@@ -71,6 +71,33 @@ def project(root):
     (root / "Main.lean").write_text("theorem candidate : True := by trivial\n")
 
 
+@pytest.mark.parametrize(
+    "arguments,heading",
+    [((), "name: leanwarp"), (("--reference",), "# LeanWarp reference")],
+)
+def test_cli_guidance_works_without_credentials_or_project(tmp_path, arguments, heading):
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in {"LEANWARP_BASE_URL", "LEANWARP_API_KEY"}
+    }
+    environment["XDG_CONFIG_HOME"] = str(tmp_path / "config")
+    run = subprocess.run(  # noqa: S603 -- fixed module and test arguments
+        [sys.executable, "-I", "-m", "leanwarp_cloud.cli", "skill", *arguments],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert run.returncode == 0, run.stderr + run.stdout
+    assert heading in run.stdout
+    assert not run.stderr
+    assert not (tmp_path / ".leanwarp").exists()
+    assert not (tmp_path / "config").exists()
+
+
 def test_cli_installed_project_workflow_and_skill(tmp_path):
     project(tmp_path)
     with local_api() as (service, origin):

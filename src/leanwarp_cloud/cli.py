@@ -63,10 +63,13 @@ def parser() -> argparse.ArgumentParser:
         "stop",
         "cancel",
         "disconnect",
-        "skill",
         "mcp",
     ):
         commands.add_parser(name)
+    skill = commands.add_parser("skill", help="read the bundled agent instructions")
+    skill.add_argument(
+        "--reference", action="store_true", help="read the full usage reference instead"
+    )
     connect = commands.add_parser("connect", help="connect once; does not allocate compute")
     connect.add_argument(
         "--max-spend", type=_dollars, required=True, help="approved workspace ceiling in USD"
@@ -113,8 +116,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
         if args.command == "skill":
+            document = "references/usage.md" if args.reference else "SKILL.md"
             sys.stdout.write(
-                files("leanwarp_cloud").joinpath("skills/leanwarp/SKILL.md").read_text()
+                files("leanwarp_cloud")
+                .joinpath(f"skills/leanwarp/{document}")
+                .read_text(encoding="utf-8")
             )
             return 0
         if args.command == "mcp":

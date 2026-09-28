@@ -16,6 +16,7 @@ leanwarp = "leanwarp_cloud.cli:main"
 [project.urls]
 Repository = "https://github.com/Isagoge-Labs/LeanWarp-SDK"
 Homepage = "https://isagoge.in"
+Documentation = "https://github.com/Isagoge-Labs/LeanWarp-SDK/blob/main/docs/README.md"
 
 [build-system]
 requires = ["hatchling>=1.28,<2"]
@@ -26,7 +27,7 @@ packages = ["src/leanwarp_cloud"]
 
 
 [tool.hatch.build.targets.sdist]
-include = ["/src", "/tests", "/README.md", "/pyproject.toml", "/.gitignore"]
+include = ["/src", "/tests", "/docs", "/README.md", "/pyproject.toml", "/.gitignore"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

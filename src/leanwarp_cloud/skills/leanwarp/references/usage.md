@@ -17,6 +17,7 @@ Use `leanwarp COMMAND --help` for arguments.
 | `wait`, `status` | Read the current operation's result or progress. |
 | `recover` | Replay an interrupted request from the local journal. |
 | `cancel`, `stop`, `disconnect` | Cancel work, stop compute, or forget a stopped connection. |
+| `skill`, `skill --reference` | Read bundled agent instructions or this reference; no account required. |
 
 `check`, `inspect`, `try-tactics` and `verify` synchronize changed files and
 explicit deletions before submitting. The project session saves workspace,
@@ -77,8 +78,20 @@ when needed, `target_context` containing the imports and definitions for the tar
 
 ## Python
 
-This example uses the `LeanWarpExample.lean` declaration from the README and
-credentials configured through `leanwarp auth login` or the environment:
+Install the library in your Python 3.12+ application's environment:
+
+```sh
+uv add 'leanwarp-cloud @ git+https://github.com/Isagoge-Labs/LeanWarp-SDK.git'
+```
+
+For an existing virtual environment without uv, use
+`python -m pip install 'leanwarp-cloud @ git+https://github.com/Isagoge-Labs/LeanWarp-SDK.git'`.
+The isolated CLI installation does not make Python imports available to your
+application.
+
+This example uses the `LeanWarpExample.lean` declaration from
+[Getting started](https://github.com/Isagoge-Labs/LeanWarp-SDK/blob/main/docs/getting-started.md)
+and credentials configured through `leanwarp auth login` or the environment:
 
 ```python
 from leanwarp_cloud import OperationOutcome, ProjectSession

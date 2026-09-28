@@ -26,7 +26,7 @@ packages = ["src/leanwarp_cloud"]
 
 
 [tool.hatch.build.targets.sdist]
-include = ["/src", "/tests", "/README.md", "/MAINTAINING.md", "/pyproject.toml", "/.gitignore"]
+include = ["/src", "/tests", "/README.md", "/pyproject.toml", "/.gitignore"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

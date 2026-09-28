@@ -1,0 +1,32 @@
+[project]
+name = "leanwarp-cloud"
+version = "0.1.0"
+description = "LeanWarp hosted proof workspaces for Python, CLI and MCP agents"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = ["httpx>=0.28.1,<1"]
+
+[project.optional-dependencies]
+mcp = ["mcp>=1.28.1,<2"]
+test = ["pytest>=8.4,<10"]
+
+[project.scripts]
+leanwarp = "leanwarp_cloud.cli:main"
+
+[project.urls]
+Repository = "https://github.com/Isagoge-Labs/LeanWarp-SDK"
+Homepage = "https://isagoge.in"
+
+[build-system]
+requires = ["hatchling>=1.28,<2"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/leanwarp_cloud"]
+
+
+[tool.hatch.build.targets.sdist]
+include = ["/src", "/tests", "/README.md", "/MAINTAINING.md", "/pyproject.toml", "/.gitignore"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

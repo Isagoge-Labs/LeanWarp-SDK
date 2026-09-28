@@ -1,0 +1,63 @@
+"""Separate transport completion from Lean's mathematical result."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+
+@dataclass(frozen=True)
+class OperationOutcome:
+    """A terminal or pending operation, including the unmodified server receipt."""
+
+    operation: dict[str, Any]
+
+    @property
+    def terminal(self) -> bool:
+        return self.operation.get("state") in {"completed", "failed", "cancelled"}
+
+    @property
+    def result(self) -> dict[str, Any] | None:
+        envelope = self.operation.get("result")
+        if not isinstance(envelope, dict):
+            return None
+        if (
+            envelope.get("operation_id") != self.operation.get("operation_id")
+            or envelope.get("revision") != self.operation.get("revision")
+            or type(envelope.get("generation")) is not int
+            or envelope["generation"] < 1
+        ):
+            return None
+        result = envelope.get("result")
+        return result if isinstance(result, dict) else None
+
+    @property
+    def verified(self) -> bool:
+        result = self.result
+        if not isinstance(result, dict):
+            return False
+        receipt = result.get("receipt")
+        return (
+            self.operation.get("kind") == "verify_target"
+            and self.operation.get("state") == "completed"
+            and result.get("status") == "ok"
+            and isinstance(receipt, dict)
+            and receipt.get("policy") == "fixed_target_kernel_check_v1"
+        )
+
+    @property
+    def successful(self) -> bool:
+        """Proof rejection and diagnostics do not become success through HTTP 200."""
+        if self.operation.get("kind") == "verify_target":
+            return self.verified
+        result = self.result
+        if self.operation.get("state") != "completed" or not isinstance(result, dict):
+            return False
+        kind = self.operation.get("kind")
+        if kind == "inspect":
+            return result.get("status") in {"proof_state", "metadata_only"}
+        if kind == "try_tactics":
+            # A completed trial batch can contain unsuccessful candidate tactics.
+            # This says nothing about whether the theorem has been proved.
+            return isinstance(result.get("results"), list)
+        return kind == "check" and result.get("status") == "ok"

@@ -1,0 +1,53 @@
+name: SDK checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sdk-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package:
+    name: Python ${{ matrix.python }}
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.12', '3.13', '3.14']
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7.1.4
+        with:
+          version: '0.12.19'
+      - name: Build and test the installed distribution
+        env:
+          PYTHON_VERSION: ${{ matrix.python }}
+        run: |
+          uv python install "$PYTHON_VERSION"
+          uv build --python "$PYTHON_VERSION"
+          uv venv --python "$PYTHON_VERSION" .venv
+          wheels=(dist/*.whl)
+          test "${#wheels[@]}" -eq 1
+          uv pip install --python .venv/bin/python "${wheels[0]}[mcp,test]"
+          .venv/bin/python -I -m pytest -q
+          .venv/bin/leanwarp --help
+          .venv/bin/leanwarp skill > /dev/null
+          uvx --from twine==7.0.0 twine check --strict dist/*
+      - name: Retain the tested release files
+        if: matrix.python == '3.12'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: leanwarp-sdk-${{ github.sha }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14

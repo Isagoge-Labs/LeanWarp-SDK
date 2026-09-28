@@ -23,7 +23,7 @@ def test_retry_preserves_mutation_identity_and_body() -> None:
 
     with (
         LeanWarpCloud(
-            "https://cloud.example", "secret", transport=httpx.MockTransport(handle)
+            "secret", base_url="https://cloud.example", transport=httpx.MockTransport(handle)
         ) as api,
         patch("leanwarp_cloud.client.time.sleep"),
     ):
@@ -53,7 +53,7 @@ def test_revision_conflict_is_not_retried_or_rebased() -> None:
 
     with (
         LeanWarpCloud(
-            "https://cloud.example", "secret", transport=httpx.MockTransport(handle)
+            "secret", base_url="https://cloud.example", transport=httpx.MockTransport(handle)
         ) as api,
         pytest.raises(LeanWarpCloudError) as caught,
     ):
@@ -73,7 +73,7 @@ def test_does_not_forward_authentication_on_redirect() -> None:
 
     with (
         LeanWarpCloud(
-            "https://cloud.example", "secret", transport=httpx.MockTransport(handle)
+            "secret", base_url="https://cloud.example", transport=httpx.MockTransport(handle)
         ) as api,
         pytest.raises(LeanWarpCloudError),
     ):
@@ -83,24 +83,44 @@ def test_does_not_forward_authentication_on_redirect() -> None:
 
 def test_polling_returns_failure_as_operation_and_timeout_keeps_handle() -> None:
     with LeanWarpCloud(
-        "http://localhost:8000",
         "secret",
+        base_url="http://localhost:8000",
         transport=httpx.MockTransport(
-            lambda _: httpx.Response(200, json={"state": "failed", "error_code": "timeout"})
+            lambda _: httpx.Response(
+                200, json={"operation_id": "op-1", "state": "failed", "error_code": "timeout"}
+            )
         ),
     ) as api:
         assert api.wait("op-1")["error_code"] == "timeout"
     with (
         LeanWarpCloud(
-            "http://localhost:8000",
             "secret",
-            transport=httpx.MockTransport(lambda _: httpx.Response(200, json={"state": "queued"})),
+            base_url="http://localhost:8000",
+            transport=httpx.MockTransport(
+                lambda _: httpx.Response(200, json={"operation_id": "op-1", "state": "queued"})
+            ),
         ) as api,
         patch("leanwarp_cloud.client.time.monotonic", side_effect=[0, 10]),
         pytest.raises(OperationTimeout) as caught,
     ):
         api.wait("op-1", timeout=1)
     assert caught.value.operation_id == "op-1"
+
+
+@pytest.mark.parametrize("identity", [None, "", "another-operation"])
+def test_polling_rejects_an_uncorrelated_terminal_result(identity) -> None:
+    with (
+        LeanWarpCloud(
+            "secret",
+            base_url="https://cloud.example",
+            transport=httpx.MockTransport(
+                lambda _: httpx.Response(200, json={"operation_id": identity, "state": "completed"})
+            ),
+        ) as api,
+        pytest.raises(LeanWarpCloudError) as caught,
+    ):
+        api.wait("requested-operation")
+    assert caught.value.code == "invalid_response"
 
 
 @pytest.mark.parametrize(
@@ -114,7 +134,7 @@ def test_polling_returns_failure_as_operation_and_timeout_keeps_handle() -> None
 )
 def test_rejects_unsafe_base_urls(url: str) -> None:
     with pytest.raises(ValueError):
-        LeanWarpCloud(url, "secret")
+        LeanWarpCloud("secret", base_url=url)
 
 
 def test_explicit_idempotency_key_supports_recovery_after_client_restart() -> None:
@@ -127,7 +147,7 @@ def test_explicit_idempotency_key_supports_recovery_after_client_restart() -> No
         return httpx.Response(202, json={"operation_id": "stable"})
 
     with LeanWarpCloud(
-        "https://cloud.example", "secret", transport=httpx.MockTransport(handle)
+        "secret", base_url="https://cloud.example", transport=httpx.MockTransport(handle)
     ) as api:
         api.submit(
             "w",
@@ -148,8 +168,8 @@ def test_streamed_response_limit_stops_before_an_unbounded_result() -> None:
 
     with (
         LeanWarpCloud(
-            "https://cloud.example",
             "secret",
+            base_url="https://cloud.example",
             transport=httpx.MockTransport(lambda _: httpx.Response(200, stream=ExcessiveBody())),
         ) as api,
         pytest.raises(LeanWarpCloudError) as caught,
@@ -182,7 +202,7 @@ def test_project_selects_exact_environment_and_rejects_mismatch(tmp_path: Path) 
         return httpx.Response(201, json={"workspace_id": "w"})
 
     with LeanWarpCloud(
-        "https://cloud.example", "secret", transport=httpx.MockTransport(handle)
+        "secret", base_url="https://cloud.example", transport=httpx.MockTransport(handle)
     ) as api:
         assert api.create_workspace_for_project(tmp_path)["workspace_id"] == "w"
         (tmp_path / "lean-toolchain").write_text("leanprover/lean4:v4.27.0\n")
@@ -214,7 +234,7 @@ def test_new_project_uses_latest_matching_build_and_allows_an_older_pin(tmp_path
         return httpx.Response(201, json=body)
 
     with LeanWarpCloud(
-        "https://cloud.example", "secret", transport=httpx.MockTransport(handle)
+        "secret", base_url="https://cloud.example", transport=httpx.MockTransport(handle)
     ) as api:
         api.create_workspace_for_project(tmp_path)
         api.create_workspace_for_project(tmp_path, bundle_id="old")
@@ -235,7 +255,7 @@ def test_execution_deadline_is_forwarded_and_retried_independently_of_polling() 
 
     with (
         LeanWarpCloud(
-            "https://cloud.example", "secret", transport=httpx.MockTransport(handle)
+            "secret", base_url="https://cloud.example", transport=httpx.MockTransport(handle)
         ) as api,
         patch("leanwarp_cloud.client.time.sleep"),
     ):
@@ -265,7 +285,7 @@ def test_invalid_execution_deadline_is_rejected_before_submission(deadline: obje
 
     with (
         LeanWarpCloud(
-            "https://cloud.example", "secret", transport=httpx.MockTransport(unexpected)
+            "secret", base_url="https://cloud.example", transport=httpx.MockTransport(unexpected)
         ) as api,
         pytest.raises(ValueError, match="timeout_seconds"),
     ):

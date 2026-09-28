@@ -6,7 +6,6 @@ import argparse
 import getpass
 import json
 import sys
-from decimal import Decimal, InvalidOperation
 from importlib.resources import files
 from pathlib import Path
 from typing import Any
@@ -15,25 +14,10 @@ import httpx
 
 from .client import LeanWarpCloudError, OperationTimeout
 from .config import credentials_path, load_client, save_credentials
+from .endpoints import ConfigurationError
 from .outcome import OperationOutcome
-from .project import project_environment
+from .project import ProjectError, project_environment
 from .session import ProjectSession, SessionError
-
-
-def _dollars(value: str) -> int:
-    try:
-        amount = Decimal(value) * 1_000_000
-        if (
-            not amount.is_finite()
-            or amount != amount.to_integral_value()
-            or not 0 <= amount <= 10**12
-        ):
-            raise ValueError
-        return int(amount)
-    except (ValueError, InvalidOperation) as error:
-        raise argparse.ArgumentTypeError(
-            "use a nonnegative USD amount with at most six decimals"
-        ) from error
 
 
 def parser() -> argparse.ArgumentParser:
@@ -47,8 +31,7 @@ def parser() -> argparse.ArgumentParser:
     commands = root.add_subparsers(dest="command", required=True)
     auth = commands.add_parser("auth", help="configure or remove local credentials")
     auth_commands = auth.add_subparsers(dest="auth_command", required=True)
-    login = auth_commands.add_parser("login", help="read the API key from a hidden prompt")
-    login.add_argument("--base-url", required=True, help="API origin; no /api or /v1 suffix")
+    auth_commands.add_parser("login", help="read the API key from a hidden prompt")
     auth_commands.add_parser(
         "logout", help="remove locally saved credentials (does not revoke the key)"
     )
@@ -71,9 +54,6 @@ def parser() -> argparse.ArgumentParser:
         "--reference", action="store_true", help="read the full usage reference instead"
     )
     connect = commands.add_parser("connect", help="connect once; does not allocate compute")
-    connect.add_argument(
-        "--max-spend", type=_dollars, required=True, help="approved workspace ceiling in USD"
-    )
     connect.add_argument("--profile", default="standard")
     connect.add_argument("--max-profile", default="standard")
     connect.add_argument("--bundle")
@@ -137,8 +117,8 @@ def main(argv: list[str] | None = None) -> int:
                     raise SessionError(
                         "auth login requires a terminal; use environment variables for automation"
                     )
-                save_credentials(args.base_url, getpass.getpass("LeanWarp API key (hidden): "))
-                _emit({"status": "authenticated", "base_url": args.base_url})
+                save_credentials(getpass.getpass("LeanWarp API key (hidden): "))
+                _emit({"status": "authenticated"})
             return 0
         with load_client() as cloud:
             project = ProjectSession(cloud, args.project)
@@ -162,7 +142,6 @@ def main(argv: list[str] | None = None) -> int:
                 return 0 if matches else 1
             elif args.command == "connect":
                 result = project.connect(
-                    max_spend_microusd=args.max_spend,
                     resource_profile=args.profile,
                     max_resource_profile=args.max_profile,
                     bundle_id=args.bundle,
@@ -225,7 +204,7 @@ def main(argv: list[str] | None = None) -> int:
             {
                 "error": "local_error",
                 "message": str(error)
-                if isinstance(error, SessionError)
+                if isinstance(error, (SessionError, ConfigurationError, ProjectError))
                 else "invalid local input or filesystem access",
             }
         )

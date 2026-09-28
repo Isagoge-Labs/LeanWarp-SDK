@@ -38,3 +38,14 @@ def test_limits_include_encoded_unicode_and_total_upload(tmp_path: Path) -> None
         collect_lean_sources(tmp_path, max_file_bytes=10)
     with pytest.raises(ValueError, match="limit"):
         collect_lean_sources(tmp_path, max_total_bytes=20)
+
+
+@pytest.mark.parametrize("missing", ["lean-toolchain", "lake-manifest.json"])
+def test_missing_metadata_reports_safe_actionable_filename(tmp_path, missing):
+    from leanwarp_cloud.project import ProjectError, project_environment
+
+    for name in {"lean-toolchain", "lake-manifest.json"} - {missing}:
+        (tmp_path / name).write_text("{}")
+    with pytest.raises(ProjectError, match=f"missing {missing}") as error:
+        project_environment(tmp_path)
+    assert "--project" in str(error.value)

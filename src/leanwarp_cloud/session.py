@@ -93,6 +93,7 @@ class ProjectSession:
                     "revision",
                     "environment",
                     "operation_id",
+                    "operation_revision",
                 }
             )
         ):
@@ -138,10 +139,22 @@ class ProjectSession:
         if list(project_environment(self.root)) != state.get("environment"):
             raise SessionError("project dependencies changed; use a new workspace explicitly")
 
+    @staticmethod
+    def _checked_operation(state: Mapping[str, Any], result: dict[str, Any]) -> dict[str, Any]:
+        # Workspace sync can advance revision after submission. Compare against
+        # the saved submission, not the workspace's current revision. Older
+        # journals have no operation_revision; keep their existing ID binding.
+        revision = state.get("operation_revision")
+        if result.get("operation_id") != state.get("operation_id") or (
+            revision is not None
+            and (type(result.get("revision")) is not int or result["revision"] != revision)
+        ):
+            raise SessionError("operation receipt does not match the saved submission")
+        return result
+
     def connect(
         self,
         *,
-        max_spend_microusd: int,
         resource_profile: str = "standard",
         max_resource_profile: str = "standard",
         bundle_id: str | None = None,
@@ -163,8 +176,6 @@ class ProjectSession:
                 raise SessionError(
                     "unsupported toolchain/lockfile; do not change dependencies to pass"
                 )
-            if type(max_spend_microusd) is not int or not 0 <= max_spend_microusd <= 10**12:
-                raise ValueError("budget must be integer microdollars between 0 and 1000000000000")
             state["environment"] = list(environment)
             return self._request(
                 state,
@@ -173,7 +184,7 @@ class ProjectSession:
                     "bundle_id": matches[-1]["bundle_id"],
                     "resource_profile": resource_profile,
                     "max_resource_profile": max_resource_profile,
-                    "max_spend_microusd": max_spend_microusd,
+                    "max_spend_microusd": None,
                 },
             )
 
@@ -222,7 +233,9 @@ class ProjectSession:
         with self._locked() as state:
             self._ready(state)
             if state.get("operation_id"):
-                previous = self.cloud.operation(state["operation_id"])
+                previous = self._checked_operation(
+                    state, self.cloud.operation(state["operation_id"])
+                )
                 if previous.get("state") not in {"completed", "failed", "cancelled"}:
                     raise SessionError("previous operation is active; wait or cancel it first")
             self._sync(state)
@@ -269,9 +282,19 @@ class ProjectSession:
             raise SessionError("invalid pending request; preserve journal for recovery")
         method = pending["method"]
         try:
-            result: dict[str, Any] = getattr(self.cloud, method)(
-                **pending["arguments"], idempotency_key=pending["idempotency_key"]
-            )
+            if method == "create_workspace":
+                # Older journals can contain an explicit cap. Replay that exact
+                # payload: stripping it changes the durable request's identity.
+                result = self.cloud._request(
+                    "POST",
+                    "workspaces",
+                    body=pending["arguments"],
+                    idempotency_key=pending["idempotency_key"],
+                )
+            else:
+                result = getattr(self.cloud, method)(
+                    **pending["arguments"], idempotency_key=pending["idempotency_key"]
+                )
         except LeanWarpCloudError as error:
             # Definite rejection has no accepted effect. Auth/transient/ambiguous
             # errors keep the intent recoverable, including a rotated key later.
@@ -307,6 +330,7 @@ class ProjectSession:
             state["files"] = pending["hashes"]
         else:
             state["operation_id"] = result["operation_id"]
+            state["operation_revision"] = result["revision"]
         state["pending"] = None
         self._save(state)
         return result
@@ -325,7 +349,9 @@ class ProjectSession:
             "recovery_required": state.get("pending") is not None,
         }
         if state.get("operation_id"):
-            result["operation"] = self.cloud.operation(state["operation_id"])
+            result["operation"] = self._checked_operation(
+                state, self.cloud.operation(state["operation_id"])
+            )
         return result
 
     def status(self) -> dict[str, Any]:
@@ -339,14 +365,14 @@ class ProjectSession:
             if not isinstance(operation, str):
                 raise SessionError("no submitted operation")
         # Do not hold the project lock while polling; another process may cancel.
-        return self.cloud.wait(operation, timeout=timeout)
+        return self._checked_operation(state, self.cloud.wait(operation, timeout=timeout))
 
     def cancel(self) -> dict[str, Any]:
         with self._locked() as state:
             self._ready(state)
             if not isinstance(state.get("operation_id"), str):
                 raise SessionError("no submitted operation")
-            return self.cloud.cancel(state["operation_id"])
+            return self._checked_operation(state, self.cloud.cancel(state["operation_id"]))
 
     def disconnect(self) -> dict[str, Any]:
         """Forget a stopped connection so this project can explicitly choose a new bundle."""
@@ -354,7 +380,9 @@ class ProjectSession:
             self._ready(state)
             workspace_id = self._workspace(state)
             if state.get("operation_id"):
-                operation = self.cloud.operation(state["operation_id"])
+                operation = self._checked_operation(
+                    state, self.cloud.operation(state["operation_id"])
+                )
                 if operation.get("state") not in {"completed", "failed", "cancelled"}:
                     raise SessionError("previous operation is active; wait or cancel it first")
             workspace = self.cloud.workspace(workspace_id)
@@ -365,7 +393,7 @@ class ProjectSession:
             stopped = self.cloud.stop(workspace_id)
             if stopped.get("workspace_id") != workspace_id or stopped.get("state") != "stopped":
                 raise SessionError("stop was not confirmed; retain the project connection")
-            for key in ("workspace_id", "revision", "operation_id"):
+            for key in ("workspace_id", "revision", "operation_id", "operation_revision"):
                 state.pop(key, None)
             state["files"] = {}
             self._save(state)
@@ -405,6 +433,8 @@ def _validate_journal(state: dict[str, Any]) -> None:
         valid = valid and text(state["workspace_id"]) and revision(state.get("revision"))
     if "operation_id" in state:
         valid = valid and text(state["operation_id"]) and "workspace_id" in state
+    if "operation_revision" in state:
+        valid = valid and "operation_id" in state and revision(state["operation_revision"])
     pending = state.get("pending")
     if pending is not None:
         valid = valid and isinstance(pending, dict)
@@ -422,13 +452,18 @@ def _validate_journal(state: dict[str, Any]) -> None:
             )
         if valid and method == "create_workspace":
             valid = (
-                set(args)
-                == {"bundle_id", "resource_profile", "max_resource_profile", "max_spend_microusd"}
+                set(args) - {"max_spend_microusd"}
+                == {"bundle_id", "resource_profile", "max_resource_profile"}
                 and all(
                     text(args[k]) for k in ("bundle_id", "resource_profile", "max_resource_profile")
                 )
-                and type(args["max_spend_microusd"]) is int
-                and 0 <= args["max_spend_microusd"] <= 10**12
+                and (
+                    args.get("max_spend_microusd") is None
+                    or (
+                        type(args["max_spend_microusd"]) is int
+                        and 0 <= args["max_spend_microusd"] <= 10**12
+                    )
+                )
                 and "workspace_id" not in state
                 and pending["hashes"] is None
             )

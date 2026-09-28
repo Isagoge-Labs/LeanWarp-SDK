@@ -1,0 +1,8 @@
+# Retain the dependency base's locked package name; no MathTree targets are included.
+name = "mathtree_verifier"
+version = "0.1.0"
+
+[[require]]
+name = "mathlib"
+git = "https://github.com/leanprover-community/mathlib4.git"
+rev = "v4.26.0"

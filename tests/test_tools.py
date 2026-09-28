@@ -17,6 +17,17 @@ from leanwarp_cloud.session import SessionError
 
 from .test_session import Service
 
+TEST_KEY = f"lw_test_{'a' * 32}.{'s' * 43}"
+# Only the test process redirects the fixed staging origin to its local fixture.
+# Installed users authenticate with the key alone; no URL-setting CLI is needed.
+CLI_ENTRY = """
+import os
+from leanwarp_cloud import endpoints
+from leanwarp_cloud.cli import main
+endpoints._API_ORIGINS['test'] = os.environ['TEST_SERVER_ORIGIN']
+raise SystemExit(main())
+"""
+
 
 @contextmanager
 def local_api():
@@ -46,7 +57,7 @@ def local_api():
                     headers=dict(self.headers),
                     content=self.rfile.read(int(self.headers.get("Content-Length", "0"))),
                 )
-                assert request.headers["Authorization"] == "Bearer test-tool-key"
+                assert request.headers["Authorization"] == f"Bearer {TEST_KEY}"
                 response = service.handle(request)
             self.send_response(response.status_code)
             self.send_header("Content-Type", "application/json")
@@ -103,25 +114,25 @@ def test_cli_installed_project_workflow_and_skill(tmp_path):
     with local_api() as (service, origin):
         environment = {
             **os.environ,
-            "LEANWARP_BASE_URL": origin,
-            "LEANWARP_API_KEY": "test-tool-key",
+            "TEST_SERVER_ORIGIN": origin,
+            "LEANWARP_API_KEY": TEST_KEY,
         }
 
         def command(*args, expected=0):
             run = subprocess.run(  # noqa: S603 -- fixed module and test arguments
-                [sys.executable, "-m", "leanwarp_cloud.cli", "--project", str(tmp_path), *args],
+                [sys.executable, "-c", CLI_ENTRY, "--project", str(tmp_path), *args],
                 env=environment,
                 capture_output=True,
                 text=True,
                 timeout=15,
                 check=False,
             )
-            assert "test-tool-key" not in run.stdout + run.stderr
+            assert TEST_KEY not in run.stdout + run.stderr
             assert run.returncode == expected, run.stderr + run.stdout
             return run.stdout
 
         assert "name: leanwarp" in command("skill")
-        assert json.loads(command("connect", "--max-spend", "2"))["workspace_id"] == "w"
+        assert json.loads(command("connect"))["workspace_id"] == "w"
         first = json.loads(command("check", "Main.lean", expected=1))
         assert first["kind"] == "check"
         assert json.loads(command("wait", expected=1))["operation_id"] == first["operation_id"]
@@ -136,7 +147,6 @@ def test_cli_installed_project_workflow_and_skill(tmp_path):
 
 
 def test_mcp_stdio_uses_same_project_session_without_key_arguments(tmp_path):
-    pytest.importorskip("mcp")
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.stdio import stdio_client
 
@@ -146,20 +156,35 @@ def test_mcp_stdio_uses_same_project_session_without_key_arguments(tmp_path):
         async def exercise():
             parameters = StdioServerParameters(
                 command=sys.executable,
-                args=["-m", "leanwarp_cloud.cli", "--project", str(tmp_path), "mcp"],
-                env={"LEANWARP_BASE_URL": origin, "LEANWARP_API_KEY": "test-tool-key"},
+                args=["-c", CLI_ENTRY, "--project", str(tmp_path), "mcp"],
+                env={"TEST_SERVER_ORIGIN": origin, "LEANWARP_API_KEY": TEST_KEY},
             )
             async with (
                 stdio_client(parameters) as (read, write),
                 ClientSession(read, write) as client,
             ):
-                await client.initialize()
+                initialized = await client.initialize()
+                assert "leanwarp://reference" in initialized.instructions
+                available = await client.list_resources()
+                assert {str(resource.uri) for resource in available.resources} == {
+                    "leanwarp://guide",
+                    "leanwarp://reference",
+                }
+                for uri, heading in (
+                    ("leanwarp://guide", "# LeanWarp"),
+                    ("leanwarp://reference", "# LeanWarp reference"),
+                ):
+                    resource = await client.read_resource(uri)
+                    assert heading in resource.contents[0].text
+                    assert TEST_KEY not in resource.contents[0].text
+                assert not (tmp_path / ".leanwarp").exists()
                 catalog = await client.list_tools()
                 assert {"connect", "verify_target", "recover", "stop"} <= {
                     t.name for t in catalog.tools
                 }
                 assert "api_key" not in json.dumps([t.inputSchema for t in catalog.tools])
-                connected = await client.call_tool("connect", {"max_spend_microusd": 2_000_000})
+                assert "max_spend" not in json.dumps([t.inputSchema for t in catalog.tools])
+                connected = await client.call_tool("connect", {})
                 assert not connected.isError, connected
                 submitted = await client.call_tool("check", {"file": "Main.lean"})
                 assert not submitted.isError, submitted
@@ -174,7 +199,6 @@ def test_mcp_stdio_uses_same_project_session_without_key_arguments(tmp_path):
 
 
 def test_mcp_redacts_unexpected_transport_details(tmp_path):
-    pytest.importorskip("mcp")
     from leanwarp_cloud import LeanWarpCloud
     from leanwarp_cloud.mcp_server import create_server
 
@@ -182,7 +206,10 @@ def test_mcp_redacts_unexpected_transport_details(tmp_path):
         raise httpx.ConnectError("Authorization: Bearer should-never-leak")
 
     with LeanWarpCloud(
-        "https://api.example", "should-never-leak", retries=0, transport=httpx.MockTransport(fail)
+        "should-never-leak",
+        base_url="https://api.example",
+        retries=0,
+        transport=httpx.MockTransport(fail),
     ) as cloud:
         server = create_server(cloud, str(tmp_path))
 
@@ -219,19 +246,17 @@ def test_engine_outcomes_do_not_confuse_trial_execution_with_proof(kind, result,
     assert not outcome.verified
 
 
-def test_credentials_reject_partial_environment_and_public_readable_file(tmp_path, monkeypatch):
+def test_credentials_require_key_and_reject_public_readable_file(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setenv("LEANWARP_BASE_URL", "https://api.example")
     monkeypatch.delenv("LEANWARP_API_KEY", raising=False)
-    with pytest.raises(SessionError, match="both"):
+    with pytest.raises(SessionError, match="auth login"):
         load_client()
-    monkeypatch.delenv("LEANWARP_BASE_URL")
     path = tmp_path / "leanwarp" / "credentials.json"
     path.parent.mkdir()
-    path.write_text(json.dumps({"base_url": "https://api.example", "api_key": "test-tool-key"}))
+    path.write_text(json.dumps({"api_key": TEST_KEY}))
     path.chmod(0o644)
     with pytest.raises(SessionError, match="only by its owner"):
         load_client()
     path.chmod(0o600)
     with load_client() as client:
-        assert client.base_url == "https://api.example"
+        assert client.base_url == "https://control-api-staging-3b57.up.railway.app"

@@ -38,7 +38,7 @@ jobs:
           uv venv --python "$PYTHON_VERSION" .venv
           wheels=(dist/*.whl)
           test "${#wheels[@]}" -eq 1
-          uv pip install --python .venv/bin/python "${wheels[0]}[mcp,test]"
+          uv pip install --python .venv/bin/python "${wheels[0]}[test]"
           .venv/bin/python -I -m pytest -q
           .venv/bin/leanwarp --help
           .venv/bin/leanwarp skill > /dev/null

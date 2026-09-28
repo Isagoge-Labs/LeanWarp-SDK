@@ -1,38 +1,59 @@
 # Getting started
 
-[Install the CLI](../README.md#install), then get an API key and API URL from your
+[Install the CLI](../README.md#install), then get an API key from your
 LeanWarp dashboard. Your account needs available credit to run compute.
+
+This release supports the hosted test service. Use the dashboard supplied with
+your test access; production keys are not supported yet.
 
 If your shell cannot find `leanwarp` after installation, run `uv tool update-shell`
 and open a new terminal.
 
 ## Sign in
 
-Replace the placeholder with the API origin shown in your dashboard:
+Sign in with your key:
 
 ```sh
-leanwarp auth login --base-url https://YOUR_API_ORIGIN
+leanwarp auth login
 ```
 
-Paste the key at the hidden prompt. For automation, inject `LEANWARP_BASE_URL`
-and `LEANWARP_API_KEY` through your environment or secret manager. Keep the key
+Paste the key at the hidden prompt. The SDK selects the service automatically.
+For automation, inject `LEANWARP_API_KEY` through your environment or secret manager. Keep the key
 out of source files and agent conversations.
 
 ## Connect your project
 
+For an existing project, keep its dependencies unchanged and run the commands
+below. Compatibility requires the exact toolchain and dependency lockfile of a
+supported bundle, including the lockfile's bytes. Equivalent version numbers
+alone are not enough. If `doctor` reports a mismatch, the project cannot run on
+that bundle; use a separate supported project or request support for its environment.
+Do not replace an existing project's lockfile just to pass this check.
+
+For a first experiment, the repository includes a [Lean 4.26 example](../examples/lean-4.26)
+with the supported metadata and `LeanWarpExample.lean`. Clone the SDK repository
+and use that directory as your project:
+
 ```sh
-cd /path/to/your/lean-project
+git clone https://github.com/Isagoge-Labs/LeanWarp-SDK.git
+cd LeanWarp-SDK/examples/lean-4.26
+```
+
+From your chosen project root:
+
+```sh
 leanwarp doctor
-leanwarp connect --max-spend 5
+leanwarp connect
 ```
 
 `doctor` checks whether the project's Lean toolchain and dependency lockfile match
 a supported bundle. Continue only if it reports `compatible: true`. LeanWarp does
 not build arbitrary project dependencies.
 
-`connect` saves a workspace with a $5 spending limit; it does not start compute.
-Execution also requires available account credit. Add `.leanwarp/` to `.gitignore`
-to keep local session state out of version control.
+`connect` saves a workspace without starting compute. Manage funding and view
+usage in the website. You can set an optional workspace lifetime cap under
+Dashboard → Usage & credits before running work. Execution requires available prepaid credit. Add
+`.leanwarp/` to `.gitignore` to keep local session state out of version control.
 
 ## Verify a proof
 

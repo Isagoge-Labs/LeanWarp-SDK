@@ -11,6 +11,10 @@ from pathlib import Path
 _EXCLUDED = {".git", ".lake", ".env", ".ssh", ".aws", ".venv", "node_modules", "vendor"}
 
 
+class ProjectError(ValueError):
+    """An actionable project error that contains no file contents or credentials."""
+
+
 def project_environment(root: str | Path) -> tuple[str, str]:
     """Read bounded project metadata without uploading or executing build configuration."""
     project = Path(root).resolve(strict=True)
@@ -18,9 +22,15 @@ def project_environment(root: str | Path) -> tuple[str, str]:
     try:
         files: dict[str, bytes] = {}
         for name in ("lean-toolchain", "lake-manifest.json"):
-            file_descriptor = os.open(
-                name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=descriptor
-            )
+            try:
+                file_descriptor = os.open(
+                    name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=descriptor
+                )
+            except FileNotFoundError as error:
+                raise ProjectError(
+                    f"missing {name}; run from your Lean project root or set --project. "
+                    "The project must have a toolchain and a Lake dependency lockfile."
+                ) from error
             with os.fdopen(file_descriptor, "rb") as source:
                 if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
                     raise ValueError("project metadata must be a regular file")

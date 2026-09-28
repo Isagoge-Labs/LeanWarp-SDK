@@ -1,13 +1,12 @@
 [project]
-name = "leanwarp-cloud"
+name = "leanwarp-sdk"
 version = "0.1.0"
 description = "LeanWarp hosted proof workspaces for Python, CLI and MCP agents"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = ["httpx>=0.28.1,<1"]
+dependencies = ["httpx>=0.28.1,<1", "mcp>=1.28.1,<2"]
 
 [project.optional-dependencies]
-mcp = ["mcp>=1.28.1,<2"]
 test = ["pytest>=8.4,<10"]
 
 [project.scripts]
@@ -27,7 +26,7 @@ packages = ["src/leanwarp_cloud"]
 
 
 [tool.hatch.build.targets.sdist]
-include = ["/src", "/tests", "/docs", "/README.md", "/pyproject.toml", "/.gitignore"]
+include = ["/src", "/tests", "/docs", "/examples", "/README.md", "/pyproject.toml", "/.gitignore"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

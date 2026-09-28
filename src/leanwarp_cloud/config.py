@@ -9,6 +9,7 @@ import tempfile
 from pathlib import Path
 
 from .client import LeanWarpCloud
+from .endpoints import api_origin
 from .session import SessionError
 
 
@@ -21,18 +22,14 @@ def credentials_path() -> Path:
 
 
 def load_client() -> LeanWarpCloud:
-    url, key = os.environ.get("LEANWARP_BASE_URL"), os.environ.get("LEANWARP_API_KEY")
-    if url is not None or key is not None:
-        if not url or not key:
-            raise SessionError("set both LEANWARP_BASE_URL and LEANWARP_API_KEY")
-        return LeanWarpCloud(url, key)
+    key = os.environ.get("LEANWARP_API_KEY")
+    if key is not None:
+        return LeanWarpCloud(key)
     path = credentials_path()
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError as error:
-        raise SessionError(
-            "run leanwarp auth login or configure the two environment variables"
-        ) from error
+        raise SessionError("run leanwarp auth login or set LEANWARP_API_KEY") from error
     with os.fdopen(fd, "rb") as stream:
         metadata = os.fstat(stream.fileno())
         if not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & 0o077:
@@ -40,16 +37,21 @@ def load_client() -> LeanWarpCloud:
         raw = stream.read(8193)
     try:
         data = json.loads(raw) if len(raw) <= 8192 else None
-        if not isinstance(data, dict) or set(data) != {"base_url", "api_key"}:
+        if not isinstance(data, dict) or set(data) not in ({"api_key"}, {"api_key", "base_url"}):
             raise ValueError
-        return LeanWarpCloud(data["base_url"], data["api_key"])
+        key = data["api_key"]
+        if not isinstance(key, str):
+            raise ValueError
+        if "base_url" in data and data["base_url"] != api_origin(key):
+            raise ValueError
     except (ValueError, TypeError, AttributeError) as error:
         raise SessionError("invalid credential file; use auth login to replace it") from error
+    return LeanWarpCloud(key)
 
 
-def save_credentials(base_url: str, api_key: str) -> None:
+def save_credentials(api_key: str) -> None:
     # Validate and authenticate before replacing a working configuration.
-    with LeanWarpCloud(base_url, api_key) as cloud:
+    with LeanWarpCloud(api_key) as cloud:
         cloud.versions()
     path = credentials_path()
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -58,7 +60,7 @@ def save_credentials(base_url: str, api_key: str) -> None:
     fd, name = tempfile.mkstemp(prefix="credentials-", dir=path.parent)
     try:
         with os.fdopen(fd, "w") as stream:
-            json.dump({"base_url": base_url.rstrip("/"), "api_key": api_key}, stream)
+            json.dump({"api_key": api_key}, stream)
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(name, path)

@@ -12,6 +12,7 @@ from uuid import uuid4
 
 import httpx
 
+from .endpoints import api_origin
 from .project import project_environment
 
 _MAX_RESPONSE_BYTES = 2 * 1024 * 1024
@@ -35,13 +36,14 @@ class OperationTimeout(TimeoutError):
 class LeanWarpCloud:
     def __init__(
         self,
-        base_url: str,
         api_key: str,
         *,
+        base_url: str | None = None,
         timeout: float = 30.0,
         retries: int = 2,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
+        base_url = api_origin(api_key) if base_url is None else base_url
         parsed = urlparse(base_url)
         local = parsed.hostname in {"localhost", "127.0.0.1", "::1"}
         if parsed.scheme != "https" and not (parsed.scheme == "http" and local):
@@ -97,7 +99,6 @@ class LeanWarpCloud:
         bundle_id: str | None = None,
         resource_profile: str = "standard",
         max_resource_profile: str = "standard",
-        max_spend_microusd: int = 0,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         toolchain, manifest_digest = project_environment(root)
@@ -116,7 +117,6 @@ class LeanWarpCloud:
             matches[-1]["bundle_id"],
             resource_profile=resource_profile,
             max_resource_profile=max_resource_profile,
-            max_spend_microusd=max_spend_microusd,
             idempotency_key=idempotency_key,
         )
 
@@ -126,7 +126,6 @@ class LeanWarpCloud:
         *,
         resource_profile: str = "standard",
         max_resource_profile: str = "standard",
-        max_spend_microusd: int = 0,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         return self._request(
@@ -136,7 +135,9 @@ class LeanWarpCloud:
                 "bundle_id": bundle_id,
                 "resource_profile": resource_profile,
                 "max_resource_profile": max_resource_profile,
-                "max_spend_microusd": max_spend_microusd,
+                # Explicit null prevents an older API's implicit zero-dollar
+                # default from creating a workspace that can never execute.
+                "max_spend_microusd": None,
             },
             idempotency_key=idempotency_key or uuid4().hex,
         )
@@ -197,7 +198,10 @@ class LeanWarpCloud:
         )
 
     def operation(self, operation_id: str) -> dict[str, Any]:
-        return self._request("GET", f"operations/{_segment(operation_id)}")
+        result = self._request("GET", f"operations/{_segment(operation_id)}")
+        if result.get("operation_id") != operation_id:
+            raise LeanWarpCloudError(502, "invalid_response", "operation identity does not match")
+        return result
 
     def check(
         self,

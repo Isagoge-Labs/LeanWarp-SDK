@@ -21,9 +21,16 @@ class OperationOutcome:
         envelope = self.operation.get("result")
         if not isinstance(envelope, dict):
             return None
+        operation_id = self.operation.get("operation_id")
+        revision = self.operation.get("revision")
         if (
-            envelope.get("operation_id") != self.operation.get("operation_id")
-            or envelope.get("revision") != self.operation.get("revision")
+            not isinstance(operation_id, str)
+            or not operation_id.strip()
+            or type(revision) is not int
+            or revision < 0
+            or envelope.get("operation_id") != operation_id
+            or type(envelope.get("revision")) is not int
+            or envelope["revision"] != revision
             or type(envelope.get("generation")) is not int
             or envelope["generation"] < 1
         ):

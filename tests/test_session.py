@@ -102,7 +102,10 @@ def project(tmp_path: Path):
     (tmp_path / "Main.lean").write_text("theorem candidate : True := by trivial\n")
     service = Service()
     with LeanWarpCloud(
-        "https://api.example", "secret", retries=0, transport=httpx.MockTransport(service.handle)
+        "secret",
+        base_url="https://api.example",
+        retries=0,
+        transport=httpx.MockTransport(service.handle),
     ) as cloud:
         yield tmp_path, service, cloud, ProjectSession(cloud, tmp_path)
 
@@ -111,13 +114,13 @@ def project(tmp_path: Path):
 def test_lost_response_recovers_exact_intent_after_restart(project, kind):
     root, service, cloud, session = project
     if kind != "workspaces":
-        session.connect(max_spend_microusd=2_000_000)
+        session.connect()
     if kind == "operations":
         session.sync()
     service.lose = "/" + kind
     with pytest.raises(httpx.ReadTimeout):
         if kind == "workspaces":
-            session.connect(max_spend_microusd=2_000_000)
+            session.connect()
         elif kind == "files":
             session.sync()
         else:
@@ -148,7 +151,7 @@ def test_lost_response_recovers_exact_intent_after_restart(project, kind):
 
 def test_changed_sources_deletions_and_proof_rejection_preserve_workspace(project):
     root, service, _, session = project
-    session.connect(max_spend_microusd=2_000_000)
+    session.connect()
     (root / "Helper.lean").write_text("def n := 1")
     session.submit("check", {"file": "Main.lean"})
     revision = service.revision
@@ -168,7 +171,7 @@ def test_changed_sources_deletions_and_proof_rejection_preserve_workspace(projec
 
 def test_pending_request_owns_nested_payload_and_recovers_exact_snapshot(project, monkeypatch):
     root, service, cloud, session = project
-    session.connect(max_spend_microusd=2_000_000)
+    session.connect()
     session.sync()
     tactics = ["simp"]
     submit = cloud.submit
@@ -193,7 +196,7 @@ def test_pending_request_owns_nested_payload_and_recovers_exact_snapshot(project
 
 def test_definite_rejection_does_not_poison_next_request(project):
     _, service, _, session = project
-    session.connect(max_spend_microusd=2_000_000)
+    session.connect()
     service.reject = True
     with pytest.raises(LeanWarpCloudError):
         session.sync()
@@ -203,7 +206,7 @@ def test_definite_rejection_does_not_poison_next_request(project):
 
 def test_lock_prevents_two_local_clients_from_mutating(project):
     root, service, cloud, session = project
-    session.connect(max_spend_microusd=2_000_000)
+    session.connect()
     with session._locked(), pytest.raises(SessionError, match="another"):
         ProjectSession(cloud, root).sync()
     assert service.revision == 0
@@ -211,7 +214,7 @@ def test_lock_prevents_two_local_clients_from_mutating(project):
 
 def test_changed_environment_never_silently_upgrades(project):
     root, _, _, session = project
-    session.connect(max_spend_microusd=2_000_000)
+    session.connect()
     (root / "lake-manifest.json").write_text('{"changed":true}')
     with pytest.raises(SessionError, match="dependencies changed"):
         session.sync()
@@ -219,7 +222,7 @@ def test_changed_environment_never_silently_upgrades(project):
 
 def test_malformed_journal_is_not_overwritten(project):
     root, _, _, session = project
-    session.connect(max_spend_microusd=2_000_000)
+    session.connect()
     journal = root / ".leanwarp/session.json"
     journal.write_text("{broken")
     with pytest.raises(SessionError, match="invalid"):
@@ -252,18 +255,101 @@ def test_proof_acceptance_requires_matching_runtime_receipt():
 
 def test_invalid_timeout_never_persists_an_unsendable_request(project):
     root, _, _, session = project
-    session.connect(max_spend_microusd=2_000_000)
+    session.connect()
     with pytest.raises(ValueError):
         session.submit("check", {"file": "Main.lean"}, timeout_seconds=0)
     assert json.loads((root / ".leanwarp/session.json").read_text())["pending"] is None
     session.submit("check", {"file": "Main.lean"})
 
 
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("operation_id", None),
+        ("operation_id", ""),
+        ("operation_id", " "),
+        ("revision", None),
+        ("revision", True),
+        ("revision", -1),
+        ("revision", "2"),
+    ],
+)
+def test_missing_or_malformed_identity_never_verifies(field, value):
+    op = {
+        "operation_id": "op",
+        "revision": 2,
+        "state": "completed",
+        "kind": "verify_target",
+        "result": {
+            "operation_id": "op",
+            "revision": 2,
+            "generation": 1,
+            "result": {"status": "ok", "receipt": {"policy": "fixed_target_kernel_check_v1"}},
+        },
+    }
+    op[field] = value
+    op["result"][field] = value
+    assert not OperationOutcome(op).verified
+    del op[field]
+    del op["result"][field]
+    assert not OperationOutcome(op).verified
+
+
+def test_boolean_envelope_revision_does_not_match_integer_revision():
+    op = {
+        "operation_id": "op",
+        "revision": 1,
+        "state": "completed",
+        "kind": "verify_target",
+        "result": {
+            "operation_id": "op",
+            "revision": True,
+            "generation": 1,
+            "result": {"status": "ok", "receipt": {"policy": "fixed_target_kernel_check_v1"}},
+        },
+    }
+    assert not OperationOutcome(op).verified
+
+
+@pytest.mark.parametrize("command", ["wait", "status", "cancel"])
+def test_saved_submission_revision_rejects_a_coherently_wrong_receipt(
+    project, monkeypatch, command
+):
+    root, service, cloud, session = project
+    session.connect()
+    submitted = session.submit("verify_target", {"file": "Main.lean"})
+    journal = root / ".leanwarp/session.json"
+    saved = journal.read_bytes()
+    assert json.loads(saved)["operation_revision"] == submitted["revision"]
+    service.operation["revision"] = 999
+    service.operation["result"]["revision"] = 999
+    monkeypatch.setattr(cloud, "cancel", lambda _operation: service.operation)
+    restarted = ProjectSession(cloud, root)
+    with pytest.raises(SessionError, match="saved submission"):
+        getattr(restarted, command)()
+    assert journal.read_bytes() == saved
+
+
+def test_operation_revision_survives_later_sync_and_legacy_journals_still_read(project):
+    root, _, cloud, session = project
+    session.connect()
+    submitted = session.submit("check", {"file": "Main.lean"})
+    (root / "Main.lean").write_text("theorem changed : True := by trivial\n")
+    synced = session.sync()
+    assert synced["revision"] > submitted["revision"]
+    assert ProjectSession(cloud, root).wait()["revision"] == submitted["revision"]
+    journal = root / ".leanwarp/session.json"
+    previous = json.loads(journal.read_text())
+    del previous["operation_revision"]
+    journal.write_text(json.dumps(previous))
+    assert ProjectSession(cloud, root).wait()["operation_id"] == submitted["operation_id"]
+
+
 def test_wrong_account_cannot_recover_a_pending_create(project):
     root, service, _, session = project
     service.lose = "/workspaces"
     with pytest.raises(httpx.ReadTimeout):
-        session.connect(max_spend_microusd=2_000_000)
+        session.connect()
     before = (root / ".leanwarp/session.json").read_bytes()
 
     def other_account(request):
@@ -272,7 +358,9 @@ def test_wrong_account_cannot_recover_a_pending_create(project):
 
     with (
         LeanWarpCloud(
-            "https://api.example", "other-key", transport=httpx.MockTransport(other_account)
+            "other-key",
+            base_url="https://api.example",
+            transport=httpx.MockTransport(other_account),
         ) as other,
         pytest.raises(SessionError, match="another account"),
     ):
@@ -285,7 +373,7 @@ def test_wrong_account_cannot_recover_a_pending_create(project):
 )
 def test_invalid_journal_fields_never_reach_network(project, field, value):
     root, service, _, session = project
-    session.connect(max_spend_microusd=2_000_000)
+    session.connect()
     path = root / ".leanwarp/session.json"
     state = json.loads(path.read_text())
     state[field] = value
@@ -306,20 +394,28 @@ def test_invalid_journal_fields_never_reach_network(project, field, value):
 )
 def test_invalid_success_receipt_retains_recoverable_creation(project, monkeypatch, receipt):
     root, _, cloud, session = project
-    original = cloud.create_workspace
-    monkeypatch.setattr(cloud, "create_workspace", lambda **_: receipt)
+    original = cloud._request
+
+    def malformed(method, route, **kwargs):
+        return (
+            receipt
+            if method == "POST" and route == "workspaces"
+            else original(method, route, **kwargs)
+        )
+
+    monkeypatch.setattr(cloud, "_request", malformed)
     with pytest.raises(SessionError, match="invalid API receipt"):
-        session.connect(max_spend_microusd=2_000_000)
+        session.connect()
     state = json.loads((root / ".leanwarp" / "session.json").read_text())
     assert state["pending"] is not None
     assert "workspace_id" not in state
-    monkeypatch.setattr(cloud, "create_workspace", original)
+    monkeypatch.setattr(cloud, "_request", original)
     assert ProjectSession(cloud, root).recover()["workspace_id"] == "w"
 
 
 def test_unhashable_journal_method_fails_closed_with_actionable_error(project):
     root, _, cloud, session = project
-    session.connect(max_spend_microusd=2_000_000)
+    session.connect()
     path = root / ".leanwarp" / "session.json"
     state = json.loads(path.read_text())
     state["pending"] = {"method": [], "arguments": {}, "idempotency_key": "a" * 32, "hashes": None}
@@ -331,13 +427,13 @@ def test_unhashable_journal_method_fails_closed_with_actionable_error(project):
 
 def test_disconnect_requires_confirmed_stop_and_allows_new_dependencies(project, monkeypatch):
     _, _, cloud, session = project
-    session.connect(max_spend_microusd=2_000_000)
+    session.connect()
     with pytest.raises(SessionError, match="stop"):
         session.disconnect()
     monkeypatch.setattr(cloud, "workspace", lambda _: {"workspace_id": "w", "state": "stopped"})
     monkeypatch.setattr(cloud, "stop", lambda _: {"workspace_id": "w", "state": "stopped"})
     assert session.disconnect()["workspace_id"] == "w"
-    assert session.connect(max_spend_microusd=3_000_000)["workspace_id"] == "w"
+    assert session.connect()["workspace_id"] == "w"
 
 
 @pytest.mark.parametrize("state", ["queued", "running", "cancel_requested"])
@@ -345,7 +441,7 @@ def test_disconnect_preserves_nonterminal_operation_on_stopped_workspace(
     project, monkeypatch, state
 ):
     _, service, cloud, session = project
-    session.connect(max_spend_microusd=2_000_000)
+    session.connect()
     session.submit("check", {"file": "Main.lean"})
     service.operation["state"] = state
     monkeypatch.setattr(cloud, "workspace", lambda _: {"workspace_id": "w", "state": "stopped"})
@@ -357,7 +453,7 @@ def test_disconnect_preserves_nonterminal_operation_on_stopped_workspace(
 
 def test_disconnect_retains_connection_when_server_has_other_device_work(project, monkeypatch):
     _, _, cloud, session = project
-    session.connect(max_spend_microusd=2_000_000)
+    session.connect()
     monkeypatch.setattr(cloud, "workspace", lambda _: {"workspace_id": "w", "state": "stopped"})
 
     def busy(_):
@@ -379,7 +475,7 @@ def test_disconnect_retains_connection_when_server_has_other_device_work(project
 )
 def test_invalid_submission_preserves_readable_journal_without_sending(project, kind, payload):
     root, service, cloud, session = project
-    session.connect(max_spend_microusd=2_000_000)
+    session.connect()
     session.sync()
     journal = session.path.read_bytes()
     service.lose = "/operations"
@@ -398,7 +494,52 @@ def test_invalid_submission_preserves_readable_journal_without_sending(project, 
 def test_invalid_connect_profile_does_not_poison_first_connection(project, field, value):
     root, service, cloud, session = project
     with pytest.raises(SessionError):
-        session.connect(max_spend_microusd=2_000_000, **{field: value})
+        session.connect(**{field: value})
     assert not session.path.exists()
     assert service.workspace_count == 0
-    assert ProjectSession(cloud, root).connect(max_spend_microusd=2_000_000)["workspace_id"] == "w"
+    assert ProjectSession(cloud, root).connect()["workspace_id"] == "w"
+
+
+@pytest.mark.parametrize("cap", [None, 0, 5_000_000])
+def test_recovery_preserves_nullable_and_legacy_creation_payloads(project, cap):
+    root, service, cloud, session = project
+    arguments = {
+        "bundle_id": "b",
+        "resource_profile": "standard",
+        "max_resource_profile": "standard",
+        "max_spend_microusd": cap,
+    }
+    key = "b" * 32
+    service.lose = "workspaces"
+    with pytest.raises(httpx.ReadTimeout):
+        cloud._request("POST", "workspaces", body=arguments, idempotency_key=key)
+    session.directory.mkdir()
+    session.path.write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "base_url": cloud.base_url,
+                "owner_id": "owner-a",
+                "files": {},
+                "environment": ["leanprover/lean4:v4.26.0", hashlib.sha256(b"{}").hexdigest()],
+                "pending": {
+                    "method": "create_workspace",
+                    "arguments": arguments,
+                    "idempotency_key": key,
+                    "hashes": None,
+                },
+            }
+        )
+    )
+    assert ProjectSession(cloud, root).recover()["workspace_id"] == "w"
+    assert service.workspace_count == 1
+    posts = [r for r in service.requests if r.method == "POST"]
+    assert len(posts) == 2 and posts[0].content == posts[1].content
+    assert posts[0].headers["Idempotency-Key"] == posts[1].headers["Idempotency-Key"]
+
+
+def test_new_connection_explicitly_selects_prepaid_policy(project):
+    _, service, _, session = project
+    session.connect()
+    body = json.loads(next(r.content for r in service.requests if r.method == "POST"))
+    assert body["max_spend_microusd"] is None

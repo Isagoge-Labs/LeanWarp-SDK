@@ -1,8 +1,8 @@
 <h1><img src="docs/assets/leanwarp-banner.svg" alt="LeanWarp — faster lean" width="960"></h1>
 
-Check and verify Lean proofs from your terminal, Python application, or coding
-agent. Keep editing your local project; LeanWarp runs Lean remotely and reuses
-compatible imports across successive checks.
+Faster Lean proof verification for developers and AI agents. Keep working in your
+local project; LeanWarp runs verification remotely and reuses compatible imports
+between checks.
 
 **[Get started](docs/getting-started.md)** ·
 [Documentation](docs/README.md) · [Agent setup](docs/agents.md) ·

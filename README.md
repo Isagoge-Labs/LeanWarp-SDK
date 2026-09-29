@@ -1,4 +1,4 @@
-<h1><img src="docs/assets/leanwarp-banner.svg" alt="LeanWarp SDK" width="960"></h1>
+<h1><img src="docs/assets/leanwarp-banner.svg" alt="LeanWarp — faster lean" width="960"></h1>
 
 Check and verify Lean proofs from your terminal, Python application, or coding
 agent. Keep editing your local project; LeanWarp runs Lean remotely and reuses

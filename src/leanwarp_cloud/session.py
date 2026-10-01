@@ -14,7 +14,7 @@ from typing import Any
 from uuid import uuid4
 
 from .client import LeanWarpCloud, LeanWarpCloudError
-from .project import collect_lean_sources, project_environment
+from .project import collect_lean_sources, matching_bundles, project_environment
 
 _MAX_JOURNAL_BYTES = 8 * 1024 * 1024
 
@@ -135,9 +135,15 @@ class ProjectSession:
         if state.get("pending") is not None:
             raise SessionError("an uncertain request exists; run recover before another mutation")
 
-    def _environment(self, state: Mapping[str, Any]) -> None:
-        if list(project_environment(self.root)) != state.get("environment"):
+    def _environment(self, state: dict[str, Any]) -> None:
+        environment = list(project_environment(self.root))
+        if environment == state.get("environment"):
+            return
+        if list(project_environment(self.root, legacy=True)) != state.get("environment"):
             raise SessionError("project dependencies changed; use a new workspace explicitly")
+        # Upgrade a byte-bound journal only while the original bytes still match.
+        state["environment"] = environment
+        self._save(state)
 
     @staticmethod
     def _checked_operation(state: Mapping[str, Any], result: dict[str, Any]) -> dict[str, Any]:
@@ -167,10 +173,8 @@ class ProjectSession:
             environment = project_environment(self.root)
             matches = [
                 b
-                for b in self.cloud.versions()["versions"]
-                if b["lean_toolchain"] == environment[0]
-                and b["lake_manifest_sha256"] == environment[1]
-                and (bundle_id is None or b["bundle_id"] == bundle_id)
+                for b in matching_bundles(self.root, self.cloud.versions()["versions"])
+                if bundle_id is None or b["bundle_id"] == bundle_id
             ]
             if not matches:
                 raise SessionError(

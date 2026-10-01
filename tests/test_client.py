@@ -180,7 +180,7 @@ def test_streamed_response_limit_stops_before_an_unbounded_result() -> None:
 
 def test_project_selects_exact_environment_and_rejects_mismatch(tmp_path: Path) -> None:
     (tmp_path / "lean-toolchain").write_text("leanprover/lean4:v4.26.0\n")
-    manifest = b'{"packages": []}\n'
+    manifest = b'{"version":"1.1.0","packages": []}\n'
     (tmp_path / "lake-manifest.json").write_bytes(manifest)
     created: list[dict[str, object]] = []
 
@@ -211,9 +211,50 @@ def test_project_selects_exact_environment_and_rejects_mismatch(tmp_path: Path) 
     assert len(created) == 1 and created[0]["bundle_id"] == "exact"
 
 
+def test_project_connects_using_locked_dependencies_not_example_name(tmp_path: Path) -> None:
+    from leanwarp_cloud.project import dependency_fingerprint
+
+    example = Path(__file__).parents[1] / "examples/lean-4.26"
+    original = (example / "lake-manifest.json").read_bytes()
+    (tmp_path / "lean-toolchain").write_bytes((example / "lean-toolchain").read_bytes())
+    manifest = json.loads(original)
+    manifest["name"] = "my_research_project"
+    manifest["packages"].reverse()
+    (tmp_path / "lake-manifest.json").write_text(json.dumps(manifest, indent=4))
+    selected = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "versions": [
+                        {
+                            "bundle_id": "qualified",
+                            "lean_toolchain": (example / "lean-toolchain").read_text().strip(),
+                            "lake_manifest_sha256": hashlib.sha256(original).hexdigest(),
+                            "lake_dependencies_sha256": dependency_fingerprint(original),
+                        }
+                    ]
+                },
+            )
+        selected.append(json.loads(request.content)["bundle_id"])
+        return httpx.Response(201, json={"workspace_id": "w"})
+
+    with LeanWarpCloud(
+        "secret", base_url="https://cloud.example", transport=httpx.MockTransport(handle)
+    ) as api:
+        assert api.create_workspace_for_project(tmp_path)["workspace_id"] == "w"
+        manifest["packages"][0]["rev"] = "f" * 40
+        (tmp_path / "lake-manifest.json").write_text(json.dumps(manifest))
+        with pytest.raises(ValueError, match="supported"):
+            api.create_workspace_for_project(tmp_path)
+    assert selected == ["qualified"]
+
+
 def test_new_project_uses_latest_matching_build_and_allows_an_older_pin(tmp_path: Path) -> None:
     (tmp_path / "lean-toolchain").write_text("leanprover/lean4:v4.26.0\n")
-    manifest = b'{"packages": []}\n'
+    manifest = b'{"version":"1.1.0","packages": []}\n'
     (tmp_path / "lake-manifest.json").write_bytes(manifest)
     matching = {
         "lean_toolchain": "leanprover/lean4:v4.26.0",

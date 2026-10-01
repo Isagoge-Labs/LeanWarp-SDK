@@ -78,7 +78,7 @@ def local_api():
 
 def project(root):
     (root / "lean-toolchain").write_text("leanprover/lean4:v4.26.0\n")
-    (root / "lake-manifest.json").write_text("{}")
+    (root / "lake-manifest.json").write_text('{"version":"1.1.0","packages":[]}')
     (root / "Main.lean").write_text("theorem candidate : True := by trivial\n")
 
 

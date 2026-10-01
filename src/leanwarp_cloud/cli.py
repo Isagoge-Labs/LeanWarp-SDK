@@ -16,7 +16,7 @@ from .client import LeanWarpCloudError, OperationTimeout
 from .config import credentials_path, load_client, save_credentials
 from .endpoints import ConfigurationError
 from .outcome import OperationOutcome
-from .project import ProjectError, project_environment
+from .project import ProjectError, matching_bundles
 from .session import ProjectSession, SessionError
 
 
@@ -125,13 +125,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.command in {"account", "versions", "resources"}:
                 result = getattr(cloud, args.command)()
             elif args.command == "doctor":
-                toolchain, manifest = project_environment(args.project)
-                catalog = cloud.versions()["versions"]
-                matches = [
-                    b
-                    for b in catalog
-                    if b["lean_toolchain"] == toolchain and b["lake_manifest_sha256"] == manifest
-                ]
+                matches = matching_bundles(args.project, cloud.versions()["versions"])
                 result = {
                     "compatible": bool(matches),
                     "matching_bundles": matches,

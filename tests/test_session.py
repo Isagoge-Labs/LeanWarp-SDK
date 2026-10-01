@@ -40,7 +40,9 @@ class Service:
                         {
                             "bundle_id": "b",
                             "lean_toolchain": "leanprover/lean4:v4.26.0",
-                            "lake_manifest_sha256": hashlib.sha256(b"{}").hexdigest(),
+                            "lake_manifest_sha256": hashlib.sha256(
+                                b'{"version":"1.1.0","packages":[]}'
+                            ).hexdigest(),
                         }
                     ]
                 },
@@ -98,7 +100,7 @@ class Service:
 @pytest.fixture
 def project(tmp_path: Path):
     (tmp_path / "lean-toolchain").write_text("leanprover/lean4:v4.26.0\n")
-    (tmp_path / "lake-manifest.json").write_text("{}")
+    (tmp_path / "lake-manifest.json").write_text('{"version":"1.1.0","packages":[]}')
     (tmp_path / "Main.lean").write_text("theorem candidate : True := by trivial\n")
     service = Service()
     with LeanWarpCloud(
@@ -215,7 +217,7 @@ def test_lock_prevents_two_local_clients_from_mutating(project):
 def test_changed_environment_never_silently_upgrades(project):
     root, _, _, session = project
     session.connect()
-    (root / "lake-manifest.json").write_text('{"changed":true}')
+    (root / "lean-toolchain").write_text("leanprover/lean4:v4.27.0")
     with pytest.raises(SessionError, match="dependencies changed"):
         session.sync()
 
@@ -521,7 +523,10 @@ def test_recovery_preserves_nullable_and_legacy_creation_payloads(project, cap):
                 "base_url": cloud.base_url,
                 "owner_id": "owner-a",
                 "files": {},
-                "environment": ["leanprover/lean4:v4.26.0", hashlib.sha256(b"{}").hexdigest()],
+                "environment": [
+                    "leanprover/lean4:v4.26.0",
+                    hashlib.sha256(b'{"version":"1.1.0","packages":[]}').hexdigest(),
+                ],
                 "pending": {
                     "method": "create_workspace",
                     "arguments": arguments,
@@ -543,3 +548,14 @@ def test_new_connection_explicitly_selects_prepaid_policy(project):
     session.connect()
     body = json.loads(next(r.content for r in service.requests if r.method == "POST"))
     assert body["max_spend_microusd"] is None
+
+
+def test_connected_project_survives_root_rename_and_formatting(project):
+    root, _, _, session = project
+    before = session.connect()
+    (root / "lake-manifest.json").write_text(
+        '{ "name": "my_research", "packages": [], "version": "1.1.0" }\n'
+    )
+    after = session.connect()
+    assert after["workspace_id"] == before["workspace_id"]
+    session.sync()

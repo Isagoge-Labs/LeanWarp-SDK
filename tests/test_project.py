@@ -45,7 +45,57 @@ def test_missing_metadata_reports_safe_actionable_filename(tmp_path, missing):
     from leanwarp_cloud.project import ProjectError, project_environment
 
     for name in {"lean-toolchain", "lake-manifest.json"} - {missing}:
-        (tmp_path / name).write_text("{}")
+        (tmp_path / name).write_text('{"version":"1.1.0","packages":[]}')
     with pytest.raises(ProjectError, match=f"missing {missing}") as error:
         project_environment(tmp_path)
     assert "--project" in str(error.value)
+
+
+def test_real_manifest_ignores_root_name_format_and_dependency_order():
+    import json
+
+    from leanwarp_cloud.project import dependency_fingerprint
+
+    original = (Path(__file__).parents[1] / "examples/lean-4.26/lake-manifest.json").read_bytes()
+    manifest = json.loads(original)
+    manifest["name"] = "researchers_project"
+    manifest["lakeDir"] = "custom-cache"
+    manifest["packages"].reverse()
+    manifest["packages"][0]["inputRev"] = "other-ref-at-same-commit"
+    assert dependency_fingerprint(original) == dependency_fingerprint(json.dumps(manifest).encode())
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("rev", "f" * 40),
+        ("url", "https://example.test/fork"),
+        ("configFile", "other.lean"),
+        ("subDir", "other"),
+    ],
+)
+def test_real_manifest_preserves_execution_relevant_dependency_identity(field, value):
+    import json
+
+    from leanwarp_cloud.project import dependency_fingerprint
+
+    original = (Path(__file__).parents[1] / "examples/lean-4.26/lake-manifest.json").read_bytes()
+    manifest = json.loads(original)
+    manifest["packages"][0][field] = value
+    assert dependency_fingerprint(original) != dependency_fingerprint(json.dumps(manifest).encode())
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b"{}",
+        b'{"version":"1.1.0","packages":[],"unknown":true}',
+        b'{"version":"1.1.0","packages":[],"packages":[]}',
+        b'{"version":"2.0.0","packages":[]}',
+    ],
+)
+def test_ambiguous_or_unsupported_manifest_fails_closed(raw):
+    from leanwarp_cloud.project import ProjectError, dependency_fingerprint
+
+    with pytest.raises(ProjectError):
+        dependency_fingerprint(raw)

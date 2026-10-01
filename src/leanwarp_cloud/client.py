@@ -13,7 +13,7 @@ from uuid import uuid4
 import httpx
 
 from .endpoints import api_origin
-from .project import project_environment
+from .project import matching_bundles
 
 _MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 
@@ -101,13 +101,10 @@ class LeanWarpCloud:
         max_resource_profile: str = "standard",
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
-        toolchain, manifest_digest = project_environment(root)
         matches = [
             bundle
-            for bundle in self.versions()["versions"]
-            if bundle["lean_toolchain"] == toolchain
-            and bundle["lake_manifest_sha256"] == manifest_digest
-            and (bundle_id is None or bundle["bundle_id"] == bundle_id)
+            for bundle in matching_bundles(root, self.versions()["versions"])
+            if bundle_id is None or bundle["bundle_id"] == bundle_id
         ]
         if not matches:
             raise ValueError("project does not match a supported environment bundle")

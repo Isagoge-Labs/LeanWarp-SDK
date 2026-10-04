@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 from pathlib import Path
 from unittest.mock import patch
@@ -100,11 +101,42 @@ def test_polling_returns_failure_as_operation_and_timeout_keeps_handle() -> None
                 lambda _: httpx.Response(200, json={"operation_id": "op-1", "state": "queued"})
             ),
         ) as api,
-        patch("leanwarp_cloud.client.time.monotonic", side_effect=[0, 10]),
+        # Every clock read advances time, so the one-second budget expires mid-poll.
+        patch("leanwarp_cloud.client.time.monotonic", side_effect=itertools.count(0, 0.4)),
         pytest.raises(OperationTimeout) as caught,
     ):
         api.wait("op-1", timeout=1)
     assert caught.value.operation_id == "op-1"
+
+
+def test_trickling_response_checks_the_wait_deadline_before_eof(monkeypatch) -> None:
+    clock = [1000.0]
+    monkeypatch.setattr("leanwarp_cloud.client.time.monotonic", lambda: clock[0])
+    payload = json.dumps({"operation_id": "op-1", "state": "queued"}).encode()
+    received: list[int] = []
+
+    class Trickle(httpx.SyncByteStream):
+        def __iter__(self):
+            for byte in payload:
+                # Each read succeeds before its inactivity timeout. Fixed-size
+                # iteration used to hide all these reads until EOF.
+                clock[0] += 1
+                received.append(byte)
+                yield bytes([byte])
+
+    with (
+        LeanWarpCloud(
+            "secret",
+            base_url="https://cloud.example",
+            retries=0,
+            transport=httpx.MockTransport(lambda _: httpx.Response(200, stream=Trickle())),
+        ) as api,
+        pytest.raises(OperationTimeout) as caught,
+    ):
+        api.wait("op-1", timeout=20)
+    assert caught.value.operation_id == "op-1"
+    assert clock[0] == 1020
+    assert len(received) < len(payload)
 
 
 @pytest.mark.parametrize("identity", [None, "", "another-operation"])

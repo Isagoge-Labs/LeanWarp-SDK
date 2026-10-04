@@ -16,9 +16,12 @@ the project's toolchain, dependencies and intended theorem fixed.
 
 ```sh
 leanwarp connect
-leanwarp check Main.lean
-leanwarp wait
+leanwarp check Main.lean --wait 30
 ```
+
+If the returned state is not terminal (exit code `3`), the work is still running:
+run `leanwarp wait`, never submit it again. MCP operation tools wait 20 seconds by
+default (`wait_seconds`, at most 40) and follow the same rule.
 
 Edit the local files and repeat the check. Changes upload automatically. Reuse
 this connection across edits so compatible imports stay warm. Keep
@@ -31,7 +34,7 @@ before checking again. Run `leanwarp COMMAND --help` for options.
 ## Verify the result
 
 Use `verify FILE --declaration NAME --target 'PROPOSITION'` to check the candidate
-against the researcher's intended statement, then `wait`. Supply the target's
+against the researcher's intended statement, with `--wait` or a following `wait`. Supply the target's
 imports and definitions with `--context-file` when needed. Do not weaken the
 statement or context to make a proof pass.
 

@@ -3,8 +3,9 @@
 [Install the CLI](../README.md#install), then get an API key from your
 LeanWarp dashboard. Your account needs available credit to run compute.
 
-This release supports the hosted test service. Use the dashboard supplied with
-your test access; production keys are not supported yet.
+Keys from the [isagoge.in dashboard](https://isagoge.in/dashboard) use the
+production service. Keys issued for test access use the hosted test service.
+The key alone selects the service; there is no API URL to configure.
 
 If your shell cannot find `leanwarp` after installation, run `uv tool update-shell`
 and open a new terminal.
@@ -30,9 +31,11 @@ alone are not enough. If `doctor` reports a mismatch, the project cannot run on
 that bundle; use a separate supported project or request support for its environment.
 Do not replace an existing project's lockfile just to pass this check.
 
-For a first experiment, the repository includes a [Lean 4.26 example](../examples/lean-4.26)
-with the supported metadata and `LeanWarpExample.lean`. Clone the SDK repository
-and use that directory as your project:
+For a first experiment, the repository includes an example project for each Lean
+environment: [Lean 4.26](../examples/lean-4.26) and [Lean 4.34](../examples/lean-4.34).
+Each has the exact metadata and `LeanWarpExample.lean`. `leanwarp doctor` reports
+whether the service currently offers that environment. Clone the SDK repository
+and use one of these directories as your project:
 
 ```sh
 git clone https://github.com/Isagoge-Labs/LeanWarp-SDK.git

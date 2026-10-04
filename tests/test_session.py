@@ -26,6 +26,10 @@ class Service:
         self.lose = ""
         self.reject = False
         self.workspace_count = 0
+        # Operation reads before a submitted operation completes; zero completes on submit.
+        self.pending_polls = 0
+        self.fail_operation_reads = 0
+        self._completion: dict[str, Any] = {}
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
@@ -48,6 +52,13 @@ class Service:
                 },
             )
         if request.method == "GET":
+            if "/operations/" in path and self.fail_operation_reads:
+                self.fail_operation_reads -= 1
+                raise httpx.ConnectError("connection reset", request=request)
+            if "/operations/" in path and self.pending_polls:
+                self.pending_polls -= 1
+                if not self.pending_polls:
+                    self.operation = self._completion
             value = (
                 self.operation
                 if "/operations/" in path
@@ -89,6 +100,9 @@ class Service:
                     "result": {"status": "rejected"},
                 },
             }
+            if self.pending_polls:
+                self._completion = self.operation
+                self.operation = {**self.operation, "state": "queued", "result": None}
             result = self.operation
         self.receipts[key] = request.content, result
         if self.lose and path.endswith(self.lose):
@@ -345,6 +359,120 @@ def test_operation_revision_survives_later_sync_and_legacy_journals_still_read(p
     del previous["operation_revision"]
     journal.write_text(json.dumps(previous))
     assert ProjectSession(cloud, root).wait()["operation_id"] == submitted["operation_id"]
+
+
+def test_submit_and_wait_returns_the_result_that_completes_within_the_wait(project, monkeypatch):
+    _, service, _, session = project
+    monkeypatch.setattr("leanwarp_cloud.client.time.sleep", lambda _seconds: None)
+    session.connect()
+    service.pending_polls = 3
+    result = session.submit_and_wait("check", {"file": "Main.lean"}, wait_seconds=30)
+    assert result["state"] == "completed"
+    assert OperationOutcome(result).result == {"status": "rejected"}
+    assert service.pending_polls == 0
+
+
+def test_submit_and_wait_returns_running_work_without_losing_the_submission(project):
+    root, service, cloud, session = project
+    session.connect()
+    service.pending_polls = 1_000
+    pending = session.submit_and_wait("check", {"file": "Main.lean"}, wait_seconds=0.05)
+    assert pending["state"] == "queued" and pending["result"] is None
+    submissions = [r for r in service.requests if r.url.path.endswith("/operations")]
+    assert len(submissions) == 1
+    service.pending_polls = 1
+    completed = ProjectSession(cloud, root).wait(timeout=1)
+    assert completed["operation_id"] == pending["operation_id"]
+    assert completed["state"] == "completed"
+
+
+def test_failed_poll_after_submission_reports_running_work_not_a_failed_submit(project):
+    root, service, cloud, session = project
+    session.connect()
+    service.pending_polls = 1_000
+    service.fail_operation_reads = 1
+    pending = session.submit_and_wait("check", {"file": "Main.lean"}, wait_seconds=5)
+    assert pending["state"] == "queued"
+    assert json.loads((root / ".leanwarp/session.json").read_text())["pending"] is None
+    service.pending_polls = 1
+    assert ProjectSession(cloud, root).wait(timeout=1)["state"] == "completed"
+
+
+def test_inline_wait_does_not_contend_for_the_project_lock(project, monkeypatch):
+    _, service, _, session = project
+    monkeypatch.setattr("leanwarp_cloud.client.time.sleep", lambda _seconds: None)
+    session.connect()
+    service.pending_polls = 2
+    account_reads = sum(r.url.path.endswith("/account") for r in service.requests)
+    result = session.submit_and_wait("check", {"file": "Main.lean"}, wait_seconds=5)
+    assert result["state"] == "completed"
+    # Only the submission itself takes the lock and re-reads the account owner.
+    assert sum(r.url.path.endswith("/account") for r in service.requests) == account_reads + 1
+
+
+@pytest.mark.parametrize("stall", ["read", "connect"])
+def test_inline_wait_returns_within_its_budget_when_polling_stalls(tmp_path, monkeypatch, stall):
+    (tmp_path / "lean-toolchain").write_text("leanprover/lean4:v4.26.0\n")
+    (tmp_path / "lake-manifest.json").write_text('{"version":"1.1.0","packages":[]}')
+    (tmp_path / "Main.lean").write_text("theorem candidate : True := by trivial\n")
+    service = Service()
+    clock = [1000.0]
+    monkeypatch.setattr("leanwarp_cloud.client.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        "leanwarp_cloud.client.time.sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds)
+    )
+    polls: list[float] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and "/operations/" in request.url.path:
+            # A stalled dependency: nothing arrives until this phase's timeout.
+            polls.append(request.extensions["timeout"][stall])
+            clock[0] += request.extensions["timeout"][stall]
+            error = httpx.ReadTimeout if stall == "read" else httpx.ConnectTimeout
+            raise error("stalled", request=request)
+        return service.handle(request)
+
+    # The production retry policy, not the fixture's zero-retry client.
+    with LeanWarpCloud(
+        "secret", base_url="https://api.example", transport=httpx.MockTransport(handle)
+    ) as cloud:
+        session = ProjectSession(cloud, tmp_path)
+        session.connect()
+        service.pending_polls = 1_000
+        started = clock[0]
+        pending = session.submit_and_wait("check", {"file": "Main.lean"}, wait_seconds=20)
+    assert clock[0] - started <= 20
+    assert polls and all(timeout < 20 for timeout in polls)
+    assert pending["state"] == "queued"
+    assert (
+        pending["operation_id"]
+        == json.loads((tmp_path / ".leanwarp/session.json").read_text())["operation_id"]
+    )
+
+
+def test_zero_wait_submits_without_polling(project):
+    _, service, _, session = project
+    session.connect()
+    service.pending_polls = 1_000
+    reads_before = len(service.requests)
+    pending = session.submit_and_wait("check", {"file": "Main.lean"}, wait_seconds=0)
+    assert pending["state"] == "queued"
+    operation_reads = [
+        r
+        for r in service.requests[reads_before:]
+        if r.method == "GET" and "/operations/" in r.url.path
+    ]
+    assert operation_reads == []
+
+
+@pytest.mark.parametrize("wait_seconds", [-1, 40.5, True, float("nan")])
+def test_invalid_inline_wait_is_rejected_before_any_submission(project, wait_seconds):
+    root, service, _, session = project
+    session.connect()
+    with pytest.raises(ValueError, match="wait_seconds"):
+        session.submit_and_wait("check", {"file": "Main.lean"}, wait_seconds=wait_seconds)
+    assert not any(r.url.path.endswith("/operations") for r in service.requests)
+    assert json.loads((root / ".leanwarp/session.json").read_text())["pending"] is None
 
 
 def test_wrong_account_cannot_recover_a_pending_create(project):

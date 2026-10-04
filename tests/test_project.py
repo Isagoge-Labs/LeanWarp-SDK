@@ -85,13 +85,35 @@ def test_real_manifest_preserves_execution_relevant_dependency_identity(field, v
     assert dependency_fingerprint(original) != dependency_fingerprint(json.dumps(manifest).encode())
 
 
+def test_lean_4_34_manifest_format_names_the_same_dependencies():
+    import json
+
+    from leanwarp_cloud.project import dependency_fingerprint
+
+    original = (Path(__file__).parents[1] / "examples/lean-4.34/lake-manifest.json").read_bytes()
+    manifest = json.loads(original)
+    assert manifest["version"] == "1.2.0"
+    # The 1.2.0 toolchain flag is project metadata, not a dependency.
+    manifest["fixedToolchain"] = True
+    assert dependency_fingerprint(original) == dependency_fingerprint(json.dumps(manifest).encode())
+    manifest["version"] = "1.1.0"
+    manifest.pop("fixedToolchain")
+    assert dependency_fingerprint(original) == dependency_fingerprint(json.dumps(manifest).encode())
+
+
 @pytest.mark.parametrize(
     "raw",
     [
         b"{}",
         b'{"version":"1.1.0","packages":[],"unknown":true}',
+        b'{"version":"1.1.0","packages":[],"fixedToolchain":true}',
         b'{"version":"1.1.0","packages":[],"packages":[]}',
         b'{"version":"2.0.0","packages":[]}',
+        b'{"version":[],"packages":[]}',
+        b'{"version":{},"packages":[]}',
+        b'{"version":null,"packages":[]}',
+        b'{"version":true,"packages":[]}',
+        b'{"version":12,"packages":[]}',
     ],
 )
 def test_ambiguous_or_unsupported_manifest_fails_closed(raw):
@@ -99,3 +121,16 @@ def test_ambiguous_or_unsupported_manifest_fails_closed(raw):
 
     with pytest.raises(ProjectError):
         dependency_fingerprint(raw)
+
+
+def test_explicit_bundle_choice_accepts_any_build_of_a_listed_environment():
+    from leanwarp_cloud.project import selects
+
+    current = {"bundle_id": "lean-4.26-mathlib-" + "b" * 20, "environment_id": "lean-4.26-mathlib"}
+    assert selects(current, None)
+    assert selects(current, current["bundle_id"])
+    assert selects(current, "lean-4.26-mathlib")
+    assert selects(current, "lean-4.26-mathlib-" + "a" * 20)
+    assert not selects(current, "lean-4.34-mathlib-" + "a" * 20)
+    # Older services list builds without an environment.
+    assert not selects({"bundle_id": "lean426"}, "lean-4.26-mathlib")

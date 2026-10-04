@@ -136,6 +136,13 @@ def test_cli_installed_project_workflow_and_skill(tmp_path):
         first = json.loads(command("check", "Main.lean", expected=1))
         assert first["kind"] == "check"
         assert json.loads(command("wait", expected=1))["operation_id"] == first["operation_id"]
+        invalid = json.loads(command("check", "Main.lean", "--wait", "99", expected=2))
+        assert "wait_seconds must be between 0 and 40" in invalid["message"]
+        service.pending_polls = 1_000
+        running = json.loads(command("check", "Main.lean", "--wait", "0.2", expected=3))
+        assert running["state"] == "queued"
+        service.pending_polls = 1
+        assert json.loads(command("wait", expected=1))["state"] == "completed"
         (tmp_path / "Main.lean").write_text("theorem candidate : True := True.intro\n")
         command("verify", "Main.lean", "--declaration", "candidate", "--target", "True", expected=1)
         assert service.workspace_count == 1
@@ -188,6 +195,8 @@ def test_mcp_stdio_uses_same_project_session_without_key_arguments(tmp_path):
                 assert not connected.isError, connected
                 submitted = await client.call_tool("check", {"file": "Main.lean"})
                 assert not submitted.isError, submitted
+                # The default inline wait returns the finished result in the same call.
+                assert json.loads(submitted.content[0].text)["state"] == "completed"
                 result = await client.call_tool("wait", {"timeout": 1})
                 assert not result.isError, result
                 stopped = await client.call_tool("stop")

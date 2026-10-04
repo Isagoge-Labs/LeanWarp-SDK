@@ -6,7 +6,7 @@ between checks.
 
 **[Get started](docs/getting-started.md)** ·
 [Documentation](docs/README.md) · [Agent setup](docs/agents.md) ·
-[API reference](#http-api) · [Website](https://isagoge.in/#leanwarp)
+[API reference](#http-api) · [Website](https://isagoge.in/leanwarp)
 
 ## Proof operations
 
@@ -16,6 +16,16 @@ between checks.
 | `inspect` | The goals and local context at a position in a proof. | `leanwarp inspect` |
 | `try_tactics` | Results of candidate tactics, without editing your source. | `leanwarp try-tactics` |
 | `verify_target` | A check that your declaration proves the statement you supplied, with a verification receipt. | `leanwarp verify` |
+
+### Coming soon
+
+These operations are planned for upcoming releases and are not available yet:
+
+- **Proof repair**: fill `sorry` placeholders with candidate proofs that Lean rechecks.
+- **Proof simplification**: replace a proof with a shorter one that still checks.
+- **Lemma extraction**: lift `sorry` goals or named `have` blocks into top-level lemmas.
+- **Declaration extraction**: list the declarations a file adds, with their types.
+- **Proof search**: explore tactic branches from a goal in the warm workspace.
 
 The CLI and MCP adapter handle file uploads, workspace reuse and request recovery.
 The Python library provides the same project workflow and a lower-level HTTP client.
@@ -41,7 +51,7 @@ first proof, or [set up your agent](docs/agents.md). Python applications use the
 
 ## Use with an agent
 
-Create a key in the [dashboard](https://isagoge.in/#dashboard), then run
+Create a key in the [dashboard](https://isagoge.in/dashboard), then run
 `leanwarp auth login` and paste it at the hidden prompt. The key selects the
 service; no API URL is needed.
 
@@ -71,14 +81,16 @@ Connect project → edit → check / inspect / try tactics / verify → read res
   reuse the worker and its imports. Every verification still checks the supplied
   target independently. Saved source survives a worker restart; in-memory state
   does not.
-- **Results are explicit.** Submission starts an operation; `leanwarp wait`
-  retrieves its result. A completed operation does not necessarily mean the
-  proof passed. See [results and exit codes](src/leanwarp_cloud/skills/leanwarp/references/usage.md#results).
+- **Results are explicit.** Submission starts an operation; `--wait SECONDS`
+  (or the MCP tools' default 20-second wait) returns its result in the same call,
+  and `leanwarp wait` retrieves work that is still running. A completed operation
+  does not necessarily mean the proof passed. See [results and exit codes](src/leanwarp_cloud/skills/leanwarp/references/usage.md#results).
 
 Use `leanwarp doctor` to check the project's toolchain and dependencies against
 supported environments. LeanWarp does not build arbitrary project dependencies.
-Start with the [included example project](examples/lean-4.26) if you want to try
-verification before connecting an existing project.
+Start with an included example project ([Lean 4.26](examples/lean-4.26) or
+[Lean 4.34](examples/lean-4.34)) if you want to try verification before connecting
+an existing project.
 For a separate temporary verification worker, use `verify --fresh`.
 
 Manage funding and optional workspace lifetime caps in **Dashboard → Usage &

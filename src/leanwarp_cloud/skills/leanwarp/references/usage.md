@@ -31,7 +31,10 @@ policy. A restarted worker restores acknowledged files but loses in-memory handl
 
 ## Results
 
-Commands return JSON; operations are asynchronous. Call `wait` after submission.
+Commands return JSON; operations run on the server after submission. MCP operation
+tools wait up to `wait_seconds` (default 20, maximum 40) and return the result when
+it finishes in time. CLI operations accept `--wait SECONDS` for the same behavior.
+A non-terminal state means the work is still running: call `wait`, never resubmit.
 A terminal operation can still contain a rejected proof or compiler errors.
 
 | Operation | Result to inspect |
@@ -57,8 +60,9 @@ The executed allocation's generation is `result.generation`; do not compare it t
 `workspace_generation` for a fresh verification.
 
 CLI exit codes: `0` successful command or result, `1` unsuccessful terminal result
-or incompatible project, `2` request/local error, `3` polling timeout. A successful
-submission alone does not mean the proof passed.
+or incompatible project, `2` request/local error, `3` polling timeout (including an
+operation still running when `--wait` expires). A successful submission alone does
+not mean the proof passed.
 
 ### Verification policy
 
@@ -130,13 +134,14 @@ from leanwarp_cloud.config import load_client
 with load_client() as cloud:
     project = ProjectSession(cloud, "/path/to/your/lean-project")
     project.connect()
-    project.submit("verify_target", {
+    result = project.submit_and_wait("verify_target", {
         "file": "LeanWarpExample.lean",
         "candidate_declaration": "add_zero_example",
         "target_statement": "∀ n : Nat, n + 0 = n",
         "execution_mode": "reusable",
-    })
-    result = project.wait(timeout=300)
+    }, wait_seconds=30)
+    if not OperationOutcome(result).terminal:
+        result = project.wait(timeout=300)
     project.stop()
     if not OperationOutcome(result).verified:
         raise RuntimeError("Verification failed", result)
@@ -208,7 +213,7 @@ shutdown releases the unused amount. A positive posted balance may therefore be
 insufficient for another allocation.
 
 `--execution-timeout` sets the server deadline (1–600 seconds). `wait --timeout`
-limits local polling; HTTP request timeouts are separate. Uploads are limited to
+and an operation's `--wait` limit local polling; HTTP request timeouts are separate. Uploads are limited to
 256 files / 1 MiB including path bytes. Hidden/dependency/cache directories and
 `lakefile.lean` are excluded. Visible symlinked source directories and symlinked
 Lean files are rejected. Module path components must start with an ASCII letter

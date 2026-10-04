@@ -13,14 +13,24 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from .client import LeanWarpCloud, LeanWarpCloudError
-from .project import collect_lean_sources, matching_bundles, project_environment
+import httpx
+
+from .client import LeanWarpCloud, LeanWarpCloudError, OperationTimeout
+from .project import collect_lean_sources, matching_bundles, project_environment, selects
 
 _MAX_JOURNAL_BYTES = 8 * 1024 * 1024
+_TERMINAL_STATES = frozenset({"completed", "failed", "cancelled"})
+# Polling shares this budget (see LeanWarpCloud.wait). Even one bounded overrun
+# read keeps an inline wait under the common 60-second MCP client tool deadline.
+MAX_INLINE_WAIT_SECONDS = 40
 
 
 class SessionError(RuntimeError):
     """Local recovery or project reconciliation is required before another write."""
+
+
+class WaitError(ValueError):
+    """An inline wait outside its supported range; nothing was submitted."""
 
 
 class ProjectSession:
@@ -174,7 +184,7 @@ class ProjectSession:
             matches = [
                 b
                 for b in matching_bundles(self.root, self.cloud.versions()["versions"])
-                if bundle_id is None or b["bundle_id"] == bundle_id
+                if selects(b, bundle_id)
             ]
             if not matches:
                 raise SessionError(
@@ -254,6 +264,46 @@ class ProjectSession:
             if timeout_seconds is not None:
                 body["timeout_seconds"] = timeout_seconds
             return self._request(state, "submit", body)
+
+    def submit_and_wait(
+        self,
+        kind: str,
+        payload: Mapping[str, Any],
+        *,
+        wait_seconds: float,
+        resource_profile: str | None = None,
+        timeout_seconds: int | None = None,
+    ) -> dict[str, Any]:
+        """Submit, then poll briefly for the result in the same call.
+
+        An acknowledged submission is durable, so neither an expired wait nor a
+        failed poll raises: the still-running operation is returned and the caller
+        continues with wait(). Polling never cancels server work.
+        """
+        if (
+            isinstance(wait_seconds, bool)
+            or not isinstance(wait_seconds, int | float)
+            or not 0 <= wait_seconds <= MAX_INLINE_WAIT_SECONDS
+        ):
+            raise WaitError(f"wait_seconds must be between 0 and {MAX_INLINE_WAIT_SECONDS}")
+        operation = self.submit(
+            kind, payload, resource_profile=resource_profile, timeout_seconds=timeout_seconds
+        )
+        if wait_seconds == 0 or operation.get("state") in _TERMINAL_STATES:
+            return operation
+        submitted = {
+            "operation_id": operation["operation_id"],
+            "operation_revision": operation["revision"],
+        }
+        # Poll this exact operation without the project lock, which another local
+        # command may hold; the receipt check below binds the result to it.
+        try:
+            latest = self.cloud.wait(operation["operation_id"], timeout=wait_seconds)
+        except OperationTimeout as error:
+            latest = error.operation or operation
+        except (httpx.TransportError, LeanWarpCloudError):
+            latest = operation
+        return self._checked_operation(submitted, latest)
 
     def _request(
         self,

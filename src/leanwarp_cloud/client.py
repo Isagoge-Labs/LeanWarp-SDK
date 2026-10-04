@@ -13,7 +13,8 @@ from uuid import uuid4
 import httpx
 
 from .endpoints import api_origin
-from .project import matching_bundles
+from .project import matching_bundles, selects
+from .transport import DeadlineTransport
 
 _MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 
@@ -28,8 +29,10 @@ class LeanWarpCloudError(RuntimeError):
 class OperationTimeout(TimeoutError):
     """Polling expired; the operation remains addressable and may still be running."""
 
-    def __init__(self, operation_id: str) -> None:
+    def __init__(self, operation_id: str, operation: dict[str, Any] | None = None) -> None:
         self.operation_id = operation_id
+        # The last non-terminal observation, when polling read one.
+        self.operation = operation
         super().__init__(f"operation {operation_id} is still pending; poll again or cancel it")
 
 
@@ -67,8 +70,9 @@ class LeanWarpCloud:
             base_url=base_url.rstrip("/") + "/",
             headers={"Authorization": f"Bearer {api_key}", "Accept-Encoding": "identity"},
             timeout=timeout,
-            transport=transport,
+            transport=transport if transport is not None else DeadlineTransport(base_url),
             follow_redirects=False,
+            trust_env=False,
         )
         self._retries = retries
         self.base_url = base_url.rstrip("/")
@@ -104,12 +108,12 @@ class LeanWarpCloud:
         matches = [
             bundle
             for bundle in matching_bundles(root, self.versions()["versions"])
-            if bundle_id is None or bundle["bundle_id"] == bundle_id
+            if selects(bundle, bundle_id)
         ]
         if not matches:
             raise ValueError("project does not match a supported environment bundle")
-        # Catalog promotion appends immutable releases. Existing workspaces keep
-        # their pin; new workspaces default to the latest admitted matching build.
+        # The service lists each environment's current build; every workspace
+        # starts new workers on its environment's current build.
         return self.create_workspace(
             matches[-1]["bundle_id"],
             resource_profile=resource_profile,
@@ -194,8 +198,9 @@ class LeanWarpCloud:
             idempotency_key=idempotency_key or uuid4().hex,
         )
 
-    def operation(self, operation_id: str) -> dict[str, Any]:
-        result = self._request("GET", f"operations/{_segment(operation_id)}")
+    def operation(self, operation_id: str, *, deadline: float | None = None) -> dict[str, Any]:
+        """Read an operation; ``deadline`` (``time.monotonic()``) bounds the whole read."""
+        result = self._request("GET", f"operations/{_segment(operation_id)}", deadline=deadline)
         if result.get("operation_id") != operation_id:
             raise LeanWarpCloudError(502, "invalid_response", "operation identity does not match")
         return result
@@ -294,16 +299,29 @@ class LeanWarpCloud:
     def wait(
         self, operation_id: str, *, timeout: float = 300, poll_interval: float = 1
     ) -> dict[str, Any]:
+        """Poll until the operation is terminal or ``timeout`` seconds pass.
+
+        Every poll request, retry and network read shares the same deadline.
+        Platform DNS and caller-injected transports retain their own timeout
+        behavior (see ``_request``).
+        """
         if timeout <= 0 or poll_interval <= 0:
             raise ValueError("timeout and poll_interval must be positive")
         deadline = time.monotonic() + timeout
+        operation: dict[str, Any] | None = None
         while True:
-            operation = self.operation(operation_id)
-            if operation.get("state") in {"completed", "failed", "cancelled"}:
-                return operation
+            try:
+                operation = self.operation(operation_id, deadline=deadline)
+            except httpx.TimeoutException:
+                # A slow read before the deadline is just a missed poll.
+                if time.monotonic() >= deadline:
+                    raise OperationTimeout(operation_id, operation) from None
+            else:
+                if operation.get("state") in {"completed", "failed", "cancelled"}:
+                    return operation
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise OperationTimeout(operation_id)
+                raise OperationTimeout(operation_id, operation)
             time.sleep(min(poll_interval, remaining))
 
     def cancel(self, operation_id: str) -> dict[str, Any]:
@@ -322,7 +340,15 @@ class LeanWarpCloud:
         *,
         body: Mapping[str, Any] | None = None,
         idempotency_key: str | None = None,
+        deadline: float | None = None,
     ) -> dict[str, Any]:
+        """Send with bounded retries.
+
+        With a ``deadline`` (``time.monotonic()``), no attempt or backoff starts
+        after it, and each attempt splits its remaining budget across connect,
+        response and body reads (see ``_attempt_timeout``). Expiry raises
+        ``httpx.TimeoutException``.
+        """
         headers = {"Idempotency-Key": idempotency_key} if idempotency_key else {}
         # One request identity always replays the same bytes, even if the caller
         # mutates a nested payload while a response is lost or a retry backs off.
@@ -335,18 +361,18 @@ class LeanWarpCloud:
         retryable = method == "GET" or idempotency_key is not None
         attempts = self._retries + 1 if retryable else 1
         for attempt in range(attempts):
+            timeout = _attempt_timeout(deadline)
             try:
-                response = self._send(method, path, content, headers)
+                response = self._send(method, path, content, headers, timeout, deadline)
             except httpx.TransportError:
-                if attempt + 1 == attempts:
+                if attempt + 1 == attempts or not _backoff(min(0.25 * 2**attempt, 2), deadline):
                     raise
-                time.sleep(min(0.25 * 2**attempt, 2))
                 continue
             if response.status_code in {429, 502, 503, 504} and attempt + 1 < attempts:
                 retry_after = response.headers.get("Retry-After", "")
                 delay = min(float(retry_after), 5) if retry_after.isdigit() else 0.25 * 2**attempt
-                time.sleep(delay)
-                continue
+                if _backoff(delay, deadline):
+                    continue
             if not response.is_success:
                 try:
                     error = response.json().get("error", {})
@@ -371,17 +397,33 @@ class LeanWarpCloud:
         raise AssertionError("request attempts exhausted without a result")
 
     def _send(
-        self, method: str, path: str, request_content: bytes | None, headers: Mapping[str, str]
+        self,
+        method: str,
+        path: str,
+        request_content: bytes | None,
+        headers: Mapping[str, str],
+        timeout: httpx.Timeout | None = None,
+        deadline: float | None = None,
     ) -> httpx.Response:
         with self._client.stream(
-            method, f"v1/leanwarp/{path}", content=request_content, headers=headers
+            method,
+            f"v1/leanwarp/{path}",
+            content=request_content,
+            headers=headers,
+            extensions={"leanwarp_deadline": deadline},
+            # httpx.USE_CLIENT_DEFAULT keeps the client's configured timeout.
+            timeout=timeout if timeout is not None else httpx.USE_CLIENT_DEFAULT,
         ) as response:
             if response.headers.get("Content-Encoding", "identity").lower() != "identity":
                 raise LeanWarpCloudError(
                     502, "invalid_encoding", "expected an uncompressed response"
                 )
             content = bytearray()
-            for chunk in response.iter_bytes(chunk_size=65536):
+            # Fixed-size chunks buffer small transport reads until the chunk is
+            # full or EOF, hiding a trickling body from the deadline check.
+            for chunk in response.iter_bytes():
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise httpx.ReadTimeout("deadline reached", request=response.request)
                 if len(content) + len(chunk) > _MAX_RESPONSE_BYTES:
                     raise LeanWarpCloudError(
                         502, "response_too_large", "response exceeds SDK limit"
@@ -393,6 +435,29 @@ class LeanWarpCloud:
                 content=bytes(content),
                 request=response.request,
             )
+
+
+def _attempt_timeout(deadline: float | None) -> httpx.Timeout | None:
+    """Limit each blocking network wait to a third of the remaining budget.
+
+    The default transport also clamps each network read (including headers)
+    to the remaining deadline. Platform DNS and caller-injected transports
+    retain their own blocking behavior; no background request survives expiry.
+    """
+    if deadline is None:
+        return None
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise httpx.TimeoutException("deadline reached")
+    return httpx.Timeout(remaining / 3)
+
+
+def _backoff(delay: float, deadline: float | None) -> bool:
+    """Sleep before a retry, or return False when the retry cannot start in time."""
+    if deadline is not None and time.monotonic() + delay >= deadline:
+        return False
+    time.sleep(delay)
+    return True
 
 
 def _segment(value: str) -> str:

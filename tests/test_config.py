@@ -34,6 +34,12 @@ def test_environment_key_chooses_exact_origin_without_fallback(monkeypatch):
     assert len(seen) == 2
 
 
+def test_released_keys_select_their_fixed_services():
+    assert endpoints.api_origin(LIVE_KEY) == "https://api.isagoge.in"
+    assert endpoints.api_origin(TEST_KEY) == "https://control-api-staging-3b57.up.railway.app"
+    assert endpoints.api_origin(LEGACY_KEY) == endpoints.api_origin(TEST_KEY)
+
+
 @pytest.mark.parametrize(
     "key", [LIVE_KEY, "lw_unknown_secret", "", "https://arbitrary.example/key"]
 )

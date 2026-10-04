@@ -11,6 +11,10 @@ from pathlib import Path
 from typing import Any
 
 _EXCLUDED = {".git", ".lake", ".env", ".ssh", ".aws", ".venv", "node_modules", "vendor"}
+# Lake manifest formats in supported Lean releases. 1.2.0 (Lean 4.34) adds an
+# optional `fixedToolchain` flag; neither format's extra fields name dependencies.
+_V1_FIELDS = frozenset({"version", "packages", "name", "lakeDir", "packagesDir"})
+_MANIFEST_FIELDS = {"1.1.0": _V1_FIELDS, "1.2.0": _V1_FIELDS | {"fixedToolchain"}}
 
 
 class ProjectError(ValueError):
@@ -66,11 +70,15 @@ def dependency_fingerprint(raw: bytes) -> str:
         raise ProjectError("invalid Lake dependency manifest") from error
     if (
         not isinstance(manifest, dict)
-        or manifest.get("version") != "1.1.0"
-        or set(manifest) - {"version", "packages", "name", "lakeDir", "packagesDir"}
+        or not isinstance(manifest.get("version"), str)
+        or manifest.get("version") not in _MANIFEST_FIELDS
+        or set(manifest) - _MANIFEST_FIELDS[manifest["version"]]
         or not isinstance(manifest.get("packages"), list)
     ):
-        raise ProjectError("unsupported Lake dependency manifest; expected version 1.1.0")
+        raise ProjectError(
+            "unsupported Lake dependency manifest; expected version "
+            + " or ".join(sorted(_MANIFEST_FIELDS))
+        )
     packages = []
     names: set[str] = set()
     for package in manifest["packages"]:
@@ -121,6 +129,24 @@ def project_environment(root: str | Path, *, legacy: bool = False) -> tuple[str,
         files["lean-toolchain"].decode("utf-8").strip(),
         hashlib.sha256(raw).hexdigest() if legacy else dependency_fingerprint(raw),
     )
+
+
+def selects(bundle: dict[str, Any], requested: str | None) -> bool:
+    """Whether a listed build satisfies an explicit `--bundle` choice.
+
+    The service lists each environment's current build, so a build or environment
+    identity selects it; a superseded build of the same environment does too.
+    """
+    if requested is None:
+        return True
+    if requested == bundle["bundle_id"]:
+        return True
+    environment = bundle.get("environment_id")
+    build = re.fullmatch(r"(.+)-[0-9a-f]{20}", requested)
+    return environment is not None and environment in {
+        requested,
+        build.group(1) if build else None,
+    }
 
 
 def matching_bundles(root: str | Path, catalog: list[dict[str, Any]]) -> list[dict[str, Any]]:

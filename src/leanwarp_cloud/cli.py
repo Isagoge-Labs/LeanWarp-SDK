@@ -17,7 +17,7 @@ from .config import credentials_path, load_client, save_credentials
 from .endpoints import ConfigurationError
 from .outcome import OperationOutcome
 from .project import ProjectError, matching_bundles
-from .session import ProjectSession, SessionError
+from .session import MAX_INLINE_WAIT_SECONDS, ProjectSession, SessionError, WaitError
 
 
 def parser() -> argparse.ArgumentParser:
@@ -85,6 +85,13 @@ def parser() -> argparse.ArgumentParser:
     for operation in (check, inspect, tactics, verify):
         operation.add_argument("--profile")
         operation.add_argument("--execution-timeout", type=int)
+        operation.add_argument(
+            "--wait",
+            type=float,
+            default=0,
+            metavar="SECONDS",
+            help=f"also poll for the result for up to {MAX_INLINE_WAIT_SECONDS} seconds",
+        )
     return root
 
 
@@ -168,12 +175,17 @@ def main(argv: list[str] | None = None) -> int:
                         target_context=context,
                         execution_mode="fresh" if args.fresh else "reusable",
                     )
-                result = project.submit(
+                result = project.submit_and_wait(
                     kind,
                     payload,
+                    wait_seconds=args.wait,
                     resource_profile=args.profile,
                     timeout_seconds=args.execution_timeout,
                 )
+                if args.wait and not OperationOutcome(result).terminal:
+                    # Same exit status as an expired `wait`: submitted and still running.
+                    _emit(result)
+                    return 3
             _emit(result)
             if "operation_id" in result and OperationOutcome(result).terminal:
                 return 0 if OperationOutcome(result).successful else 1
@@ -198,7 +210,7 @@ def main(argv: list[str] | None = None) -> int:
             {
                 "error": "local_error",
                 "message": str(error)
-                if isinstance(error, (SessionError, ConfigurationError, ProjectError))
+                if isinstance(error, (SessionError, ConfigurationError, ProjectError, WaitError))
                 else "invalid local input or filesystem access",
             }
         )

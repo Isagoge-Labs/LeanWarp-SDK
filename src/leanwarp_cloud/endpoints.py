@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import re
 
-# The public API is configured here when its production deployment is qualified.
-# Never substitute staging for an unavailable production service.
+# Each key prefix names exactly one service. A missing origin disables that
+# environment; never substitute staging for an unavailable production service.
 _API_ORIGINS: dict[str, str | None] = {
     "test": "https://control-api-staging-3b57.up.railway.app",
-    "live": None,
+    "live": "https://api.isagoge.in",
 }
 
 

@@ -88,13 +88,14 @@ Connect project → edit → check / inspect / try tactics / verify → read res
 
 Use `leanwarp doctor` to check the project's toolchain and dependencies against
 supported environments. LeanWarp does not build arbitrary project dependencies.
-Start with an included example project ([Lean 4.26](examples/lean-4.26) or
-[Lean 4.34](examples/lean-4.34)) if you want to try verification before connecting
+Start with an included example project ([Lean 4.34](examples/lean-4.34) or
+[Lean 4.26](examples/lean-4.26)) if you want to try verification before connecting
 an existing project.
 For a separate temporary verification worker, use `verify --fresh`.
 
-Manage funding and optional workspace lifetime caps in **Dashboard → Usage &
-credits**. Compute requires available prepaid credit, including reservations.
+Manage funding in **Dashboard → Usage & credits**. Set optional workspace lifetime
+caps in the **Workspaces** section of the **LeanWarp** tab. Compute requires
+available prepaid credit, including reservations.
 Warm idle time is billed until compute stops: use `leanwarp stop` when finished.
 Changing a cap does not cancel already reserved work.
 If an operation is active, wait for it or cancel it and wait before stopping.
@@ -161,3 +162,7 @@ Manage keys and spending limits through the dashboard.
 The agent instructions ship with the package: `leanwarp skill` prints the
 workflow, and `leanwarp skill --reference` prints the full reference. Use
 `leanwarp COMMAND --help` for arguments.
+
+## License
+
+The SDK is available under the [MIT License](LICENSE).

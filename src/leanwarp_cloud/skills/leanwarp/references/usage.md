@@ -7,7 +7,7 @@ Use `leanwarp COMMAND --help` for arguments.
 
 | Command | Purpose |
 | --- | --- |
-| `doctor` | Match the exact toolchain and dependency lockfile to a supported bundle. |
+| `doctor` | Match the Lean toolchain and resolved dependencies to a supported bundle. |
 | `account`, `resources`, `versions` | Read available credit, compute profiles and supported bundles. |
 | `connect` | Save a workspace without starting compute. |
 | `check FILE` | Check a Lean file. |

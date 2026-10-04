@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 import os
@@ -132,15 +133,25 @@ def test_cli_installed_project_workflow_and_skill(tmp_path):
             return run.stdout
 
         assert "name: leanwarp" in command("skill")
-        assert json.loads(command("connect"))["workspace_id"] == "w"
+        diagnosis = json.loads(command("doctor"))
+        assert diagnosis["compatible"] is True
+        assert diagnosis["matching_bundles"]
+        assert diagnosis["resources"]
+        assert diagnosis["base_url"] == origin
+        assert json.loads(command("connect", "--bundle", "b"))["workspace_id"] == "w"
+        assert json.loads(command("versions"))["versions"]
+        assert json.loads(command("sync"))["revision"] == 1
         first = json.loads(command("check", "Main.lean", expected=1))
         assert first["kind"] == "check"
+        # Results lead with whether they passed; the full server receipt follows.
+        assert next(iter(first)) == "success" and first["success"] is False
         assert json.loads(command("wait", expected=1))["operation_id"] == first["operation_id"]
         invalid = json.loads(command("check", "Main.lean", "--wait", "99", expected=2))
-        assert "wait_seconds must be between 0 and 40" in invalid["message"]
+        assert invalid["error"] == "invalid_arguments"
+        assert "between 0 and 40 seconds" in invalid["message"]
         service.pending_polls = 1_000
         running = json.loads(command("check", "Main.lean", "--wait", "0.2", expected=3))
-        assert running["state"] == "queued"
+        assert running["state"] == "queued" and running["success"] is None
         service.pending_polls = 1
         assert json.loads(command("wait", expected=1))["state"] == "completed"
         (tmp_path / "Main.lean").write_text("theorem candidate : True := True.intro\n")
@@ -264,8 +275,66 @@ def test_credentials_require_key_and_reject_public_readable_file(tmp_path, monke
     path.parent.mkdir()
     path.write_text(json.dumps({"api_key": TEST_KEY}))
     path.chmod(0o644)
-    with pytest.raises(SessionError, match="only by its owner"):
+    with pytest.raises(SessionError, match="readable only by you"):
         load_client()
     path.chmod(0o600)
     with load_client() as client:
         assert client.base_url == "https://control-api-staging-3b57.up.railway.app"
+
+
+def test_cli_help_describes_every_command_and_reports_its_version(capsys):
+    from leanwarp_cloud import __version__
+    from leanwarp_cloud.cli import parser
+
+    root = parser()
+    commands = next(a for a in root._actions if isinstance(a, argparse._SubParsersAction))
+    described = {action.dest for action in commands._choices_actions if action.help}
+    assert set(commands.choices) - {"versions"} <= described
+    for name, command in commands.choices.items():
+        for action in command._actions:
+            if action.option_strings and action.dest != "help" and action.help is not None:
+                assert action.help.strip(), (name, action.dest)
+    with pytest.raises(SystemExit) as exited:
+        root.parse_args(["--version"])
+    assert exited.value.code == 0
+    assert capsys.readouterr().out.strip() == f"leanwarp {__version__}"
+
+
+def test_cli_reports_argument_mistakes_as_json(capsys):
+    from leanwarp_cloud.cli import main
+
+    with pytest.raises(SystemExit) as exited:
+        main(["inspect", "Main.lean", "--line", "1"])
+    assert exited.value.code == 2
+    error = json.loads(capsys.readouterr().out)
+    assert error["error"] == "invalid_arguments"
+    assert "--column" in error["message"]
+
+
+def test_cli_explains_a_malformed_key(monkeypatch, capsys, tmp_path):
+    from leanwarp_cloud.cli import main
+
+    monkeypatch.setenv("LEANWARP_API_KEY", "lw_live_fake")
+    (tmp_path / "Main.lean").write_text("example : True := trivial")
+    assert main(["--project", str(tmp_path), "doctor"]) == 2
+    error = json.loads(capsys.readouterr().out)
+    assert "not a LeanWarp API key" in error["message"]
+
+
+def test_mcp_starts_and_explains_sign_in_before_credentials_exist(tmp_path, monkeypatch):
+    from leanwarp_cloud.mcp_server import create_server
+
+    def not_signed_in():
+        raise SessionError("not signed in; run `leanwarp auth login` or set LEANWARP_API_KEY")
+
+    server = create_server(not_signed_in, str(tmp_path))
+
+    async def call():
+        guide = await server.read_resource("leanwarp://guide")
+        assert "# LeanWarp" in next(iter(guide)).content
+        tools = {tool.name for tool in await server.list_tools()}
+        assert {"doctor", "environments", "connect", "verify_target"} <= tools
+        with pytest.raises(Exception, match="auth login"):
+            await server.call_tool("doctor", {})
+
+    asyncio.run(call())

@@ -238,7 +238,7 @@ def test_project_selects_exact_environment_and_rejects_mismatch(tmp_path: Path) 
     ) as api:
         assert api.create_workspace_for_project(tmp_path)["workspace_id"] == "w"
         (tmp_path / "lean-toolchain").write_text("leanprover/lean4:v4.27.0\n")
-        with pytest.raises(ValueError, match="supported"):
+        with pytest.raises(ValueError, match="No LeanWarp environment matches"):
             api.create_workspace_for_project(tmp_path)
     assert len(created) == 1 and created[0]["bundle_id"] == "exact"
 
@@ -279,7 +279,7 @@ def test_project_connects_using_locked_dependencies_not_example_name(tmp_path: P
         assert api.create_workspace_for_project(tmp_path)["workspace_id"] == "w"
         manifest["packages"][0]["rev"] = "f" * 40
         (tmp_path / "lake-manifest.json").write_text(json.dumps(manifest))
-        with pytest.raises(ValueError, match="supported"):
+        with pytest.raises(ValueError, match="No LeanWarp environment matches"):
             api.create_workspace_for_project(tmp_path)
     assert selected == ["qualified"]
 
@@ -310,11 +310,12 @@ def test_new_project_uses_latest_matching_build_and_allows_an_older_pin(tmp_path
         "secret", base_url="https://cloud.example", transport=httpx.MockTransport(handle)
     ) as api:
         api.create_workspace_for_project(tmp_path)
-        api.create_workspace_for_project(tmp_path, bundle_id="old")
-        for invalid in ("other", "missing"):
-            with pytest.raises(ValueError, match="supported"):
-                api.create_workspace_for_project(tmp_path, bundle_id=invalid)
-    assert selected == ["new", "old"]
+        api.create_workspace_for_project(tmp_path, environment="old")
+        # An explicit choice runs on the named environment even if the project pins another.
+        api.create_workspace_for_project(tmp_path, environment="other")
+        with pytest.raises(ValueError, match="does not serve the environment 'missing'"):
+            api.create_workspace_for_project(tmp_path, environment="missing")
+    assert selected == ["new", "old", "other"]
 
 
 def test_execution_deadline_is_forwarded_and_retried_independently_of_polling() -> None:

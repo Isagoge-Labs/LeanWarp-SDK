@@ -1,7 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="960" height="232" viewBox="0 0 960 232" role="img" aria-labelledby="title desc">
   <title id="title">LeanWarp</title>
-  <desc id="desc">faster lean</desc>
+  <desc id="desc">Lean proofs, checked on warm workers</desc>
   <rect width="960" height="232" rx="12" fill="#080f14"/>
   <text x="480" y="112" text-anchor="middle" fill="#f1f6fa" font-family="ui-sans-serif,system-ui,sans-serif" font-size="52" font-weight="650" letter-spacing="-1.5">LeanWarp</text>
-  <text x="480" y="150" text-anchor="middle" fill="#b0c3cf" font-family="ui-sans-serif,system-ui,sans-serif" font-size="20">faster lean</text>
+  <text x="480" y="150" text-anchor="middle" fill="#b0c3cf" font-family="ui-sans-serif,system-ui,sans-serif" font-size="20">Lean proofs, checked on warm workers</text>
 </svg>

@@ -36,6 +36,8 @@ class Service:
         path = request.url.path
         if path.endswith("/account"):
             return httpx.Response(200, json={"owner_id": "owner-a"})
+        if path.endswith("/resources"):
+            return httpx.Response(200, json={"resources": [{"name": "standard"}]})
         if path.endswith("/versions"):
             return httpx.Response(
                 200,
@@ -232,8 +234,16 @@ def test_changed_environment_never_silently_upgrades(project):
     root, _, _, session = project
     session.connect()
     (root / "lean-toolchain").write_text("leanprover/lean4:v4.27.0")
-    with pytest.raises(SessionError, match="dependencies changed"):
+    with pytest.raises(SessionError, match="toolchain or lockfile changed"):
         session.sync()
+
+
+def test_connected_project_refuses_a_silent_environment_switch(project):
+    _, service, _, session = project
+    session.connect()
+    with pytest.raises(SessionError, match="disconnect"):
+        session.connect(environment="lean-4.34-mathlib")
+    assert service.workspace_count == 1
 
 
 def test_malformed_journal_is_not_overwritten(project):
@@ -241,7 +251,7 @@ def test_malformed_journal_is_not_overwritten(project):
     session.connect()
     journal = root / ".leanwarp/session.json"
     journal.write_text("{broken")
-    with pytest.raises(SessionError, match="invalid"):
+    with pytest.raises(SessionError, match="damaged"):
         session.sync()
     assert journal.read_text() == "{broken"
 
@@ -341,7 +351,7 @@ def test_saved_submission_revision_rejects_a_coherently_wrong_receipt(
     service.operation["result"]["revision"] = 999
     monkeypatch.setattr(cloud, "cancel", lambda _operation: service.operation)
     restarted = ProjectSession(cloud, root)
-    with pytest.raises(SessionError, match="saved submission"):
+    with pytest.raises(SessionError, match="different operation"):
         getattr(restarted, command)()
     assert journal.read_bytes() == saved
 
@@ -469,7 +479,7 @@ def test_zero_wait_submits_without_polling(project):
 def test_invalid_inline_wait_is_rejected_before_any_submission(project, wait_seconds):
     root, service, _, session = project
     session.connect()
-    with pytest.raises(ValueError, match="wait_seconds"):
+    with pytest.raises(ValueError, match="inline wait"):
         session.submit_and_wait("check", {"file": "Main.lean"}, wait_seconds=wait_seconds)
     assert not any(r.url.path.endswith("/operations") for r in service.requests)
     assert json.loads((root / ".leanwarp/session.json").read_text())["pending"] is None
@@ -509,7 +519,7 @@ def test_invalid_journal_fields_never_reach_network(project, field, value):
     state[field] = value
     path.write_text(json.dumps(state))
     count = len(service.requests)
-    with pytest.raises(SessionError, match="invalid"):
+    with pytest.raises(SessionError, match="damaged"):
         session.recover()
     assert len(service.requests) == count
 
@@ -534,7 +544,7 @@ def test_invalid_success_receipt_retains_recoverable_creation(project, monkeypat
         )
 
     monkeypatch.setattr(cloud, "_request", malformed)
-    with pytest.raises(SessionError, match="invalid API receipt"):
+    with pytest.raises(SessionError, match="response was incomplete"):
         session.connect()
     state = json.loads((root / ".leanwarp" / "session.json").read_text())
     assert state["pending"] is not None
@@ -550,7 +560,7 @@ def test_unhashable_journal_method_fails_closed_with_actionable_error(project):
     state = json.loads(path.read_text())
     state["pending"] = {"method": [], "arguments": {}, "idempotency_key": "a" * 32, "hashes": None}
     path.write_text(json.dumps(state))
-    with pytest.raises(SessionError, match="preserve"):
+    with pytest.raises(SessionError, match="damaged"):
         ProjectSession(cloud, root).recover()
     assert json.loads(path.read_text()) == state
 
@@ -576,7 +586,7 @@ def test_disconnect_preserves_nonterminal_operation_on_stopped_workspace(
     service.operation["state"] = state
     monkeypatch.setattr(cloud, "workspace", lambda _: {"workspace_id": "w", "state": "stopped"})
     before = session.path.read_bytes()
-    with pytest.raises(SessionError, match="active"):
+    with pytest.raises(SessionError, match="still running"):
         session.disconnect()
     assert session.path.read_bytes() == before
 

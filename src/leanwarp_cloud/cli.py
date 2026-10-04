@@ -8,95 +8,267 @@ import json
 import sys
 from importlib.resources import files
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 import httpx
 
-from .client import LeanWarpCloudError, OperationTimeout
+from . import __version__
+from .client import LeanWarpCloud, LeanWarpCloudError, OperationTimeout
 from .config import credentials_path, load_client, save_credentials
 from .endpoints import ConfigurationError
-from .outcome import OperationOutcome
-from .project import ProjectError, matching_bundles
-from .session import MAX_INLINE_WAIT_SECONDS, ProjectSession, SessionError, WaitError
+from .outcome import OperationOutcome, reported
+from .project import ProjectError
+from .session import MAX_INLINE_WAIT_SECONDS, ProjectSession, SessionError, UsageError
+
+DEFAULT_WAIT_SECONDS = 30.0
+
+_DESCRIPTION = """\
+Check and verify Lean proofs on LeanWarp's hosted workers.
+Every command prints one JSON object."""
+
+_EPILOG = f"""\
+a typical session:
+  leanwarp doctor            show which environment this project runs on
+  leanwarp connect           create the project's workspace (no compute yet)
+  leanwarp check Main.lean   compile a file and report Lean errors
+  leanwarp verify Main.lean --declaration NAME --target 'STATEMENT'
+  leanwarp stop              stop the worker when you are done
+
+results:
+  Operations wait up to {DEFAULT_WAIT_SECONDS:g} seconds for their result. "success" is true
+  when the check passed or the proof was verified, false when it did not,
+  and null while the work is still running.
+
+exit codes:
+  0  success
+  1  the check or proof did not pass, or the project has no environment
+  2  the command could not run (see "message")
+  3  still running: run `leanwarp wait`, never submit it again
+
+AI agents: run `leanwarp skill` for the full workflow."""
+
+
+def _wait_seconds(value: str) -> float:
+    try:
+        seconds = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be a number of seconds") from None
+    if not 0 <= seconds <= MAX_INLINE_WAIT_SECONDS:
+        raise argparse.ArgumentTypeError(
+            f"must be between 0 and {MAX_INLINE_WAIT_SECONDS} seconds; "
+            "run `leanwarp wait` to wait longer"
+        )
+    return seconds
+
+
+class _Parser(argparse.ArgumentParser):
+    """Report argument mistakes as JSON on stdout, like every other result."""
+
+    def error(self, message: str) -> NoReturn:
+        _emit({"error": "invalid_arguments", "message": message, "usage": self.format_usage()})
+        raise SystemExit(2)
 
 
 def parser() -> argparse.ArgumentParser:
-    root = argparse.ArgumentParser(
+    root = _Parser(
         prog="leanwarp",
-        description="Hosted LeanWarp project tools. Outputs JSON; credentials stay local.",
+        description=_DESCRIPTION,
+        epilog=_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    root.add_argument("--version", action="version", version=f"leanwarp {__version__}")
     root.add_argument(
-        "--project", default=".", help="local project root (default: current directory)"
+        "--project",
+        default=".",
+        metavar="DIR",
+        help="the Lean project directory (default: the current directory)",
     )
-    commands = root.add_subparsers(dest="command", required=True)
-    auth = commands.add_parser("auth", help="configure or remove local credentials")
-    auth_commands = auth.add_subparsers(dest="auth_command", required=True)
-    auth_commands.add_parser("login", help="read the API key from a hidden prompt")
+    commands = root.add_subparsers(dest="command", required=True, metavar="COMMAND")
+
+    auth = commands.add_parser("auth", help="sign in with an API key, or sign out")
+    auth_commands = auth.add_subparsers(dest="auth_command", required=True, metavar="ACTION")
     auth_commands.add_parser(
-        "logout", help="remove locally saved credentials (does not revoke the key)"
+        "login",
+        help="paste an API key at a hidden prompt (in automation, set LEANWARP_API_KEY instead)",
     )
-    for name in (
-        "doctor",
-        "account",
-        "versions",
-        "resources",
-        "status",
-        "sync",
-        "recover",
-        "stop",
-        "cancel",
-        "disconnect",
-        "mcp",
-    ):
-        commands.add_parser(name)
-    skill = commands.add_parser("skill", help="read the bundled agent instructions")
-    skill.add_argument(
-        "--reference", action="store_true", help="read the full usage reference instead"
+    auth_commands.add_parser(
+        "logout", help="forget the saved key on this machine (revoke it in the dashboard)"
     )
-    connect = commands.add_parser("connect", help="connect once; does not allocate compute")
-    connect.add_argument("--profile", default="standard")
-    connect.add_argument("--max-profile", default="standard")
-    connect.add_argument("--bundle")
-    wait = commands.add_parser("wait", help="poll the saved operation; timeout does not cancel it")
-    wait.add_argument("--timeout", type=float, default=300)
-    check = commands.add_parser("check", help="sync and strictly check a source file")
-    check.add_argument("file")
-    inspect = commands.add_parser("inspect", help="inspect one-based source coordinates")
-    inspect.add_argument("file")
-    inspect.add_argument("--line", type=int, required=True)
-    inspect.add_argument("--column", type=int, required=True)
+
+    environment_help = (
+        "an environment from `leanwarp environments`; use it even if the project pins "
+        "another toolchain or lockfile"
+    )
+    doctor = commands.add_parser(
+        "doctor", help="show which environment this project runs on (no compute)"
+    )
+    doctor.add_argument("--environment", metavar="NAME", help=environment_help)
+
+    connect = commands.add_parser(
+        "connect", help="create this project's workspace (no compute until the first operation)"
+    )
+    selection = connect.add_mutually_exclusive_group()
+    selection.add_argument("--environment", metavar="NAME", help=environment_help)
+    selection.add_argument("--bundle", help=argparse.SUPPRESS)
+    connect.add_argument(
+        "--profile", default="standard", metavar="SIZE", help="worker size (default: standard)"
+    )
+    connect.add_argument(
+        "--max-profile",
+        default="standard",
+        metavar="SIZE",
+        help="largest worker size an operation in this workspace may request",
+    )
+
+    check = commands.add_parser("check", help="compile a file and report Lean errors and warnings")
+    check.add_argument("file", metavar="FILE", help="a .lean file in the project")
+
+    inspect = commands.add_parser(
+        "inspect", help="show the goals and local context at a position in a proof"
+    )
+    inspect.add_argument("file", metavar="FILE", help="a .lean file in the project")
+
     tactics = commands.add_parser(
-        "try-tactics", help="try candidate tactics without editing the local file"
+        "try-tactics", help="try tactics at a position without editing the file"
     )
-    tactics.add_argument("file")
-    tactics.add_argument("--line", type=int, required=True)
-    tactics.add_argument("--column", type=int, required=True)
-    tactics.add_argument("--tactic", action="append", required=True)
-    verify = commands.add_parser("verify", help="verify against an explicit fixed target")
-    verify.add_argument("file")
-    verify.add_argument("--declaration", required=True)
+    tactics.add_argument("file", metavar="FILE", help="a .lean file in the project")
+
+    for command in (inspect, tactics):
+        command.add_argument("--line", type=int, required=True, help="line number, from 1")
+        command.add_argument("--column", type=int, required=True, help="column number, from 1")
+    tactics.add_argument(
+        "--tactic",
+        action="append",
+        required=True,
+        metavar="TACTIC",
+        help="a tactic to try; repeat for several",
+    )
+
+    verify = commands.add_parser(
+        "verify", help="check that a declaration proves exactly the statement you give"
+    )
+    verify.add_argument("file", metavar="FILE", help="the .lean file that contains the proof")
     verify.add_argument(
-        "--target", required=True, help="fixed Lean proposition approved by the user"
+        "--declaration", required=True, metavar="NAME", help="the theorem's name in FILE"
     )
     verify.add_argument(
-        "--context-file", type=Path, help="UTF-8 Lean imports/definitions for the fixed target"
+        "--target",
+        required=True,
+        metavar="STATEMENT",
+        help="the statement the proof must establish, e.g. '∀ n : Nat, n + 0 = n'",
     )
-    verify.add_argument("--fresh", action="store_true")
+    verify.add_argument(
+        "--context-file",
+        type=Path,
+        metavar="PATH",
+        help="Lean imports and definitions the statement needs, e.g. `import Mathlib`",
+    )
+    verify.add_argument(
+        "--fresh", action="store_true", help="verify on a separate worker that stops afterwards"
+    )
+
     for operation in (check, inspect, tactics, verify):
-        operation.add_argument("--profile")
-        operation.add_argument("--execution-timeout", type=int)
         operation.add_argument(
             "--wait",
-            type=float,
-            default=0,
+            type=_wait_seconds,
+            default=DEFAULT_WAIT_SECONDS,
             metavar="SECONDS",
-            help=f"also poll for the result for up to {MAX_INLINE_WAIT_SECONDS} seconds",
+            help=(
+                f"wait up to this long for the result, 0 to {MAX_INLINE_WAIT_SECONDS} "
+                f"(default: {DEFAULT_WAIT_SECONDS:g}); then use `leanwarp wait`"
+            ),
         )
+        operation.add_argument(
+            "--execution-timeout",
+            type=int,
+            metavar="SECONDS",
+            help="stop the operation on the server after this long, 1 to 600",
+        )
+        operation.add_argument(
+            "--profile", metavar="SIZE", help="worker size for this operation only"
+        )
+
+    wait = commands.add_parser("wait", help="wait for the latest operation's result")
+    wait.add_argument(
+        "--timeout",
+        type=float,
+        default=300,
+        metavar="SECONDS",
+        help="give up waiting after this long (default: 300); the operation keeps running",
+    )
+    commands.add_parser("status", help="show the workspace and the latest operation")
+    commands.add_parser("sync", help="upload changed files (operations also sync automatically)")
+    commands.add_parser("cancel", help="cancel the latest operation")
+    commands.add_parser("stop", help="stop the worker; saved files are kept")
+    commands.add_parser("recover", help="resend a request whose response was lost")
+    commands.add_parser(
+        "disconnect",
+        help="forget this project's workspace so it can connect to another environment",
+    )
+    commands.add_parser("account", help="show your credit balance")
+    commands.add_parser(
+        "environments", aliases=["versions"], help="list the Lean environments LeanWarp serves"
+    )
+    commands.add_parser("resources", help="list worker sizes and prices")
+    skill = commands.add_parser("skill", help="print the instructions for AI agents")
+    skill.add_argument("--reference", action="store_true", help="print the full reference instead")
+    commands.add_parser("mcp", help="run the MCP server for this project over stdio")
     return root
 
 
 def _emit(value: object) -> None:
     sys.stdout.write(json.dumps(value, ensure_ascii=False, allow_nan=False) + "\n")
+
+
+def _error(code: str, message: str, **details: object) -> int:
+    _emit({"error": code, "message": message, **details})
+    return 2
+
+
+def _exit_code(operation: dict[str, Any]) -> int:
+    outcome = OperationOutcome(operation)
+    if not outcome.terminal:
+        return 3
+    return 0 if outcome.successful else 1
+
+
+def _doctor(cloud: LeanWarpCloud, root: str, environment: str | None) -> int:
+    report = ProjectSession(cloud, root).doctor(environment=environment)
+    _emit(report)
+    return 0 if report["compatible"] else 1
+
+
+def _operation(project: ProjectSession, args: argparse.Namespace) -> dict[str, Any]:
+    payload: dict[str, Any] = {"file": args.file}
+    kind = args.command.replace("-", "_")
+    if kind == "check":
+        payload["strict"] = True
+    elif kind in {"inspect", "try_tactics"}:
+        payload.update(line=args.line, column=args.column)
+        if kind == "try_tactics":
+            payload["tactics"] = args.tactic
+    else:
+        kind = "verify_target"
+        context = ""
+        if args.context_file:
+            with args.context_file.open("rb") as stream:
+                raw = stream.read(128 * 1024 + 1)
+            if len(raw) > 128 * 1024:
+                raise UsageError(f"{args.context_file} is larger than 128 KiB")
+            context = raw.decode("utf-8")
+        payload.update(
+            candidate_declaration=args.declaration,
+            target_statement=args.target,
+            target_context=context,
+            execution_mode="fresh" if args.fresh else "reusable",
+        )
+    return project.submit_and_wait(
+        kind,
+        payload,
+        wait_seconds=args.wait,
+        resource_profile=args.profile,
+        timeout_seconds=args.execution_timeout,
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -122,99 +294,77 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 if not sys.stdin.isatty():
                     raise SessionError(
-                        "auth login requires a terminal; use environment variables for automation"
+                        "auth login needs an interactive terminal; in automation, set "
+                        "LEANWARP_API_KEY instead"
                     )
                 save_credentials(getpass.getpass("LeanWarp API key (hidden): "))
                 _emit({"status": "authenticated"})
             return 0
         with load_client() as cloud:
+            if args.command == "doctor":
+                return _doctor(cloud, args.project, args.environment)
+            if args.command in {"environments", "versions"}:
+                catalog = cloud.versions()
+                _emit(
+                    catalog if args.command == "versions" else {"environments": catalog["versions"]}
+                )
+                return 0
+            if args.command in {"account", "resources"}:
+                _emit(getattr(cloud, args.command)())
+                return 0
             project = ProjectSession(cloud, args.project)
-            if args.command in {"account", "versions", "resources"}:
-                result = getattr(cloud, args.command)()
-            elif args.command == "doctor":
-                matches = matching_bundles(args.project, cloud.versions()["versions"])
-                result = {
-                    "compatible": bool(matches),
-                    "matching_bundles": matches,
-                    "resources": cloud.resources()["resources"],
-                    "base_url": cloud.base_url,
-                }
-                _emit(result)
-                return 0 if matches else 1
-            elif args.command == "connect":
-                result = project.connect(
-                    resource_profile=args.profile,
-                    max_resource_profile=args.max_profile,
-                    bundle_id=args.bundle,
-                )
-            elif args.command == "wait":
-                result = project.wait(timeout=args.timeout)
-            elif args.command in {"status", "sync", "recover", "stop", "cancel", "disconnect"}:
-                result = getattr(project, args.command)()
-            else:
-                payload: dict[str, Any] = {"file": args.file}
-                kind = args.command.replace("-", "_")
-                if kind == "check":
-                    payload["strict"] = True
-                elif kind in {"inspect", "try_tactics"}:
-                    payload.update(line=args.line, column=args.column)
-                    if kind == "try_tactics":
-                        payload["tactics"] = args.tactic
-                else:
-                    kind = "verify_target"
-                    context = ""
-                    if args.context_file:
-                        with args.context_file.open("rb") as stream:
-                            raw = stream.read(128 * 1024 + 1)
-                        if len(raw) > 128 * 1024:
-                            raise ValueError("target context is too large")
-                        context = raw.decode("utf-8")
-                    payload.update(
-                        candidate_declaration=args.declaration,
-                        target_statement=args.target,
-                        target_context=context,
-                        execution_mode="fresh" if args.fresh else "reusable",
+            if args.command == "connect":
+                _emit(
+                    project.connect(
+                        resource_profile=args.profile,
+                        max_resource_profile=args.max_profile,
+                        environment=args.environment,
+                        bundle_id=args.bundle,
                     )
-                result = project.submit_and_wait(
-                    kind,
-                    payload,
-                    wait_seconds=args.wait,
-                    resource_profile=args.profile,
-                    timeout_seconds=args.execution_timeout,
                 )
-                if args.wait and not OperationOutcome(result).terminal:
-                    # Same exit status as an expired `wait`: submitted and still running.
-                    _emit(result)
-                    return 3
-            _emit(result)
-            if "operation_id" in result and OperationOutcome(result).terminal:
-                return 0 if OperationOutcome(result).successful else 1
-            return 0
+                return 0
+            if args.command in {"status", "recover", "stop", "cancel", "disconnect", "sync"}:
+                result = getattr(project, args.command)()
+                if args.command in {"recover", "cancel"} and "operation_id" in result:
+                    _emit(reported(result))
+                    return _exit_code(result)
+                _emit(result)
+                return 0
+            result = (
+                project.wait(timeout=args.timeout)
+                if args.command == "wait"
+                else _operation(project, args)
+            )
+            _emit(reported(result))
+            return _exit_code(result)
     except OperationTimeout as error:
-        _emit({"error": "poll_timeout", "operation_id": error.operation_id, "running": True})
+        _emit(
+            {
+                "error": "poll_timeout",
+                "message": "the operation is still running; run `leanwarp wait` again",
+                "operation_id": error.operation_id,
+                "running": True,
+            }
+        )
         return 3
     except LeanWarpCloudError as error:
-        _emit({"error": error.code, "http_status": error.status_code})
-        return 2
+        return _error(error.code, str(error), http_status=error.status_code)
     except httpx.TransportError:
-        _emit(
-            {
-                "error": "transport_error",
-                "action": "recover any pending request; do not resubmit it",
-            }
+        return _error(
+            "transport_error",
+            "could not reach LeanWarp; check your connection, then run `leanwarp recover` "
+            "before resubmitting anything",
+            action="recover any pending request; do not resubmit it",
         )
-        return 2
-    except (SessionError, ValueError, OSError) as error:
-        # Do not print HTTP exception representations or credential-file contents.
-        _emit(
-            {
-                "error": "local_error",
-                "message": str(error)
-                if isinstance(error, (SessionError, ConfigurationError, ProjectError, WaitError))
-                else "invalid local input or filesystem access",
-            }
-        )
-        return 2
+    except (SessionError, ConfigurationError, ProjectError, UsageError) as error:
+        return _error("local_error", str(error))
+    except UnicodeDecodeError:
+        return _error("local_error", "the file is not UTF-8 text")
+    except OSError as error:
+        # The path and the system's reason only; never file contents or credentials.
+        return _error("local_error", f"{error.strerror or 'cannot read'}: {error.filename}")
+    except ValueError:
+        return _error("local_error", "the request could not be prepared")
 
 
 if __name__ == "__main__":

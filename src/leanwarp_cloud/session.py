@@ -16,20 +16,35 @@ from uuid import uuid4
 import httpx
 
 from .client import LeanWarpCloud, LeanWarpCloudError, OperationTimeout
-from .project import collect_lean_sources, matching_bundles, project_environment, selects
+from .project import (
+    ProjectError,
+    choose_environment,
+    collect_lean_sources,
+    environment_name,
+    project_identity,
+    selects,
+    validate_selection,
+)
 
 _MAX_JOURNAL_BYTES = 8 * 1024 * 1024
 _TERMINAL_STATES = frozenset({"completed", "failed", "cancelled"})
 # Polling shares this budget (see LeanWarpCloud.wait). Even one bounded overrun
 # read keeps an inline wait under the common 60-second MCP client tool deadline.
 MAX_INLINE_WAIT_SECONDS = 40
+_JOURNAL_DAMAGED = (
+    ".leanwarp/session.json is damaged; keep it, since it may record an unfinished request"
+)
 
 
 class SessionError(RuntimeError):
     """Local recovery or project reconciliation is required before another write."""
 
 
-class WaitError(ValueError):
+class UsageError(ValueError):
+    """An argument outside its supported range; nothing was sent."""
+
+
+class WaitError(UsageError):
     """An inline wait outside its supported range; nothing was submitted."""
 
 
@@ -56,19 +71,24 @@ class ProjectSession:
 
         self.directory.mkdir(mode=0o700, exist_ok=True)
         if self.directory.is_symlink() or not self.directory.is_dir():
-            raise SessionError(".leanwarp must be a real project directory")
+            raise SessionError(".leanwarp must be a directory, not a symlink")
         fd = os.open(self.directory / "lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
         try:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as error:
-                raise SessionError("another LeanWarp command is using this project") from error
+                raise SessionError(
+                    "another LeanWarp command is using this project; let it finish"
+                ) from error
             state = self._read()
             owner = self.cloud.account().get("owner_id")
             if not isinstance(owner, str) or not owner:
                 raise SessionError("API returned an invalid account identity")
             if state.get("owner_id", owner) != owner:
-                raise SessionError("project belongs to another account; restore its credentials")
+                raise SessionError(
+                    "this project was connected with another account; sign in with a key "
+                    "from that account"
+                )
             state["owner_id"] = owner
             yield state
         finally:
@@ -86,7 +106,7 @@ class ProjectSession:
         try:
             state = json.loads(raw) if len(raw) <= _MAX_JOURNAL_BYTES else None
         except ValueError as error:
-            raise SessionError("invalid project journal; preserve it for recovery") from error
+            raise SessionError(_JOURNAL_DAMAGED) from error
         if (
             not isinstance(state, dict)
             or state.get("schema") != 1
@@ -107,7 +127,10 @@ class ProjectSession:
                 }
             )
         ):
-            raise SessionError("project journal is invalid or belongs to another API origin")
+            raise SessionError(
+                ".leanwarp/session.json belongs to another LeanWarp service or is damaged; "
+                "keep it and sign in with a key for the service it was created with"
+            )
         _validate_journal(state)
         return state
 
@@ -117,7 +140,7 @@ class ProjectSession:
         _validate_journal(state)
         raw = json.dumps(state, ensure_ascii=False, allow_nan=False).encode("utf-8")
         if len(raw) > _MAX_JOURNAL_BYTES:
-            raise SessionError("request exceeds the project journal recovery limit")
+            raise SessionError("this request is too large to record for recovery")
         fd, name = tempfile.mkstemp(prefix="session-", dir=self.directory)
         try:
             with os.fdopen(fd, "wb") as stream:
@@ -137,20 +160,26 @@ class ProjectSession:
     def _workspace(state: Mapping[str, Any]) -> str:
         workspace = state.get("workspace_id")
         if not isinstance(workspace, str) or not workspace:
-            raise SessionError("connect the project first")
+            raise SessionError("this project is not connected; run `leanwarp connect`")
         return workspace
 
     @staticmethod
     def _ready(state: Mapping[str, Any]) -> None:
         if state.get("pending") is not None:
-            raise SessionError("an uncertain request exists; run recover before another mutation")
+            raise SessionError(
+                "an earlier request may not have reached LeanWarp; run `leanwarp recover` first"
+            )
 
     def _environment(self, state: dict[str, Any]) -> None:
-        environment = list(project_environment(self.root))
+        identity = project_identity(self.root, allow_empty=True)
+        environment = list(identity.journal())
         if environment == state.get("environment"):
             return
-        if list(project_environment(self.root, legacy=True)) != state.get("environment"):
-            raise SessionError("project dependencies changed; use a new workspace explicitly")
+        if list(identity.journal(legacy=True)) != state.get("environment"):
+            raise SessionError(
+                "the project's toolchain or lockfile changed since it was connected; run "
+                "`leanwarp stop`, `leanwarp disconnect` and `leanwarp connect`"
+            )
         # Upgrade a byte-bound journal only while the original bytes still match.
         state["environment"] = environment
         self._save(state)
@@ -165,7 +194,10 @@ class ProjectSession:
             revision is not None
             and (type(result.get("revision")) is not int or result["revision"] != revision)
         ):
-            raise SessionError("operation receipt does not match the saved submission")
+            raise SessionError(
+                "LeanWarp returned a different operation than this project submitted; "
+                "run `leanwarp status`"
+            )
         return result
 
     def connect(
@@ -173,34 +205,129 @@ class ProjectSession:
         *,
         resource_profile: str = "standard",
         max_resource_profile: str = "standard",
+        environment: str | None = None,
         bundle_id: str | None = None,
     ) -> dict[str, Any]:
+        """Create this project's workspace once, without starting compute.
+
+        LeanWarp picks the environment that matches the project's toolchain and
+        lockfile, or the newest one for a project that pins neither. Name an
+        environment to run a project that matches none of them.
+        """
+        validate_selection(environment, bundle_id)
         with self._locked() as state:
             self._ready(state)
             if state.get("workspace_id"):
                 self._environment(state)
-                return self.cloud.workspace(self._workspace(state))
-            environment = project_environment(self.root)
-            matches = [
-                b
-                for b in matching_bundles(self.root, self.cloud.versions()["versions"])
-                if selects(b, bundle_id)
-            ]
-            if not matches:
-                raise SessionError(
-                    "unsupported toolchain/lockfile; do not change dependencies to pass"
-                )
-            state["environment"] = list(environment)
-            return self._request(
+                workspace = self.cloud.workspace(self._workspace(state))
+                if bundle_id is not None:
+                    choose_environment(
+                        project_identity(self.root, allow_empty=True),
+                        self.cloud.versions()["versions"],
+                        bundle_id=bundle_id,
+                    )
+                if not selects(workspace, environment or bundle_id):
+                    raise SessionError(
+                        f"this project is connected to {environment_name(workspace)}; run "
+                        "`leanwarp stop` and `leanwarp disconnect` before choosing another "
+                        "environment"
+                    )
+                return workspace
+            identity = project_identity(self.root)
+            choice = choose_environment(
+                identity, self.cloud.versions()["versions"], environment, bundle_id=bundle_id
+            )
+            state["environment"] = list(identity.journal())
+            workspace = self._request(
                 state,
                 "create_workspace",
                 {
-                    "bundle_id": matches[-1]["bundle_id"],
+                    "bundle_id": choice.build["bundle_id"],
                     "resource_profile": resource_profile,
                     "max_resource_profile": max_resource_profile,
                     "max_spend_microusd": None,
                 },
             )
+            return {**workspace, "environment_choice": choice.public()}
+
+    def doctor(self, *, environment: str | None = None) -> dict[str, Any]:
+        """Report the saved connection or a proposed choice without writes or compute."""
+        if self.directory.is_symlink():
+            raise SessionError(".leanwarp must be a directory, not a symlink")
+        state = self._read()
+        catalog = self.cloud.versions()["versions"]
+        report: dict[str, Any] = {
+            "environments": sorted({environment_name(build) for build in catalog}),
+            "matching_bundles": [],
+            "resources": self.cloud.resources()["resources"],
+            "base_url": self.cloud.base_url,
+            "connected": bool(state.get("workspace_id")),
+            "recovery_required": state.get("pending") is not None,
+        }
+        if state.get("pending") is not None:
+            return {
+                **report,
+                "compatible": False,
+                "message": "run `leanwarp recover` before choosing an environment",
+            }
+        identity = project_identity(self.root, allow_empty=bool(state.get("workspace_id")))
+        report["matching_bundles"] = [build for build in catalog if identity.matches(build)]
+        report["project"] = {
+            "lean_toolchain": identity.toolchain,
+            "lockfile": identity.manifest_sha256 is not None,
+        }
+        if state.get("workspace_id"):
+            owner = self.cloud.account().get("owner_id")
+            if not isinstance(owner, str) or not owner or owner != state.get("owner_id", owner):
+                raise SessionError(
+                    "this project belongs to another account; restore its credentials"
+                )
+            workspace = self.cloud.workspace(self._workspace(state))
+            build = next(
+                (build for build in catalog if selects(build, str(workspace.get("bundle_id", "")))),
+                None,
+            )
+            if build is None:
+                return {
+                    **report,
+                    "compatible": False,
+                    "environment": environment_name(workspace),
+                    "message": (
+                        "the connected environment is no longer served; "
+                        "stop and disconnect before reconnecting"
+                    ),
+                }
+            choice = {
+                "environment": environment_name(build),
+                "lean_toolchain": build["lean_toolchain"],
+                "match": "connected",
+                "matches_project": identity.matches(build),
+            }
+            if list(identity.journal()) != state.get("environment") and list(
+                identity.journal(legacy=True)
+            ) != state.get("environment"):
+                return {
+                    **report,
+                    "compatible": False,
+                    "environment": choice,
+                    "message": (
+                        "the project's toolchain or lockfile changed; "
+                        "stop, disconnect and reconnect"
+                    ),
+                }
+            if not selects(workspace, environment):
+                return {
+                    **report,
+                    "compatible": False,
+                    "environment": choice,
+                    "message": "stop and disconnect before choosing another environment",
+                }
+            return {**report, "compatible": True, "environment": choice}
+        try:
+            selected = choose_environment(identity, catalog, environment)
+        except ProjectError as error:
+            return {**report, "compatible": False, "message": str(error)}
+        return {**report, "compatible": True, "environment": selected.public()}
 
     def sync(self) -> dict[str, Any]:
         with self._locked() as state:
@@ -242,7 +369,9 @@ class ProjectSession:
         if timeout_seconds is not None and (
             type(timeout_seconds) is not int or not 1 <= timeout_seconds <= 600
         ):
-            raise ValueError("timeout_seconds must be an integer between 1 and 600")
+            raise UsageError(
+                "the execution timeout must be a whole number of seconds from 1 to 600"
+            )
         json.dumps(dict(payload), allow_nan=False)
         with self._locked() as state:
             self._ready(state)
@@ -251,7 +380,10 @@ class ProjectSession:
                     state, self.cloud.operation(state["operation_id"])
                 )
                 if previous.get("state") not in {"completed", "failed", "cancelled"}:
-                    raise SessionError("previous operation is active; wait or cancel it first")
+                    raise SessionError(
+                        "the previous operation is still running; run `leanwarp wait` or "
+                        "`leanwarp cancel` first"
+                    )
             self._sync(state)
             body: dict[str, Any] = {
                 "workspace_id": self._workspace(state),
@@ -285,7 +417,10 @@ class ProjectSession:
             or not isinstance(wait_seconds, int | float)
             or not 0 <= wait_seconds <= MAX_INLINE_WAIT_SECONDS
         ):
-            raise WaitError(f"wait_seconds must be between 0 and {MAX_INLINE_WAIT_SECONDS}")
+            raise WaitError(
+                f"the inline wait must be between 0 and {MAX_INLINE_WAIT_SECONDS} seconds; "
+                "poll longer with wait"
+            )
         operation = self.submit(
             kind, payload, resource_profile=resource_profile, timeout_seconds=timeout_seconds
         )
@@ -333,7 +468,7 @@ class ProjectSession:
             or not isinstance(pending.get("arguments"), dict)
             or not isinstance(pending.get("idempotency_key"), str)
         ):
-            raise SessionError("invalid pending request; preserve journal for recovery")
+            raise SessionError(_JOURNAL_DAMAGED)
         method = pending["method"]
         try:
             if method == "create_workspace":
@@ -375,7 +510,7 @@ class ProjectSession:
                 )
             )
         ):
-            raise SessionError("invalid API receipt; preserve journal and run recover")
+            raise SessionError("LeanWarp's response was incomplete; run `leanwarp recover`")
         if method == "create_workspace":
             state["workspace_id"] = result["workspace_id"]
             state["revision"] = result["revision"]
@@ -417,7 +552,7 @@ class ProjectSession:
             self._ready(state)
             operation = state.get("operation_id")
             if not isinstance(operation, str):
-                raise SessionError("no submitted operation")
+                raise SessionError("this project has not submitted an operation")
         # Do not hold the project lock while polling; another process may cancel.
         return self._checked_operation(state, self.cloud.wait(operation, timeout=timeout))
 
@@ -425,11 +560,11 @@ class ProjectSession:
         with self._locked() as state:
             self._ready(state)
             if not isinstance(state.get("operation_id"), str):
-                raise SessionError("no submitted operation")
+                raise SessionError("this project has not submitted an operation")
             return self._checked_operation(state, self.cloud.cancel(state["operation_id"]))
 
     def disconnect(self) -> dict[str, Any]:
-        """Forget a stopped connection so this project can explicitly choose a new bundle."""
+        """Forget a stopped connection so this project can connect to another environment."""
         with self._locked() as state:
             self._ready(state)
             workspace_id = self._workspace(state)
@@ -438,15 +573,20 @@ class ProjectSession:
                     state, self.cloud.operation(state["operation_id"])
                 )
                 if operation.get("state") not in {"completed", "failed", "cancelled"}:
-                    raise SessionError("previous operation is active; wait or cancel it first")
+                    raise SessionError(
+                        "the previous operation is still running; run `leanwarp wait` or "
+                        "`leanwarp cancel` first"
+                    )
             workspace = self.cloud.workspace(workspace_id)
             if workspace.get("state") != "stopped":
-                raise SessionError("stop the workspace before disconnecting this project")
+                raise SessionError("run `leanwarp stop` before disconnecting this project")
             # Runtime state alone does not exclude queued or temporary work.
             # The server's guarded stop also checks work submitted elsewhere.
             stopped = self.cloud.stop(workspace_id)
             if stopped.get("workspace_id") != workspace_id or stopped.get("state") != "stopped":
-                raise SessionError("stop was not confirmed; retain the project connection")
+                raise SessionError(
+                    "LeanWarp did not confirm the stop; run `leanwarp status` and try again"
+                )
             for key in ("workspace_id", "revision", "operation_id", "operation_revision"):
                 state.pop(key, None)
             state["files"] = {}
@@ -563,4 +703,4 @@ def _validate_journal(state: dict[str, Any]) -> None:
                     )
                 )
     if not valid:
-        raise SessionError("invalid project journal; preserve it for recovery")
+        raise SessionError(_JOURNAL_DAMAGED)

@@ -1,101 +1,159 @@
 # Getting started
 
-[Install the CLI](../README.md#install), then get an API key from your
-LeanWarp dashboard. Your account needs available credit to run compute.
+This guide takes you from an API key to a verified proof in a few minutes. You
+need the `leanwarp` command ([install](../README.md#install)); you don't need Lean
+installed locally.
 
-Keys from the [isagoge.in dashboard](https://isagoge.in/dashboard) use the
-production service. Keys issued for test access use the hosted test service.
-The key alone selects the service; there is no API URL to configure.
-
-If your shell cannot find `leanwarp` after installation, run `uv tool update-shell`
+If your shell can't find `leanwarp` after installing, run `uv tool update-shell`
 and open a new terminal.
 
-## Sign in
+## 1. Sign in
 
-Sign in with your key:
+Create an API key in the [dashboard](https://isagoge.in/dashboard), then run:
 
 ```sh
 leanwarp auth login
 ```
 
-Paste the key at the hidden prompt. The SDK selects the service automatically.
-For automation, inject `LEANWARP_API_KEY` through your environment or secret manager. Keep the key
-out of source files and agent conversations.
+Paste the key at the hidden prompt. In CI or other automation, set
+`LEANWARP_API_KEY` from your secret manager instead. Keep keys out of source files
+and agent conversations.
 
-## Connect your project
+Running operations uses prepaid credit, which you add in the dashboard.
 
-For an existing project, keep its dependencies unchanged. Compatibility requires
-the exact Lean toolchain and resolved dependencies of a supported bundle; matching
-version labels alone is not enough. Run `doctor` to check the current bundle's
-requirements. Some bundles also require identical lockfile bytes. If `doctor`
-reports a mismatch, use a separate supported project or request support for its
-environment. Do not replace an existing project's lockfile just to pass this check.
+## 2. Choose a project
 
-For a first experiment, the repository includes an example project for each Lean
-environment: [Lean 4.34](../examples/lean-4.34) and [Lean 4.26](../examples/lean-4.26).
-Each has the exact metadata and `LeanWarpExample.lean`. `leanwarp doctor` reports
-whether the service currently offers that environment. Clone the SDK repository
-and use one of these directories as your project:
+LeanWarp uploads only your `.lean` files and runs them in an **environment**: a
+Lean release with Mathlib, already built on LeanWarp's workers. List them with:
+
+```sh
+leanwarp environments
+```
+
+The quickest start is an example project that matches an environment. Copy one of
+the [examples](../examples) and work inside it:
 
 ```sh
 git clone https://github.com/Isagoge-Labs/LeanWarp-SDK.git
-cd LeanWarp-SDK/examples/lean-4.34
+cd LeanWarp-SDK/examples/lean-4.26
 ```
 
-From your chosen project root:
+For your own project, run `leanwarp doctor` from its root. It reports the
+environment the project will use, without starting compute:
+
+- a project whose `lean-toolchain` and `lake-manifest.json` match an environment
+  uses it, so results agree with your local build;
+- a folder of `.lean` files with neither file uses the only served environment, or the newest served stable Lean release when there are several;
+- a project that matches none is told which environments exist. Pass
+  `--environment NAME` to `doctor` and `connect` to use one anyway; your files then
+  compile against that environment's Lean and Mathlib.
+
+When several environments share the newest stable Lean release, choose one
+explicitly. A lockfile must use a supported format with pinned Git dependencies;
+local path dependencies are not uploaded. `doctor` reports the saved environment
+of an already connected project, even when the default later changes.
+
+Then create the project's workspace. This starts no compute:
 
 ```sh
-leanwarp doctor
 leanwarp connect
 ```
 
-`doctor` checks whether the project's Lean toolchain and dependency lockfile match
-a supported bundle. Continue only if it reports `compatible: true`. LeanWarp does
-not build arbitrary project dependencies.
+Add `.leanwarp/` to `.gitignore`; it holds this project's connection.
 
-`connect` saves a workspace without starting compute. Manage funding and view
-usage under Dashboard → Usage & credits. Set an optional workspace lifetime cap
-in the Workspaces section of the LeanWarp tab before running work. Execution
-requires available prepaid credit. Add `.leanwarp/` to `.gitignore` to keep local
-session state out of version control.
+## 3. Check and verify
 
-## Verify a proof
-
-Save this as `LeanWarpExample.lean` in your project:
+`LeanWarpExample.lean` in the example contains:
 
 ```lean
 theorem add_zero_example (n : Nat) : n + 0 = n := by
   rfl
 ```
 
-Verify the declaration against its intended statement:
+Check it, then verify that the theorem proves the statement you intend:
+
+```sh
+leanwarp check LeanWarpExample.lean
+```
+
+On `success: null` (exit `3`), run `leanwarp wait` until the check finishes.
+Then verify:
 
 ```sh
 leanwarp verify LeanWarpExample.lean \
   --declaration add_zero_example --target '∀ n : Nat, n + 0 = n'
-leanwarp wait
 ```
 
-Submission starts the work; `wait` retrieves its result. For this verification,
-`wait` exits with code `0` when the proof passes and `1` when it fails. Code `3`
-means polling timed out: run `wait` again. The JSON output contains the result and
-verification receipt. See [results and exit codes](../src/leanwarp_cloud/skills/leanwarp/references/usage.md#results).
+The first operation starts a worker, which takes a little longer; later ones reuse
+it. Each command uploads changed files, waits up to 30 seconds and prints the
+result. Abbreviated:
 
-Edit the file and repeat `verify` and `wait`. Changed files upload automatically,
-and the same workspace is reused. Compatible imports can stay warm across edits.
-You do not need to manage workspace IDs yourself.
+```json
+{
+  "success": true,
+  "kind": "verify_target",
+  "state": "completed",
+  "revision": 1,
+  "result": {
+    "result": {
+      "status": "ok",
+      "receipt": {
+        "policy": "fixed_target_kernel_check_v1",
+        "candidate_declaration": "add_zero_example"
+      }
+    }
+  }
+}
+```
 
-## Stop compute
+`success` is `true` when the check passed or the proof was verified and `false`
+when it did not; Lean's messages are in `result.result`. If the work takes longer
+than the wait, `success` is `null` and the exit code is `3`: run `leanwarp wait`
+for the result. Don't submit it again.
 
-When finished:
+Edit the file and run the command again. The same workspace and warm worker are
+reused, so later checks start where the last one ended.
+
+## 4. Verify a Mathlib statement
+
+When the statement needs Mathlib or your own definitions, put what it needs in a
+context file. Save this as `SqNonneg.lean`:
+
+```lean
+import Mathlib
+
+theorem sq_nonneg_example (x : ℝ) : 0 ≤ x ^ 2 := by
+  positivity
+```
+
+and the statement's imports as `statement-context.txt`:
+
+```lean
+import Mathlib
+```
+
+Then verify:
+
+```sh
+leanwarp verify SqNonneg.lean --declaration sq_nonneg_example \
+  --target '∀ x : ℝ, 0 ≤ x ^ 2' --context-file statement-context.txt
+```
+
+LeanWarp elaborates the statement on its own, with only that context, and checks
+the proof against it with Lean's kernel. The proof can't change what the
+statement means. `sorry`, `admit`, `native_decide`, `set_option`, custom
+elaborators and new axioms are rejected.
+
+## 5. Stop the worker
 
 ```sh
 leanwarp stop
 ```
 
-Warm compute remains billable until stopped or retired by the server. If an
-operation is still running, wait for it or cancel it and wait before stopping.
-If a response is lost, follow [recovery](../src/leanwarp_cloud/skills/leanwarp/references/usage.md#recovery)
-before submitting replacement work.
+A worker also stops on its own after 5 minutes without activity. You pay for the
+time it runs, including those idle minutes, so stop it when you're done. Your
+files stay in the workspace for next time.
 
-Next: [agent setup](agents.md) or the [reference](../src/leanwarp_cloud/skills/leanwarp/references/usage.md).
+Next: [set up an agent](agents.md), or read the
+[reference](../src/leanwarp_cloud/skills/leanwarp/references/usage.md) for every
+command, limit and recovery step.

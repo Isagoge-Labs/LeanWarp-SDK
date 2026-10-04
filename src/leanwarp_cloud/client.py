@@ -13,7 +13,7 @@ from uuid import uuid4
 import httpx
 
 from .endpoints import api_origin
-from .project import matching_bundles, selects
+from .project import choose_environment, project_identity, validate_selection
 from .transport import DeadlineTransport
 
 _MAX_RESPONSE_BYTES = 2 * 1024 * 1024
@@ -91,31 +91,31 @@ class LeanWarpCloud:
         return self._request("GET", "account")
 
     def versions(self) -> dict[str, Any]:
+        """Served environments under `versions`, one current build per environment."""
         return self._request("GET", "versions")
 
     def resources(self) -> dict[str, Any]:
+        """Worker sizes and their rates; reading them does not start compute."""
         return self._request("GET", "resources")
 
     def create_workspace_for_project(
         self,
         root: str | Path,
         *,
+        environment: str | None = None,
         bundle_id: str | None = None,
         resource_profile: str = "standard",
         max_resource_profile: str = "standard",
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
-        matches = [
-            bundle
-            for bundle in matching_bundles(root, self.versions()["versions"])
-            if selects(bundle, bundle_id)
-        ]
-        if not matches:
-            raise ValueError("project does not match a supported environment bundle")
-        # The service lists each environment's current build; every workspace
-        # starts new workers on its environment's current build.
+        """Create a workspace in the environment `ProjectSession.connect` would choose."""
+        validate_selection(environment, bundle_id)
+        catalog = self.versions()["versions"]
+        choice = choose_environment(
+            project_identity(root), catalog, environment, bundle_id=bundle_id
+        )
         return self.create_workspace(
-            matches[-1]["bundle_id"],
+            choice.build["bundle_id"],
             resource_profile=resource_profile,
             max_resource_profile=max_resource_profile,
             idempotency_key=idempotency_key,

@@ -68,3 +68,9 @@ class OperationOutcome:
             # This says nothing about whether the theorem has been proved.
             return isinstance(result.get("results"), list)
         return kind == "check" and result.get("status") == "ok"
+
+
+def reported(operation: dict[str, Any]) -> dict[str, Any]:
+    """Lead an operation with whether it passed: true, false, or null while running."""
+    outcome = OperationOutcome(operation)
+    return {"success": outcome.successful if outcome.terminal else None, **operation}

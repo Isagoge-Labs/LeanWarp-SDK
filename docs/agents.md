@@ -1,52 +1,57 @@
 # Use LeanWarp with an agent
 
-[Install the CLI and authenticate](getting-started.md) before giving an agent
-access. Choose the Lean project it may use. The CLI, Python project
-session and MCP adapter share credentials and `.leanwarp/session.json`.
+An agent uses LeanWarp through the `leanwarp` command or its MCP server. Both
+share the same key and the same project state in `.leanwarp/`, so you can switch
+between them. [Install and sign in](getting-started.md) first, then choose the Lean
+project the agent may work in.
 
-## CLI and skill
+## The instruction
 
-For an agent with shell access, ask it to read:
+Give the agent the project directory and this instruction:
 
-```sh
-leanwarp skill
-```
+> Run `leanwarp skill` and follow it. Use LeanWarp to check this Lean project
+> and verify proofs against their intended statements. Reuse the workspace
+> while you edit, and run `leanwarp stop` when you are done.
 
-This prints the edit–verify workflow, result checks, recovery rules and compute
-shutdown guidance. It does not install a skill into your agent's configuration.
-The complete reference is available on demand:
+`leanwarp skill` prints the workflow: connecting, checking, reading results,
+verifying against a fixed statement, recovering from lost responses and stopping
+the worker. `leanwarp skill --reference` prints the full reference. Neither needs
+a key or starts compute.
 
-```sh
-leanwarp skill --reference
-```
+Sign in yourself with `leanwarp auth login`, or inject `LEANWARP_API_KEY` into the
+agent's environment. Never put the key in the instruction.
 
-For automatic skill discovery, use your agent's skill installer with the
-[LeanWarp skill directory](../src/leanwarp_cloud/skills/leanwarp). Install the whole
-directory, including `references/`, rather than copying only `SKILL.md`.
+## Agents with shell access
 
-A starting instruction for the agent:
+The CLI is built for agents: every command prints one JSON object, results start
+with `success` (`true`, `false`, or `null` while running), and exit codes separate
+"did not pass" (`1`) from "could not run" (`2`) and "still running" (`3`).
 
-> Read the LeanWarp skill. Work in this Lean project.
-> Verify my proof against its intended statement, reuse the workspace across
-> edits, and stop compute when finished.
-
-Manage funding in the website. Provide credentials through the hidden
-login prompt or environment, never in the instruction.
+To install the instructions as a skill your agent discovers automatically, point
+its skill installer at the [skill directory](../src/leanwarp_cloud/skills/leanwarp).
+Install the whole directory, including `references/`.
 
 ## MCP
 
-MCP is included in the standard installation. Add the
-[MCP configuration](../src/leanwarp_cloud/skills/leanwarp/references/usage.md#mcp)
-to your client, with your project's absolute path. It starts the local stdio
-server using `leanwarp --project /absolute/path/to/lean-project mcp`.
+Add this server to your MCP client, with the absolute path of your project:
 
-Use the executable's absolute path if the client cannot find `leanwarp` on its
-`PATH`. The server reads the same saved credentials as the CLI, or environment
-variables injected into its process. No API key belongs in tool arguments.
+```json
+{
+  "mcpServers": {
+    "leanwarp": {
+      "command": "leanwarp",
+      "args": ["--project", "/absolute/path/to/lean-project", "mcp"]
+    }
+  }
+}
+```
 
-MCP exposes typed tools and their descriptions, plus the bundled instructions at
-`leanwarp://guide` and `leanwarp://reference`. Have the agent read those resources
-before working. Installing the
-LeanWarp skill alongside it supplies the overall workflow; your client must
-support skills to load it automatically. See the [MCP reference](../src/leanwarp_cloud/skills/leanwarp/references/usage.md#mcp)
-for tool names and parameters.
+Use the absolute path of `leanwarp` if the client can't find it on its `PATH`.
+The server starts even before you sign in, so the agent can read its guides; tools
+that call LeanWarp then explain how to sign in.
+
+The agent should read the resources `leanwarp://guide` and `leanwarp://reference`
+first. The tools are `doctor`, `environments`, `connect`, `check`, `inspect`,
+`try_tactics`, `verify_target`, `wait`, `status`, `cancel`, `stop`, `recover`,
+`disconnect`, `account` and `resources`. Operation tools wait up to 20 seconds for
+their result by default (`wait_seconds`, at most 40).

@@ -17,8 +17,8 @@ running after a polling timeout, wait again or cancel it and wait until terminal
 before stopping compute.
 
 Edit `LeanWarpExample.lean` and repeat verification in the same directory to reuse
-the workspace. Keep `lean-toolchain` and `lake-manifest.json` unchanged; the server
-requires an exact metadata match. Use this as a separate example, not as a
+the workspace. Keep `lean-toolchain` and `lake-manifest.json` unchanged so this
+example keeps its supported environment. Use this as a separate example, not as a
 replacement for the dependencies of an existing research project.
 
 The SDK sends Lean source to the hosted environment. You do not need to install

@@ -24,22 +24,22 @@ out of source files and agent conversations.
 
 ## Connect your project
 
-For an existing project, keep its dependencies unchanged and run the commands
-below. Compatibility requires the exact toolchain and dependency lockfile of a
-supported bundle, including the lockfile's bytes. Equivalent version numbers
-alone are not enough. If `doctor` reports a mismatch, the project cannot run on
-that bundle; use a separate supported project or request support for its environment.
-Do not replace an existing project's lockfile just to pass this check.
+For an existing project, keep its dependencies unchanged. Compatibility requires
+the exact Lean toolchain and resolved dependencies of a supported bundle; matching
+version labels alone is not enough. Run `doctor` to check the current bundle's
+requirements. Some bundles also require identical lockfile bytes. If `doctor`
+reports a mismatch, use a separate supported project or request support for its
+environment. Do not replace an existing project's lockfile just to pass this check.
 
 For a first experiment, the repository includes an example project for each Lean
-environment: [Lean 4.26](../examples/lean-4.26) and [Lean 4.34](../examples/lean-4.34).
+environment: [Lean 4.34](../examples/lean-4.34) and [Lean 4.26](../examples/lean-4.26).
 Each has the exact metadata and `LeanWarpExample.lean`. `leanwarp doctor` reports
 whether the service currently offers that environment. Clone the SDK repository
 and use one of these directories as your project:
 
 ```sh
 git clone https://github.com/Isagoge-Labs/LeanWarp-SDK.git
-cd LeanWarp-SDK/examples/lean-4.26
+cd LeanWarp-SDK/examples/lean-4.34
 ```
 
 From your chosen project root:
@@ -54,9 +54,10 @@ a supported bundle. Continue only if it reports `compatible: true`. LeanWarp doe
 not build arbitrary project dependencies.
 
 `connect` saves a workspace without starting compute. Manage funding and view
-usage in the website. You can set an optional workspace lifetime cap under
-Dashboard → Usage & credits before running work. Execution requires available prepaid credit. Add
-`.leanwarp/` to `.gitignore` to keep local session state out of version control.
+usage under Dashboard → Usage & credits. Set an optional workspace lifetime cap
+in the Workspaces section of the LeanWarp tab before running work. Execution
+requires available prepaid credit. Add `.leanwarp/` to `.gitignore` to keep local
+session state out of version control.
 
 ## Verify a proof
 

@@ -161,9 +161,11 @@ elaborators and new axioms are rejected.
 leanwarp stop
 ```
 
-A worker also stops on its own after 5 minutes without activity. You pay for the
-time it runs, including those idle minutes, so stop it when you're done. Your
-files stay in the workspace for next time.
+A worker also stops on its own after the idle timeout shown by `leanwarp resources`.
+You pay for the time it runs, including those idle minutes, so stop it when you're
+done. Closing your terminal or SDK client does not stop the worker. Your uploaded
+files and completed results stay in the workspace; the next operation rebuilds
+the in-memory session.
 
 Next: [set up an agent](agents.md), or read the
 [reference](../src/leanwarp_cloud/skills/leanwarp/references/usage.md) for every

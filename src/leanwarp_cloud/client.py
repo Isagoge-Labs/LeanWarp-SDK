@@ -100,7 +100,7 @@ class LeanWarpCloud:
         return self._request("GET", "versions")
 
     def resources(self) -> dict[str, Any]:
-        """Worker sizes and their rates; reading them does not start compute."""
+        """Raw release billing catalog for wire integrations; starts no compute."""
         return self._request("GET", "resources")
 
     def create_workspace_for_project(
@@ -109,8 +109,8 @@ class LeanWarpCloud:
         *,
         environment: str | None = None,
         bundle_id: str | None = None,
-        resource_profile: str = "standard",
-        max_resource_profile: str = "standard",
+        resource_profile: str | None = None,
+        max_resource_profile: str | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         """Create a workspace in the environment `ProjectSession.connect` would choose."""
@@ -130,21 +130,23 @@ class LeanWarpCloud:
         self,
         bundle_id: str,
         *,
-        resource_profile: str = "standard",
-        max_resource_profile: str = "standard",
+        resource_profile: str | None = None,
+        max_resource_profile: str | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
+        # Omitted profiles use the service's reviewed default. Explicit names
+        # still select that profile, including clients that request standard.
+        # Explicit null prevents an older API's implicit zero-dollar cap from
+        # creating a workspace that can never execute.
+        body: dict[str, Any] = {"bundle_id": bundle_id, "max_spend_microusd": None}
+        if resource_profile is not None:
+            body["resource_profile"] = resource_profile
+        if max_resource_profile is not None:
+            body["max_resource_profile"] = max_resource_profile
         return self._request(
             "POST",
             "workspaces",
-            body={
-                "bundle_id": bundle_id,
-                "resource_profile": resource_profile,
-                "max_resource_profile": max_resource_profile,
-                # Explicit null prevents an older API's implicit zero-dollar
-                # default from creating a workspace that can never execute.
-                "max_spend_microusd": None,
-            },
+            body=body,
             idempotency_key=idempotency_key or uuid4().hex,
         )
 

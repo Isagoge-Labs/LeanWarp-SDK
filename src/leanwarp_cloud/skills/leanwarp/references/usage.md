@@ -21,7 +21,7 @@ command prints one JSON object; `leanwarp COMMAND --help` lists its options.
 | `stop` | Stop the worker. Files are kept. |
 | `recover` | Resend a request whose response was lost. |
 | `disconnect` | Forget a stopped workspace so the project can connect to another environment. |
-| `environments`, `resources`, `account` | List environments, worker sizes and prices, or your credit. |
+| `environments`, `resources`, `account` | List environments, show the published worker's resources and pricing, or your credit. |
 | `skill [--reference]` | Print the agent instructions or this reference. No key needed. |
 | `mcp` | Run the MCP server for this project over stdio. |
 
@@ -30,8 +30,6 @@ files first, then accept:
 
 - `--wait SECONDS`: how long to wait for the result, 0 to 40 (default 30).
 - `--execution-timeout SECONDS`: the operation's time limit on the server, 1 to 600.
-- `--profile SIZE`: run this operation on another worker size, up to the
-  workspace's `--max-profile`. It uses a temporary worker that stops afterwards.
 
 `verify --fresh` also uses a temporary worker. Otherwise operations share the
 workspace's worker, which keeps imports loaded between calls.
@@ -41,6 +39,13 @@ build would say. `check --draft` is faster while you edit: the worker keeps the
 file open, and after an edit Lean reuses its work on the unchanged part of the
 file. In a draft check `sorry` is only a warning, so finish with a full `check`
 or with `verify`.
+
+Tactic trials start from the same captured goal without changing the file.
+They run in batches of up to four branches normally, or eight on the usage-based
+worker, so a large portfolio fits the worker's CPU and memory limits. Results
+keep the order of the supplied tactics. Hosted checks have demonstrated reuse
+of the captured document. Read each result's `execution` fields for the path
+that actually ran.
 
 ## Environments
 
@@ -250,13 +255,26 @@ machine signed in to the same account.
 used; there is no URL to configure. `auth logout` forgets the saved key; revoke it
 in the dashboard to disable it.
 
-Workers are billed per second while they run. A worker starts with the first
-operation, stays warm between operations, and stops after 5 minutes without
-activity, after an hour of running, or on `stop`. While it runs, an hour of usage
-is held from your available credit; the unused part is returned when it stops, so
-starting one needs at least an hour's worth of available credit. Spending caps
-are set per workspace in the dashboard; changing one doesn't cancel work already
-running.
+Workers are billed per second while they run, including idle time. `resources`
+reports one published `worker`: its starting minute quote, `usage_based`,
+resource limits, startup credit hold and idle timeout. LeanWarp selects the
+worker; you set a spending cap in the dashboard. Existing workspaces keep their
+saved billing terms. The service holds credit while a worker runs and returns
+the unused part after stopping.
+
+When `usage_based` is true, CPU and RAM charges increase independently above
+their reserved baselines. The starting rate remains a paid minimum while
+running, including idle time. Bursting depends on available host capacity.
+Otherwise the quoted minute rate applies for the time the worker runs.
+
+A worker starts with the first operation and stays warm between operations until
+the idle timeout, its maximum lifetime or `stop`. Closing the SDK client only
+closes its HTTP connection; it does not stop compute or billing. `stop` discards
+in-memory state but retains uploaded files and completed results; the next
+operation reconstructs the worker without another upload. Spending caps are set
+per workspace in the dashboard. A cap change applies to future worker starts and
+elastic lease renewals; if the next credit hold cannot fit, the worker stops and
+an unfinished operation reports `leanwarp_budget_exceeded`.
 
 `account` reports `balance_microusd`, `reserved_microusd` and
 `available_microusd` as strings ($1 = 1000000).

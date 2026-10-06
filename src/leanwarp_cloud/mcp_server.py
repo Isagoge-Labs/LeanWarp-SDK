@@ -14,6 +14,7 @@ from .config import load_client
 from .endpoints import ConfigurationError
 from .outcome import reported
 from .project import ProjectError, plan_upload
+from .resources import published_worker_resources
 from .session import ProjectSession, SessionError, UsageError
 
 # Warm checks usually finish within this; a cold start returns a pending operation.
@@ -144,26 +145,18 @@ def create_server(cloud: LeanWarpCloud | Callable[[], LeanWarpCloud], root: str)
     @server.tool(annotations=read)
     @_safe_tool
     def resources() -> dict[str, Any]:
-        """List worker sizes and their prices. Does not start compute."""
-        return client().resources()
+        """Show the published worker's resources and pricing. Does not start compute."""
+        return published_worker_resources(client().resources())
 
     @server.tool(annotations=write)
     @_safe_tool
-    def connect(
-        environment: str | None = None,
-        resource_profile: str = "standard",
-        max_resource_profile: str = "standard",
-    ) -> dict[str, Any]:
+    def connect(environment: str | None = None) -> dict[str, Any]:
         """Create this project's workspace once. Does not start compute.
 
         LeanWarp picks the environment matching the project's toolchain and lockfile.
         Pass environment only to run a project that matches none.
         """
-        return session().connect(
-            resource_profile=resource_profile,
-            max_resource_profile=max_resource_profile,
-            environment=environment,
-        )
+        return session().connect(environment=environment)
 
     @server.tool(annotations=read)
     @_safe_tool

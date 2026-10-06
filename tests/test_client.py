@@ -11,6 +11,27 @@ import pytest
 from leanwarp_cloud import LeanWarpCloud, LeanWarpCloudError, OperationTimeout
 
 
+def test_workspace_default_belongs_to_service_and_explicit_profiles_are_preserved() -> None:
+    bodies: list[dict] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, json={"workspace_id": "w"})
+
+    with LeanWarpCloud(
+        "secret", base_url="https://cloud.example", transport=httpx.MockTransport(handle)
+    ) as api:
+        api.create_workspace("b")
+        api.create_workspace("b", resource_profile="standard", max_resource_profile="large")
+    assert bodies[0] == {"bundle_id": "b", "max_spend_microusd": None}
+    assert bodies[1] == {
+        "bundle_id": "b",
+        "max_spend_microusd": None,
+        "resource_profile": "standard",
+        "max_resource_profile": "large",
+    }
+
+
 def test_retry_preserves_mutation_identity_and_body() -> None:
     requests: list[httpx.Request] = []
     tactics = ["simp"]

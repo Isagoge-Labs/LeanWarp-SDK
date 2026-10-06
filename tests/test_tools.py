@@ -136,7 +136,8 @@ def test_cli_installed_project_workflow_and_skill(tmp_path):
         diagnosis = json.loads(command("doctor"))
         assert diagnosis["compatible"] is True
         assert diagnosis["matching_bundles"]
-        assert diagnosis["resources"]
+        assert diagnosis["worker"] == {"usage_based": False}
+        assert "resources" not in diagnosis and "default_resource_profile" not in diagnosis
         assert diagnosis["base_url"] == origin
         source_bytes = len((tmp_path / "Main.lean").read_bytes()) + len("Main.lean")
         assert diagnosis["upload"] == {
@@ -148,6 +149,7 @@ def test_cli_installed_project_workflow_and_skill(tmp_path):
         assert [file["path"] for file in upload["files"]] == ["Main.lean"]
         assert json.loads(command("connect", "--bundle", "b"))["workspace_id"] == "w"
         assert json.loads(command("versions"))["versions"]
+        assert json.loads(command("resources")) == {"worker": {"usage_based": False}}
         assert json.loads(command("sync"))["revision"] == 1
         first = json.loads(command("check", "Main.lean", expected=1))
         assert first["kind"] == "check"
@@ -218,6 +220,10 @@ def test_mcp_stdio_uses_same_project_session_without_key_arguments(tmp_path):
                 }
                 assert "api_key" not in json.dumps([t.inputSchema for t in catalog.tools])
                 assert "max_spend" not in json.dumps([t.inputSchema for t in catalog.tools])
+                assert "profile" not in json.dumps([t.inputSchema for t in catalog.tools])
+                resources = await client.call_tool("resources", {})
+                assert not resources.isError, resources
+                assert json.loads(resources.content[0].text) == {"worker": {"usage_based": False}}
                 connected = await client.call_tool("connect", {})
                 assert not connected.isError, connected
                 submitted = await client.call_tool("check", {"file": "Main.lean"})
@@ -325,6 +331,61 @@ def test_cli_reports_argument_mistakes_as_json(capsys):
     error = json.loads(capsys.readouterr().out)
     assert error["error"] == "invalid_arguments"
     assert "--column" in error["message"]
+
+
+def test_cli_keeps_legacy_profile_flags_out_of_customer_help():
+    from leanwarp_cloud.cli import parser
+
+    root = parser()
+    commands = next(a for a in root._actions if isinstance(a, argparse._SubParsersAction))
+    for name in ("connect", "check", "inspect", "try-tactics", "verify"):
+        assert "--profile" not in commands.choices[name].format_help()
+        assert "--max-profile" not in commands.choices[name].format_help()
+    connected = root.parse_args(["connect", "--profile", "standard", "--max-profile", "large"])
+    assert connected.profile == "standard" and connected.max_profile == "large"
+    checked = root.parse_args(["check", "Main.lean", "--profile", "standard"])
+    assert checked.profile == "standard"
+
+
+def test_cli_forwards_legacy_profile_flags_for_existing_automation(tmp_path, monkeypatch, capsys):
+    from leanwarp_cloud import LeanWarpCloud, cli
+
+    project(tmp_path)
+    service = Service()
+    monkeypatch.setattr(
+        cli,
+        "load_client",
+        lambda: LeanWarpCloud(
+            TEST_KEY,
+            base_url="https://api.example",
+            transport=httpx.MockTransport(service.handle),
+        ),
+    )
+    assert (
+        cli.main(
+            [
+                "--project",
+                str(tmp_path),
+                "connect",
+                "--profile",
+                "standard",
+                "--max-profile",
+                "large",
+            ]
+        )
+        == 0
+    )
+    create = next(request for request in service.requests if request.method == "POST")
+    assert json.loads(create.content) == {
+        "bundle_id": "b",
+        "resource_profile": "standard",
+        "max_resource_profile": "large",
+        "max_spend_microusd": None,
+    }
+    assert cli.main(["--project", str(tmp_path), "check", "Main.lean", "--profile", "large"]) == 1
+    submit = next(request for request in reversed(service.requests) if request.method == "POST")
+    assert json.loads(submit.content)["resource_profile"] == "large"
+    assert TEST_KEY not in capsys.readouterr().out
 
 
 def test_cli_explains_a_malformed_key(monkeypatch, capsys, tmp_path):

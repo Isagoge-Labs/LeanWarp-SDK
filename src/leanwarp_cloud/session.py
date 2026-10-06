@@ -26,6 +26,7 @@ from .project import (
     selects,
     validate_selection,
 )
+from .resources import published_worker_resources
 
 _MAX_JOURNAL_BYTES = 8 * 1024 * 1024
 _TERMINAL_STATES = frozenset({"completed", "failed", "cancelled"})
@@ -204,8 +205,8 @@ class ProjectSession:
     def connect(
         self,
         *,
-        resource_profile: str = "standard",
-        max_resource_profile: str = "standard",
+        resource_profile: str | None = None,
+        max_resource_profile: str | None = None,
         environment: str | None = None,
         bundle_id: str | None = None,
     ) -> dict[str, Any]:
@@ -239,16 +240,15 @@ class ProjectSession:
                 identity, self.cloud.versions()["versions"], environment, bundle_id=bundle_id
             )
             state["environment"] = list(identity.journal())
-            workspace = self._request(
-                state,
-                "create_workspace",
-                {
-                    "bundle_id": choice.build["bundle_id"],
-                    "resource_profile": resource_profile,
-                    "max_resource_profile": max_resource_profile,
-                    "max_spend_microusd": None,
-                },
-            )
+            arguments: dict[str, Any] = {
+                "bundle_id": choice.build["bundle_id"],
+                "max_spend_microusd": None,
+            }
+            if resource_profile is not None:
+                arguments["resource_profile"] = resource_profile
+            if max_resource_profile is not None:
+                arguments["max_resource_profile"] = max_resource_profile
+            workspace = self._request(state, "create_workspace", arguments)
             return {**workspace, "environment_choice": choice.public()}
 
     def doctor(self, *, environment: str | None = None) -> dict[str, Any]:
@@ -257,10 +257,11 @@ class ProjectSession:
             raise SessionError(".leanwarp must be a directory, not a symlink")
         state = self._read()
         catalog = self.cloud.versions()["versions"]
+        resources = self.cloud.resources()
         report: dict[str, Any] = {
             "environments": sorted({environment_name(build) for build in catalog}),
             "matching_bundles": [],
-            "resources": self.cloud.resources()["resources"],
+            **published_worker_resources(resources),
             "base_url": self.cloud.base_url,
             "connected": bool(state.get("workspace_id")),
             "recovery_required": state.get("pending") is not None,
@@ -653,10 +654,14 @@ def _validate_journal(state: dict[str, Any]) -> None:
             )
         if valid and method == "create_workspace":
             valid = (
-                set(args) - {"max_spend_microusd"}
-                == {"bundle_id", "resource_profile", "max_resource_profile"}
+                "bundle_id" in args
+                and set(args).issubset(
+                    {"bundle_id", "resource_profile", "max_resource_profile", "max_spend_microusd"}
+                )
                 and all(
-                    text(args[k]) for k in ("bundle_id", "resource_profile", "max_resource_profile")
+                    text(args[k])
+                    for k in ("bundle_id", "resource_profile", "max_resource_profile")
+                    if k in args
                 )
                 and (
                     args.get("max_spend_microusd") is None

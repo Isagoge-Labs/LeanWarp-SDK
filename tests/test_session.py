@@ -630,7 +630,7 @@ def test_invalid_submission_preserves_readable_journal_without_sending(project, 
 
 
 @pytest.mark.parametrize("field", ["resource_profile", "max_resource_profile"])
-@pytest.mark.parametrize("value", ["", "x" * 257, None])
+@pytest.mark.parametrize("value", ["", "x" * 257])
 def test_invalid_connect_profile_does_not_poison_first_connection(project, field, value):
     root, service, cloud, session = project
     with pytest.raises(SessionError):
@@ -686,6 +686,29 @@ def test_new_connection_explicitly_selects_prepaid_policy(project):
     session.connect()
     body = json.loads(next(r.content for r in service.requests if r.method == "POST"))
     assert body["max_spend_microusd"] is None
+    assert "resource_profile" not in body
+    assert "max_resource_profile" not in body
+
+
+def test_recovery_keeps_server_default_selection_omitted(project):
+    root, service, _, session = project
+    service.lose = "workspaces"
+    with pytest.raises(httpx.ReadTimeout):
+        session.connect()
+    assert ProjectSession(session.cloud, root).recover()["workspace_id"] == "w"
+    posts = [r for r in service.requests if r.method == "POST"]
+    assert len(posts) == 2
+    assert posts[0].content == posts[1].content
+    assert posts[0].headers["Idempotency-Key"] == posts[1].headers["Idempotency-Key"]
+    assert "resource_profile" not in json.loads(posts[0].content)
+
+
+def test_connection_keeps_explicit_profile_selection(project):
+    _, service, _, session = project
+    session.connect(resource_profile="standard", max_resource_profile="large")
+    body = json.loads(next(r.content for r in service.requests if r.method == "POST"))
+    assert body["resource_profile"] == "standard"
+    assert body["max_resource_profile"] == "large"
 
 
 def test_connected_project_survives_root_rename_and_formatting(project):

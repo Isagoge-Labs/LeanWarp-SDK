@@ -102,12 +102,22 @@ environments LeanWarp serves.
 
 ## Billing
 
-You pay for the time a worker runs, by the second, from prepaid credit. A
-worker starts with your first operation, stays warm between calls, and stops
-after 5 minutes without activity or when you run `leanwarp stop`. While it runs,
-an hour of usage is held from your credit and the unused part is returned when it
-stops. Set a spending cap for each workspace in the
-[dashboard](https://isagoge.in/dashboard).
+You pay from prepaid credit, billed by the second while a worker runs. Run
+`leanwarp resources` to see the published worker's starting minute price, whether
+charges depend on usage, startup credit hold and idle timeout. LeanWarp selects
+the worker; you set a spending cap in the dashboard.
+
+When the worker uses usage billing, CPU and RAM charges increase independently
+above their reserved baselines. The starting rate is a paid minimum while the
+worker runs, including idle time. Bursting depends on available host capacity.
+Otherwise, the listed minute rate applies for the time the worker runs. Existing
+workspaces keep their saved billing terms.
+
+A worker starts with your first operation and stays warm between calls. Run
+`leanwarp stop` when finished; closing the SDK client or your terminal does not
+stop it. Stopping releases unused held credit and keeps your uploaded files and
+completed results; the next operation reconstructs the worker. Set a spending cap
+for each workspace in the [dashboard](https://isagoge.in/dashboard).
 
 ## Concepts
 

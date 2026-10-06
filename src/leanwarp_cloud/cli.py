@@ -18,6 +18,7 @@ from .config import credentials_path, load_client, save_credentials
 from .endpoints import ConfigurationError
 from .outcome import OperationOutcome, reported
 from .project import ProjectError, plan_upload
+from .resources import published_worker_resources
 from .session import MAX_INLINE_WAIT_SECONDS, ProjectSession, SessionError, UsageError
 
 DEFAULT_WAIT_SECONDS = 30.0
@@ -118,14 +119,12 @@ def parser() -> argparse.ArgumentParser:
     selection = connect.add_mutually_exclusive_group()
     selection.add_argument("--environment", metavar="NAME", help=environment_help)
     selection.add_argument("--bundle", help=argparse.SUPPRESS)
-    connect.add_argument(
-        "--profile", default="standard", metavar="SIZE", help="worker size (default: standard)"
-    )
+    # Deprecated wire compatibility for existing automation and saved requests.
+    connect.add_argument("--profile", metavar="SIZE", help=argparse.SUPPRESS)
     connect.add_argument(
         "--max-profile",
-        default="standard",
         metavar="SIZE",
-        help="largest worker size an operation in this workspace may request",
+        help=argparse.SUPPRESS,
     )
 
     check = commands.add_parser("check", help="compile a file and report Lean errors and warnings")
@@ -201,7 +200,9 @@ def parser() -> argparse.ArgumentParser:
             help="stop the operation on the server after this long, 1 to 600",
         )
         operation.add_argument(
-            "--profile", metavar="SIZE", help="worker size for this operation only"
+            "--profile",
+            metavar="SIZE",
+            help=argparse.SUPPRESS,
         )
 
     wait = commands.add_parser("wait", help="wait for the latest operation's result")
@@ -225,7 +226,7 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser(
         "environments", aliases=["versions"], help="list the Lean environments LeanWarp serves"
     )
-    commands.add_parser("resources", help="list worker sizes and prices")
+    commands.add_parser("resources", help="show worker resources and pricing")
     skill = commands.add_parser("skill", help="print the instructions for AI agents")
     skill.add_argument("--reference", action="store_true", help="print the full reference instead")
     commands.add_parser("mcp", help="run the MCP server for this project over stdio")
@@ -330,7 +331,11 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 return 0
             if args.command in {"account", "resources"}:
-                _emit(getattr(cloud, args.command)())
+                _emit(
+                    published_worker_resources(cloud.resources())
+                    if args.command == "resources"
+                    else cloud.account()
+                )
                 return 0
             project = ProjectSession(cloud, args.project)
             if args.command == "connect":

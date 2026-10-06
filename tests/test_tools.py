@@ -138,6 +138,14 @@ def test_cli_installed_project_workflow_and_skill(tmp_path):
         assert diagnosis["matching_bundles"]
         assert diagnosis["resources"]
         assert diagnosis["base_url"] == origin
+        source_bytes = len((tmp_path / "Main.lean").read_bytes()) + len("Main.lean")
+        assert diagnosis["upload"] == {
+            "file_count": 1,
+            "total_bytes": source_bytes,
+            "problems": [],
+        }
+        upload = json.loads(command("files"))
+        assert [file["path"] for file in upload["files"]] == ["Main.lean"]
         assert json.loads(command("connect", "--bundle", "b"))["workspace_id"] == "w"
         assert json.loads(command("versions"))["versions"]
         assert json.loads(command("sync"))["revision"] == 1
@@ -146,6 +154,14 @@ def test_cli_installed_project_workflow_and_skill(tmp_path):
         # Results lead with whether they passed; the full server receipt follows.
         assert next(iter(first)) == "success" and first["success"] is False
         assert json.loads(command("wait", expected=1))["operation_id"] == first["operation_id"]
+
+        def submitted() -> dict:
+            posted = (r for r in reversed(service.requests) if r.method == "POST")
+            return json.loads(next(posted).content)["payload"]
+
+        assert submitted() == {"file": "Main.lean", "strict": True}
+        command("check", "Main.lean", "--draft", expected=1)
+        assert submitted() == {"file": "Main.lean", "strict": False}
         invalid = json.loads(command("check", "Main.lean", "--wait", "99", expected=2))
         assert invalid["error"] == "invalid_arguments"
         assert "between 0 and 40 seconds" in invalid["message"]
@@ -332,9 +348,13 @@ def test_mcp_starts_and_explains_sign_in_before_credentials_exist(tmp_path, monk
     async def call():
         guide = await server.read_resource("leanwarp://guide")
         assert "# LeanWarp" in next(iter(guide)).content
-        tools = {tool.name for tool in await server.list_tools()}
-        assert {"doctor", "environments", "connect", "verify_target"} <= tools
+        tools = {tool.name: tool for tool in await server.list_tools()}
+        assert {"doctor", "environments", "connect", "verify_target", "files"} <= set(tools)
+        assert "draft" in tools["check"].inputSchema["properties"]
         with pytest.raises(Exception, match="auth login"):
             await server.call_tool("doctor", {})
+        # Listing the upload reads only local files, so it works before sign-in.
+        listing = await server.call_tool("files", {})
+        assert '"file_count": 0' in listing[0][0].text
 
     asyncio.run(call())

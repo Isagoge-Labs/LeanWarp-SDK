@@ -22,8 +22,9 @@ Authorization: Bearer lw_live_…
    `revision`.
 4. `POST /workspaces/{workspace_id}/operations` submits an operation against that
    revision and returns `202 Accepted` with an `operation_id`.
-5. `GET /operations/{operation_id}` until `state` is `completed`, `failed` or
-   `cancelled`.
+5. `GET /operations/{operation_id}?wait_seconds=20` until `state` is `completed`,
+   `failed` or `cancelled`. The server holds each read until the operation ends
+   or `wait_seconds` (0 to 20) pass, so you don't need to poll quickly.
 6. `POST /workspaces/{workspace_id}/stop` stops the worker.
 
 ```sh
@@ -46,7 +47,7 @@ curl -s https://api.isagoge.in/v1/leanwarp/workspaces/$WORKSPACE/operations \
 | `GET` | `/workspaces/{workspace_id}` | read | A workspace's state and current revision. |
 | `PUT` | `/workspaces/{workspace_id}/files` | write | Upload or delete files; returns the new revision. |
 | `POST` | `/workspaces/{workspace_id}/operations` | execute | Submit `check`, `inspect`, `try_tactics` or `verify_target`. |
-| `GET` | `/operations/{operation_id}` | read | An operation's state and result. |
+| `GET` | `/operations/{operation_id}` | read | An operation's state and result; `?wait_seconds=N` waits up to 20 seconds for it to end. |
 | `POST` | `/operations/{operation_id}/cancel` | execute | Ask to cancel; poll until it ends. |
 | `POST` | `/workspaces/{workspace_id}/stop` | write or execute | Stop the worker; files are kept. |
 | `DELETE` | `/workspaces/{workspace_id}` | write | Delete a workspace. |
@@ -95,3 +96,19 @@ and `leanwarp_budget_exceeded` means the workspace reached its spending cap.
 A `completed` operation can still report a failed check or a rejected proof: read
 `result.result.status`. A verification passed only when its status is `ok` and its
 receipt's `policy` is `fixed_target_kernel_check_v1`.
+
+`result` holds the receipt's `operation_id`, `revision` and `generation`, and the
+operation's fields under `result.result`; the
+[reference](../src/leanwarp_cloud/skills/leanwarp/references/usage.md#results)
+lists them. Completed operations also have `execution`, saying which worker ran
+them and what was reused, and `timing`, with `queued_ms`, `worker_ms`,
+`upload_ms` and `run_ms`. After dispatch recovery, `queued_ms` is absent rather
+than an estimate of earlier attempts. Clients should tolerate absent timing.
+
+A dependency preparation failure is also a completed receipt with `status: error`,
+`diagnostics` explaining the failure, and `diagnostics_complete: false`, for any
+operation kind. It contains no successful tactic trials.
+
+Held operation reads share the API's per-account and overall request limits. A
+busy service returns HTTP 503 with `Retry-After`. The SDK falls back to ordinary
+polling if a proxy cannot hold the connection, within the original wait deadline.

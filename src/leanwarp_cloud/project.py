@@ -6,15 +6,18 @@ dependency, so a project's toolchain and lockfile only decide where it runs.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
 import re
 import stat
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
+
+from pathspec import GitIgnoreSpec
 
 _EXCLUDED = {".git", ".lake", ".env", ".ssh", ".aws", ".venv", "node_modules", "vendor"}
 # Lake manifest formats in supported Lean releases. 1.2.0 (Lean 4.34) adds an
@@ -323,67 +326,288 @@ def _default_environment(catalog: Sequence[Mapping[str, Any]]) -> Mapping[str, A
     )
 
 
+#: Ignore files read from the project's top level, in order; later patterns win.
+IGNORE_FILES = (".gitignore", ".leanwarpignore")
+MAX_UPLOAD_FILES = 256
+MAX_UPLOAD_BYTES = 1024 * 1024
+_IGNORE_FILE_BYTES = 64 * 1024
+
+
+@dataclass(frozen=True)
+class UploadPlan:
+    """The files an operation would upload, and why any cannot be."""
+
+    sizes: dict[str, int]
+    total_bytes: int
+    ignored: int
+    ignore_files: tuple[str, ...]
+    problems: tuple[str, ...]
+    max_total_bytes: int
+
+    def public(self) -> dict[str, Any]:
+        return {
+            "files": [{"path": path, "bytes": size} for path, size in self.sizes.items()],
+            "file_count": len(self.sizes),
+            "total_bytes": self.total_bytes,
+            "limits": {"files": MAX_UPLOAD_FILES, "bytes": self.max_total_bytes},
+            "ignored_lean_files": self.ignored,
+            "ignore_files": list(self.ignore_files),
+            "problems": list(self.problems),
+        }
+
+
 def collect_lean_sources(
-    root: str | Path, *, max_file_bytes: int = 1024 * 1024, max_total_bytes: int = 1024 * 1024
+    root: str | Path,
+    *,
+    max_file_bytes: int = MAX_UPLOAD_BYTES,
+    max_total_bytes: int = MAX_UPLOAD_BYTES,
 ) -> dict[str, str]:
-    """Read regular UTF-8 .lean files below root, excluding links and hidden paths.
+    """Read regular UTF-8 .lean files below root, excluding links, hidden and ignored paths.
 
     The selected environment supplies the toolchain and dependencies.
     Symlinks are errors rather than silently dereferenced outside the project.
     """
+    plan, sources = _scan_upload(
+        root, max_file_bytes=max_file_bytes, max_total_bytes=max_total_bytes, collect=True
+    )
+    if plan.problems:
+        raise ProjectError(plan.problems[0])
+    return sources
+
+
+def plan_upload(
+    root: str | Path,
+    *,
+    max_file_bytes: int = MAX_UPLOAD_BYTES,
+    max_total_bytes: int = MAX_UPLOAD_BYTES,
+) -> UploadPlan:
+    """Preview every selected file and problem, without retaining file contents.
+
+    Paths matching the project's top-level ``.gitignore`` or ``.leanwarpignore``
+    are skipped, as git would skip them.
+    """
+    plan, _ = _scan_upload(
+        root, max_file_bytes=max_file_bytes, max_total_bytes=max_total_bytes, collect=False
+    )
+    return plan
+
+
+def _scan_upload(
+    root: str | Path, *, max_file_bytes: int, max_total_bytes: int, collect: bool
+) -> tuple[UploadPlan, dict[str, str]]:
+    """One validation path; only a bounded upload retains source bodies."""
     project = Path(root).resolve(strict=True)
     if not project.is_dir():
         raise ProjectError(f"{project} is not a directory")
     if max_file_bytes <= 0 or max_total_bytes <= 0:
         raise ValueError("source size limits must be positive")
+    ignore_files, ignored_by = _ignore_rules(project)
     sources: dict[str, str] = {}
-    total = 0
+    sizes: dict[str, int] = {}
+    import_problems: list[str] = []
+    problems: list[str] = []
+    total = ignored = 0
     for directory, directories, names, directory_fd in os.fwalk(project, follow_symlinks=False):
+        relative_directory = Path(directory).relative_to(project).as_posix()
+        prefix = "" if relative_directory == "." else f"{relative_directory}/"
         directories[:] = sorted(
-            name for name in directories if name not in _EXCLUDED and not name.startswith(".")
+            name
+            for name in directories
+            if name not in _EXCLUDED
+            and not name.startswith(".")
+            and not ignored_by(f"{prefix}{name}/")
         )
-        for name in directories:
-            if (Path(directory) / name).is_symlink():
-                raise ProjectError(
-                    f"{(Path(directory) / name).relative_to(project)} is a symlinked directory; "
-                    "LeanWarp uploads only regular files inside the project"
-                )
+        problems.extend(
+            f"{prefix}{name} is a symlinked directory; LeanWarp uploads only regular files "
+            "inside the project. Exclude it in .leanwarpignore if it is not needed"
+            for name in directories
+            if (Path(directory) / name).is_symlink()
+        )
         for name in sorted(names):
             if not name.endswith(".lean") or name.startswith(".") or name == "lakefile.lean":
                 continue
-            path = Path(directory) / name
-            relative = path.relative_to(project).as_posix()
-            module_root = relative.split("/", 1)[0].removesuffix(".lean")
-            if (
-                len(relative) > 240
-                or re.fullmatch(
-                    r"[A-Za-z_][A-Za-z0-9_]*(?:/[A-Za-z_][A-Za-z0-9_]*)*\.lean", relative
-                )
-                is None
-                or module_root in {"Init", "Lean", "Lake", "Std", "Mathlib"}
-            ):
-                raise ProjectError(
-                    f"{relative} is not an uploadable Lean module path: use ASCII letters, "
-                    "digits and underscores, at most 240 characters, outside Init, Lean, Lake, "
-                    "Std and Mathlib"
-                )
-            # O_NOFOLLOW rejects a file replaced by a symlink during discovery.
-            descriptor = os.open(
-                name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd
+            relative = f"{prefix}{name}"
+            if ignored_by(relative):
+                ignored += 1
+                continue
+            problem = _module_path_problem(relative)
+            source = ""
+            if problem is None:
+                source, problem = _read_source(relative, name, directory_fd, max_file_bytes)
+            if problem is not None:
+                problems.append(problem)
+                if collect:
+                    break
+                continue
+            size = len(source.encode("utf-8"))
+            sizes[relative] = size
+            total += size + len(relative.encode("utf-8"))
+            import_problems.extend(_ignored_imports(project, relative, source, ignored_by))
+            if collect:
+                if len(sizes) > MAX_UPLOAD_FILES or total > max_total_bytes:
+                    break
+                sources[relative] = source
+        if collect and (problems or len(sizes) > MAX_UPLOAD_FILES or total > max_total_bytes):
+            break
+    if not (collect and problems) and (len(sizes) > MAX_UPLOAD_FILES or total > max_total_bytes):
+        problems.append(
+            f"the project's Lean files ({len(sizes)} files, {total} bytes) exceed the upload "
+            f"limit of {MAX_UPLOAD_FILES} files and {_size(max_total_bytes)}. Run `leanwarp "
+            "files` to see them, then exclude unrelated ones in .leanwarpignore"
+        )
+    if not (collect and problems):
+        problems.extend(import_problems)
+    return UploadPlan(
+        sizes=sizes,
+        total_bytes=total,
+        ignored=ignored,
+        ignore_files=ignore_files,
+        problems=tuple(problems),
+        max_total_bytes=max_total_bytes,
+    ), sources
+
+
+def _module_path_problem(relative: str) -> str | None:
+    module_root = relative.split("/", 1)[0].removesuffix(".lean")
+    if (
+        len(relative) <= 240
+        and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(?:/[A-Za-z_][A-Za-z0-9_]*)*\.lean", relative)
+        is not None
+        and module_root not in {"Init", "Lean", "Lake", "Std", "Mathlib"}
+    ):
+        return None
+    return (
+        f"{relative} is not an uploadable Lean module path: use ASCII letters, digits and "
+        "underscores, at most 240 characters, outside Init, Lean, Lake, Std and Mathlib. "
+        "Exclude it in .leanwarpignore if it is not part of the project"
+    )
+
+
+def _read_source(
+    relative: str, name: str, directory_fd: int, max_file_bytes: int
+) -> tuple[str, str | None]:
+    """Read one bounded file, or say why it cannot be uploaded."""
+    # O_NOFOLLOW rejects a file replaced by a symlink during discovery.
+    try:
+        descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd)
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            return "", f"{relative} cannot be read; symlinked Lean files are not uploaded"
+        return "", f"{relative} cannot be read: {error.strerror or 'unknown error'}"
+    with os.fdopen(descriptor, "rb") as source:
+        if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+            return "", f"{relative} must be a regular file"
+        raw = source.read(max_file_bytes + 1)
+    if len(raw) > max_file_bytes:
+        return "", f"{relative} is larger than the {_size(max_file_bytes)} upload limit"
+    try:
+        return raw.decode("utf-8"), None
+    except UnicodeDecodeError:
+        return "", f"{relative} is not UTF-8 text"
+
+
+def _size(limit: int) -> str:
+    for unit, scale in (("MiB", 1024 * 1024), ("KiB", 1024)):
+        if limit % scale == 0:
+            return f"{limit // scale} {unit}"
+    return f"{limit} bytes"
+
+
+# Lean headers contain whitespace-separated imports, including nested comments.
+# Match tokens without consuming the declaration body or text inside strings.
+_HEADER_COMPONENT = re.compile(r"[^\W\d]\w*|«[^»]+»")
+_HEADER_IDENTIFIER = re.compile(
+    rf"(?:{_HEADER_COMPONENT.pattern})(?:\.(?:{_HEADER_COMPONENT.pattern}))*"
+)
+_HEADER_TOKEN = re.compile(rf"{_HEADER_IDENTIFIER.pattern}|\S")
+_HEADER_WORDS = {"module", "prelude", "public", "private", "meta", "import", "all"}
+
+
+def _header_imports(source: str) -> list[str]:
+    """Read only Lean's header, skipping line and nested block comments."""
+    modules: list[str] = []
+    importing = False
+    position = 0
+    while position < len(source):
+        if source[position].isspace():
+            position += 1
+            continue
+        if source.startswith("--", position):
+            end = source.find("\n", position + 2)
+            position = len(source) if end < 0 else end + 1
+            continue
+        if source.startswith("/-", position):
+            depth = 1
+            position += 2
+            while position < len(source) and depth:
+                if source.startswith("/-", position):
+                    depth += 1
+                    position += 2
+                elif source.startswith("-/", position):
+                    depth -= 1
+                    position += 2
+                else:
+                    position += 1
+            continue
+        token = _HEADER_TOKEN.match(source, position)
+        if token is None:
+            break
+        word = token.group()
+        position = token.end()
+        if word in _HEADER_WORDS:
+            importing = word in {"import", "all"}
+        elif importing and _HEADER_IDENTIFIER.fullmatch(word):
+            # Each Lean import consumes one identifier, including quoted
+            # components such as Foo.«Bar». Only ASCII project module names
+            # correspond to uploadable paths; consume other imports as well.
+            parts = [
+                part[1:-1] if part.startswith("«") else part
+                for part in _HEADER_COMPONENT.findall(word)
+            ]
+            if all(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", part) for part in parts):
+                modules.append(".".join(parts))
+            importing = False
+        else:
+            break
+    return modules
+
+
+def _ignored_imports(
+    project: Path, relative: str, source: str, ignored_by: Callable[[str], bool]
+) -> list[str]:
+    """Report omitted project imports while one bounded file is in memory."""
+    problems: list[str] = []
+    for module in dict.fromkeys(_header_imports(source)):
+        path = module.replace(".", "/") + ".lean"
+        parents = Path(path).parents
+        omitted = ignored_by(path) or any(
+            ignored_by(f"{parent.as_posix()}/") for parent in parents if parent != Path(".")
+        )
+        if omitted and (project / path).is_file():
+            problems.append(
+                f"{relative} imports {module}, but an ignore rule in .gitignore or "
+                f".leanwarpignore leaves out {path}. Change the rule so it is uploaded; "
+                "`leanwarp files` shows the result"
             )
-            with os.fdopen(descriptor, "rb") as source:
-                metadata = os.fstat(source.fileno())
-                if not stat.S_ISREG(metadata.st_mode):
-                    raise ProjectError(f"{relative} must be a regular file")
-                raw = source.read(max_file_bytes + 1)
-            total += len(raw) + len(relative.encode("utf-8"))
-            if len(raw) > max_file_bytes or total > max_total_bytes or len(sources) >= 256:
-                raise ProjectError(
-                    "the project's Lean files exceed the upload limit of 256 files and 1 MiB; "
-                    "move unrelated files out of the project directory"
-                )
-            try:
-                sources[relative] = raw.decode("utf-8")
-            except UnicodeDecodeError as error:
-                raise ProjectError(f"{relative} is not UTF-8 text") from error
-    return sources
+    return problems
+
+
+def _ignore_rules(project: Path) -> tuple[tuple[str, ...], Callable[[str], bool]]:
+    """The top-level ignore files present, and a matcher for project-relative paths."""
+    found: list[str] = []
+    lines: list[str] = []
+    for name in IGNORE_FILES:
+        path = project / name
+        if path.is_symlink() or not path.is_file():
+            continue
+        with path.open("rb") as stream:
+            raw = stream.read(_IGNORE_FILE_BYTES + 1)
+        if len(raw) > _IGNORE_FILE_BYTES:
+            raise ProjectError(f"{name} is larger than 64 KiB")
+        try:
+            lines.extend(raw.decode("utf-8").splitlines())
+        except UnicodeDecodeError as error:
+            raise ProjectError(f"{name} is not UTF-8 text") from error
+        found.append(name)
+    spec = GitIgnoreSpec.from_lines(lines)
+    return tuple(found), spec.match_file

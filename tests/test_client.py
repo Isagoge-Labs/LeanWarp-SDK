@@ -370,3 +370,150 @@ def test_invalid_execution_deadline_is_rejected_before_submission(deadline: obje
             payload={"file": "Main.lean"},
             timeout_seconds=deadline,
         )
+
+
+class _Clock:
+    """A fake monotonic clock that sleeps and held reads advance."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+        self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+def test_waiting_asks_the_server_to_hold_each_read_until_the_operation_ends(monkeypatch) -> None:
+    clock = _Clock()
+    monkeypatch.setattr("leanwarp_cloud.client.time.monotonic", clock.monotonic)
+    monkeypatch.setattr("leanwarp_cloud.client.time.sleep", clock.sleep)
+    holds: list[float] = []
+    read_timeouts: list[float] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        hold = float(request.url.params["wait_seconds"])
+        holds.append(hold)
+        read_timeouts.append(request.extensions["timeout"]["read"])
+        # The first read is held for its whole window; the operation then ends.
+        clock.now += hold
+        state = "running" if len(holds) == 1 else "completed"
+        return httpx.Response(200, json={"operation_id": "op-1", "state": state})
+
+    with LeanWarpCloud(
+        "secret", base_url="https://cloud.example", transport=httpx.MockTransport(handle)
+    ) as api:
+        operation = api.wait("op-1", timeout=300)
+
+    assert operation["state"] == "completed"
+    assert holds[0] == 20
+    assert all(timeout > hold for timeout, hold in zip(read_timeouts, holds, strict=True))
+    # Held reads pace themselves; there is no sleeping between them.
+    assert clock.sleeps == []
+
+
+def test_waiting_polls_an_api_that_answers_without_holding_the_read(monkeypatch) -> None:
+    clock = _Clock()
+    monkeypatch.setattr("leanwarp_cloud.client.time.monotonic", clock.monotonic)
+    monkeypatch.setattr("leanwarp_cloud.client.time.sleep", clock.sleep)
+    reads = itertools.count(1)
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        state = "completed" if next(reads) == 3 else "running"
+        return httpx.Response(200, json={"operation_id": "op-1", "state": state})
+
+    with LeanWarpCloud(
+        "secret", base_url="https://cloud.example", transport=httpx.MockTransport(handle)
+    ) as api:
+        assert api.wait("op-1", timeout=60, poll_interval=1)["state"] == "completed"
+    assert clock.sleeps == [1, 1]
+
+
+def test_reads_cannot_ask_the_server_to_hold_longer_than_it_will() -> None:
+    with (
+        LeanWarpCloud(
+            "secret",
+            base_url="https://cloud.example",
+            transport=httpx.MockTransport(lambda request: httpx.Response(500)),
+        ) as api,
+        pytest.raises(ValueError, match="wait_seconds"),
+    ):
+        api.operation("op-1", wait_seconds=21)
+
+
+@pytest.mark.parametrize("failure", ["gateway", "timeout"])
+def test_wait_falls_back_when_a_proxy_cannot_hold_reads(monkeypatch, failure) -> None:
+    clock = _Clock()
+    monkeypatch.setattr("leanwarp_cloud.client.time.monotonic", clock.monotonic)
+    monkeypatch.setattr("leanwarp_cloud.client.time.sleep", clock.sleep)
+    holds = []
+    completes_at = clock.now + 60
+
+    def handle(request):
+        hold = float(request.url.params.get("wait_seconds", 0))
+        holds.append(hold)
+        if hold > 5:
+            clock.now += 5
+            if failure == "timeout":
+                raise httpx.ReadTimeout("proxy hold expired", request=request)
+            return httpx.Response(504)
+        return httpx.Response(
+            200,
+            json={
+                "operation_id": "op-1",
+                "state": "completed" if clock.now >= completes_at else "running",
+            },
+        )
+
+    with LeanWarpCloud(
+        "secret", base_url="https://cloud.example", transport=httpx.MockTransport(handle)
+    ) as api:
+        assert api.wait("op-1", timeout=300)["state"] == "completed"
+    assert holds[0] == 20
+    assert holds[1:] and set(holds[1:]) == {0}
+    assert clock.now == completes_at
+
+
+@pytest.mark.parametrize(
+    "status,code", [(403, "forbidden"), (404, "not_found"), (502, "invalid_response")]
+)
+def test_held_reads_do_not_hide_authorization_or_response_errors(status, code) -> None:
+    calls = []
+
+    def handle(request):
+        calls.append(request)
+        return httpx.Response(status, json={"error": {"code": code}})
+
+    with (
+        LeanWarpCloud(
+            "secret", base_url="https://cloud.example", transport=httpx.MockTransport(handle)
+        ) as api,
+        pytest.raises(LeanWarpCloudError) as caught,
+    ):
+        api.wait("op-1")
+    assert caught.value.code == code
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("held", [False, True])
+def test_held_reads_preserve_rate_limit_backoff(monkeypatch, held):
+    clock = _Clock()
+    monkeypatch.setattr("leanwarp_cloud.client.time.monotonic", clock.monotonic)
+    monkeypatch.setattr("leanwarp_cloud.client.time.sleep", clock.sleep)
+    calls = []
+
+    def handle(request):
+        calls.append(request)
+        if len(calls) == 1:
+            return httpx.Response(429, headers={"Retry-After": "1"})
+        return httpx.Response(200, json={"operation_id": "op-1", "state": "completed"})
+
+    with LeanWarpCloud(
+        "secret", base_url="https://cloud.example", transport=httpx.MockTransport(handle)
+    ) as api:
+        result = api.wait("op-1") if held else api.operation("op-1")
+    assert result["state"] == "completed"
+    assert len(calls) == 2 and clock.sleeps == [1]

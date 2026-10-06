@@ -17,6 +17,10 @@ from .project import choose_environment, project_identity, validate_selection
 from .transport import DeadlineTransport
 
 _MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+#: The longest the API holds a read of an operation that has not finished.
+MAX_SERVER_WAIT_SECONDS = 20.0
+# Time allowed for a held response to arrive after the server stops waiting.
+_RESPONSE_MARGIN = 2.0
 
 
 class LeanWarpCloudError(RuntimeError):
@@ -75,6 +79,7 @@ class LeanWarpCloud:
             trust_env=False,
         )
         self._retries = retries
+        self._timeout = timeout
         self.base_url = base_url.rstrip("/")
 
     def close(self) -> None:
@@ -198,9 +203,20 @@ class LeanWarpCloud:
             idempotency_key=idempotency_key or uuid4().hex,
         )
 
-    def operation(self, operation_id: str, *, deadline: float | None = None) -> dict[str, Any]:
-        """Read an operation; ``deadline`` (``time.monotonic()``) bounds the whole read."""
-        result = self._request("GET", f"operations/{_segment(operation_id)}", deadline=deadline)
+    def operation(
+        self, operation_id: str, *, deadline: float | None = None, wait_seconds: float = 0
+    ) -> dict[str, Any]:
+        """Read an operation; ``deadline`` (``time.monotonic()``) bounds the whole read.
+
+        With ``wait_seconds`` (at most 20), the server holds the read until the
+        operation ends or that many seconds pass, instead of answering at once.
+        """
+        if not 0 <= wait_seconds <= MAX_SERVER_WAIT_SECONDS:
+            raise ValueError(f"wait_seconds must be between 0 and {MAX_SERVER_WAIT_SECONDS:g}")
+        path = f"operations/{_segment(operation_id)}"
+        if wait_seconds > 0:
+            path += f"?wait_seconds={wait_seconds:.3f}"
+        result = self._request("GET", path, deadline=deadline, hold_seconds=wait_seconds)
         if result.get("operation_id") != operation_id:
             raise LeanWarpCloudError(502, "invalid_response", "operation identity does not match")
         return result
@@ -299,30 +315,57 @@ class LeanWarpCloud:
     def wait(
         self, operation_id: str, *, timeout: float = 300, poll_interval: float = 1
     ) -> dict[str, Any]:
-        """Poll until the operation is terminal or ``timeout`` seconds pass.
+        """Wait until the operation is terminal or ``timeout`` seconds pass.
 
-        Every poll request, retry and network read shares the same deadline.
-        Platform DNS and caller-injected transports retain their own timeout
-        behavior (see ``_request``).
+        Each read asks the server to hold it until the operation ends, so a
+        result arrives as soon as it exists. An API that answers at once is
+        polled every ``poll_interval`` seconds instead. Every read, retry and
+        network wait shares the same deadline. Platform DNS and caller-injected
+        transports retain their own timeout behavior (see ``_request``).
         """
         if timeout <= 0 or poll_interval <= 0:
             raise ValueError("timeout and poll_interval must be positive")
         deadline = time.monotonic() + timeout
         operation: dict[str, Any] | None = None
+        use_held_reads = True
         while True:
+            started = time.monotonic()
+            # Hold at most half the remaining time, so a stalled connection
+            # still leaves room to retry, and leave time for the response.
+            hold = min(
+                MAX_SERVER_WAIT_SECONDS, max(0.0, (deadline - started) / 2 - _RESPONSE_MARGIN)
+            )
+            if not use_held_reads:
+                hold = 0
+            held = False
             try:
-                operation = self.operation(operation_id, deadline=deadline)
+                operation = self.operation(operation_id, deadline=deadline, wait_seconds=hold)
             except httpx.TimeoutException:
+                # Some proxies terminate held reads before the API does. Fall
+                # back to ordinary polling for the remainder of this wait.
+                use_held_reads = False
                 # A slow read before the deadline is just a missed poll.
                 if time.monotonic() >= deadline:
                     raise OperationTimeout(operation_id, operation) from None
+            except LeanWarpCloudError as error:
+                if (
+                    hold <= 0
+                    or error.status_code not in {502, 503, 504}
+                    or error.code in {"invalid_response", "invalid_encoding", "response_too_large"}
+                ):
+                    raise
+                use_held_reads = False
             else:
                 if operation.get("state") in {"completed", "failed", "cancelled"}:
                     return operation
+                held = hold > 0 and time.monotonic() - started >= min(hold, poll_interval)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise OperationTimeout(operation_id, operation)
-            time.sleep(min(poll_interval, remaining))
+            if not held:
+                # A failed read, or an API that answers without holding it,
+                # is retried at the polling pace.
+                time.sleep(min(poll_interval, remaining))
 
     def cancel(self, operation_id: str) -> dict[str, Any]:
         return self._request("POST", f"operations/{_segment(operation_id)}/cancel")
@@ -341,13 +384,15 @@ class LeanWarpCloud:
         body: Mapping[str, Any] | None = None,
         idempotency_key: str | None = None,
         deadline: float | None = None,
+        hold_seconds: float = 0,
     ) -> dict[str, Any]:
         """Send with bounded retries.
 
         With a ``deadline`` (``time.monotonic()``), no attempt or backoff starts
         after it, and each attempt splits its remaining budget across connect,
         response and body reads (see ``_attempt_timeout``). Expiry raises
-        ``httpx.TimeoutException``.
+        ``httpx.TimeoutException``. ``hold_seconds`` is how long the server may
+        deliberately delay its response; the read timeout allows for it.
         """
         headers = {"Idempotency-Key": idempotency_key} if idempotency_key else {}
         # One request identity always replays the same bytes, even if the caller
@@ -361,14 +406,22 @@ class LeanWarpCloud:
         retryable = method == "GET" or idempotency_key is not None
         attempts = self._retries + 1 if retryable else 1
         for attempt in range(attempts):
-            timeout = _attempt_timeout(deadline)
+            timeout = _attempt_timeout(deadline, hold_seconds, default=self._timeout)
             try:
                 response = self._send(method, path, content, headers, timeout, deadline)
-            except httpx.TransportError:
+            except httpx.TransportError as transport_error:
+                # wait() retries an expired held read without the hold. Other
+                # transport failures keep the usual bounded retry policy.
+                if hold_seconds > 0 and isinstance(transport_error, httpx.TimeoutException):
+                    raise
                 if attempt + 1 == attempts or not _backoff(min(0.25 * 2**attempt, 2), deadline):
                     raise
                 continue
-            if response.status_code in {429, 502, 503, 504} and attempt + 1 < attempts:
+            if (
+                response.status_code in {429, 502, 503, 504}
+                and attempt + 1 < attempts
+                and not (hold_seconds > 0 and response.status_code in {502, 503, 504})
+            ):
                 retry_after = response.headers.get("Retry-After", "")
                 delay = min(float(retry_after), 5) if retry_after.isdigit() else 0.25 * 2**attempt
                 if _backoff(delay, deadline):
@@ -437,19 +490,27 @@ class LeanWarpCloud:
             )
 
 
-def _attempt_timeout(deadline: float | None) -> httpx.Timeout | None:
+def _attempt_timeout(
+    deadline: float | None, hold_seconds: float = 0, *, default: float = 30.0
+) -> httpx.Timeout | None:
     """Limit each blocking network wait to a third of the remaining budget.
 
-    The default transport also clamps each network read (including headers)
-    to the remaining deadline. Platform DNS and caller-injected transports
-    retain their own blocking behavior; no background request survives expiry.
+    A read the server holds for ``hold_seconds`` may wait that long for its
+    response, within the remaining budget. The default transport also clamps
+    each network read (including headers) to the remaining deadline. Platform
+    DNS and caller-injected transports retain their own blocking behavior; no
+    background request survives expiry.
     """
     if deadline is None:
-        return None
+        if hold_seconds <= 0:
+            return None
+        return httpx.Timeout(default, read=max(default, hold_seconds + _RESPONSE_MARGIN))
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         raise httpx.TimeoutException("deadline reached")
-    return httpx.Timeout(remaining / 3)
+    if hold_seconds <= 0:
+        return httpx.Timeout(remaining / 3)
+    return httpx.Timeout(remaining / 3, read=min(remaining, hold_seconds + _RESPONSE_MARGIN))
 
 
 def _backoff(delay: float, deadline: float | None) -> bool:

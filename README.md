@@ -12,9 +12,9 @@ command, an MCP server and a Python library.
 
 | Operation | What you get | CLI |
 | --- | --- | --- |
-| Check | Lean's errors and warnings for a file. | `leanwarp check` |
+| Check | Lean's errors and warnings for a file; `--draft` reuses Lean's work on the unchanged part while you edit. | `leanwarp check` |
 | Inspect | The goals and local context at a position in a proof. | `leanwarp inspect` |
-| Try tactics | What each candidate tactic does, without editing the file. | `leanwarp try-tactics` |
+| Try tactics | Several tactics from the same captured goal: which close it, which leave goals, which fail. The file is not edited. | `leanwarp try-tactics` |
 | Verify | Whether a declaration proves exactly the statement you give, checked by Lean's kernel. | `leanwarp verify` |
 
 ### Coming soon
@@ -84,6 +84,8 @@ Keep API keys out of prompts, source files and tool arguments.
 LeanWarp uploads only your `.lean` files. Lean, Mathlib and every other
 dependency come from an **environment**: a Lean release with Mathlib, already
 built on LeanWarp's workers. Run `leanwarp environments` to list them.
+`leanwarp files` lists what would upload; patterns in `.gitignore` and
+`.leanwarpignore` leave files out.
 
 `leanwarp connect` picks the environment for you:
 

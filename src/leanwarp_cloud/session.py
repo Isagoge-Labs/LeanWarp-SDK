@@ -21,6 +21,7 @@ from .project import (
     choose_environment,
     collect_lean_sources,
     environment_name,
+    plan_upload,
     project_identity,
     selects,
     validate_selection,
@@ -275,6 +276,12 @@ class ProjectSession:
         report["project"] = {
             "lean_toolchain": identity.toolchain,
             "lockfile": identity.manifest_sha256 is not None,
+        }
+        upload = plan_upload(self.root)
+        report["upload"] = {
+            "file_count": len(upload.sizes),
+            "total_bytes": upload.total_bytes,
+            "problems": list(upload.problems),
         }
         if state.get("workspace_id"):
             owner = self.cloud.account().get("owner_id")

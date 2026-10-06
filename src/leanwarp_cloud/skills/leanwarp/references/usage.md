@@ -8,9 +8,10 @@ command prints one JSON object; `leanwarp COMMAND --help` lists its options.
 | Command | What it does |
 | --- | --- |
 | `auth login`, `auth logout` | Save or forget the API key on this machine. |
-| `doctor [--environment NAME]` | Show which environment the project runs on. No compute. |
+| `doctor [--environment NAME]` | Show which environment the project runs on, and summarise the upload. No compute. |
+| `files` | List the Lean files that would upload, their sizes and any problems. No key needed. |
 | `connect [--environment NAME]` | Create the project's workspace. No compute. |
-| `check FILE` | Compile a file and report Lean's errors and warnings. |
+| `check FILE [--draft]` | Compile a file and report Lean's errors and warnings. |
 | `inspect FILE --line N --column N` | Show the goals and local context at a position. |
 | `try-tactics FILE --line N --column N --tactic T [--tactic T …]` | Try tactics without editing the file. |
 | `verify FILE --declaration NAME --target STATEMENT [--context-file PATH]` | Check that a declaration proves exactly the statement. |
@@ -34,6 +35,12 @@ files first, then accept:
 
 `verify --fresh` also uses a temporary worker. Otherwise operations share the
 workspace's worker, which keeps imports loaded between calls.
+
+`check` is strict by default: `sorry` is an error and the result is what a final
+build would say. `check --draft` is faster while you edit: the worker keeps the
+file open, and after an edit Lean reuses its work on the unchanged part of the
+file. In a draft check `sorry` is only a warning, so finish with a full `check`
+or with `verify`.
 
 ## Environments
 
@@ -78,15 +85,36 @@ command could not run. Its JSON then has `error` (a stable code) and `message`.
 
 What to read in `result.result`:
 
-| Operation | Field |
+| Operation | Fields |
 | --- | --- |
-| `check` | `status` (`ok` when there are no errors) and Lean's diagnostics. |
-| `inspect` | `status`: `proof_state` with goals, or `metadata_only` when the position has no goal. |
-| `try_tactics` | One entry per tactic in `results`, each with its own status. |
-| `verify_target` | `status` `ok` and `receipt.policy` `fixed_target_kernel_check_v1`. |
+| `check` | `status` (`ok` when there are no errors), `diagnostics` and `cached`. |
+| `inspect` | `status`: `proof_state` with `goal_contexts`, or `metadata_only` when the position has no goal. Also `selected_hole`, `enclosing_declaration`, `premise_hints` and `context_omitted`. |
+| `try_tactics` | `results`: one entry per tactic, in the order given, with `tactic`, `outcome`, `status`, `diagnostics`, `elapsed_ms` and `execution`. `skipped` lists tactics that did not run, with a reason. |
+| `verify_target` | `status` `ok` and `receipt.policy` `fixed_target_kernel_check_v1`; a rejection has `failure_kind`. |
 
-`metadata_only` doesn't mean a goal is solved, and a tactic that succeeds in a
-trial isn't a proof until the file checks with it.
+A trial's `outcome` is `closed_proof`, `open_proof_state` (the tactic ran and
+goals remain, shown in its diagnostics), `tactic_error`, `timeout` or
+`rejected`. `metadata_only` doesn't mean a goal is solved, and a tactic that
+succeeds in a trial isn't a proof until the file checks with it. Engine errors,
+such as a position outside any proof, arrive as `status` `error` with an `error`
+object holding `code` and `message`.
+
+### How it ran
+
+Completed operations also carry `execution`, which says what LeanWarp reused,
+and `timing`, which says where the time went. Only facts that apply appear.
+
+| `execution` field | Values |
+| --- | --- |
+| `worker` | `warm`: the workspace's running worker. `started`: a new worker started for this operation. `temporary`: a separate worker that stopped afterwards. |
+| `imports` | `reused`: the file's imports were already loaded. `extended`: loaded imports were extended. `loaded`: imported now. |
+| `document` | Draft checks only. `incremental`: Lean reused its earlier work on the file. `full`: the file was elaborated from the start. |
+| `trials` | Tactic trials counted by how they ran. `proof_state`: from Lean's captured proof state. `document_state`: replayed from the captured document. `source_recheck`: the file rechecked with the tactic in place. `cached`: an identical earlier trial. |
+
+`timing` has `queued_ms` (left out when the operation was recovered after a
+failed attempt), `worker_ms` (getting a ready worker, including any start),
+`upload_ms` and `run_ms`. Trials also report their own `execution` and
+`elapsed_ms`.
 
 Each result names the operation ID and source revision it belongs to. The SDK
 rejects a result that doesn't match the operation the project submitted.
@@ -133,7 +161,7 @@ without a key; tools that need one then say how to sign in. The resources
 reference without a key. CLI and MCP share the project's `.leanwarp/` state; don't
 run both against one project at the same time.
 
-Tools: `doctor`, `environments`, `connect`, `check`, `inspect`, `try_tactics`,
+Tools: `doctor`, `files`, `environments`, `connect`, `check` (`draft`), `inspect`, `try_tactics`,
 `verify_target` (`file`, `candidate_declaration`, `target_statement`,
 `target_context`), `wait`, `status`, `cancel`, `stop`, `recover`, `disconnect`,
 `account` and `resources`. Operation tools wait up to `wait_seconds` (default 20,
@@ -188,6 +216,7 @@ the same key. See the [HTTP API](https://github.com/Isagoge-Labs/LeanWarp-SDK/bl
 | Situation | What to do |
 | --- | --- |
 | A create, upload or submit response was lost | `recover` resends the saved request, even if files changed since. |
+| A file can't be uploaded, or the upload is too large | Run `files` to see every problem, then exclude unrelated files in `.leanwarpignore`. |
 | `success` is `null`, or `wait` timed out | Run `wait` again. To abandon it, `cancel`, then `wait` until it ends. |
 | Another LeanWarp command is using the project | Let it finish; a lock prevents overlapping writes. |
 | `revision_conflict` from another machine | Decide which files to keep with the other writer. Don't delete `.leanwarp/` to force it. |
@@ -244,3 +273,9 @@ running.
 
 Hidden directories, `.lake`, `lakefile.lean` and symlinks are never uploaded, and
 symlinked Lean files are rejected. Lake scripts and dependency builds never run.
+
+Patterns in the project's top-level `.gitignore` and `.leanwarpignore` exclude
+files, with git's syntax. `.leanwarpignore` is read last, so it can exclude
+something git tracks, such as an `archive/` folder, or re-include a file git
+ignores with `!path`. A file inside an excluded directory can't be re-included.
+`files` lists exactly what would upload.

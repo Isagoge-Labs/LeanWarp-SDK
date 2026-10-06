@@ -13,7 +13,7 @@ from .client import LeanWarpCloud, LeanWarpCloudError, OperationTimeout
 from .config import load_client
 from .endpoints import ConfigurationError
 from .outcome import reported
-from .project import ProjectError
+from .project import ProjectError, plan_upload
 from .session import ProjectSession, SessionError, UsageError
 
 # Warm checks usually finish within this; a cold start returns a pending operation.
@@ -114,6 +114,15 @@ def create_server(cloud: LeanWarpCloud | Callable[[], LeanWarpCloud], root: str)
         """
         return session().doctor(environment=environment)
 
+    @server.tool(name="files", annotations=read)
+    @_safe_tool
+    def upload_files() -> dict[str, Any]:
+        """List the Lean files that would upload, their sizes and any problems.
+
+        .gitignore and .leanwarpignore in the project exclude files. Needs no key.
+        """
+        return plan_upload(root).public()
+
     @server.tool(annotations=read)
     @_safe_tool
     def versions() -> dict[str, Any]:
@@ -164,14 +173,18 @@ def create_server(cloud: LeanWarpCloud | Callable[[], LeanWarpCloud], root: str)
 
     @server.tool(annotations=write)
     @_safe_tool
-    def check(file: str, wait_seconds: float = DEFAULT_WAIT_SECONDS) -> dict[str, Any]:
+    def check(
+        file: str, draft: bool = False, wait_seconds: float = DEFAULT_WAIT_SECONDS
+    ) -> dict[str, Any]:
         """Compile a file and report Lean errors and warnings. Uploads changed files first.
 
-        May start a worker, which uses credit.
+        draft=true is faster while editing: Lean reuses its work on the unchanged part
+        of the file, and `sorry` is only a warning, so finish with a full check or
+        verify_target. May start a worker, which uses credit.
         """
         return reported(
             session().submit_and_wait(
-                "check", {"file": file, "strict": True}, wait_seconds=wait_seconds
+                "check", {"file": file, "strict": not draft}, wait_seconds=wait_seconds
             )
         )
 

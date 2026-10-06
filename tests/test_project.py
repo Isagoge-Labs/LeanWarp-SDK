@@ -1,7 +1,9 @@
+import os
 from pathlib import Path
 
 import pytest
-from leanwarp_cloud import collect_lean_sources
+from leanwarp_cloud import collect_lean_sources, plan_upload
+from leanwarp_cloud.project import ProjectError
 
 
 def test_uploads_only_project_lean_sources(tmp_path: Path) -> None:
@@ -20,7 +22,7 @@ def test_rejects_symlink_to_secret_outside_project(tmp_path: Path) -> None:
     root.mkdir()
     (tmp_path / "secret").write_text("secret")
     (root / "Proof.lean").symlink_to(tmp_path / "secret")
-    with pytest.raises(OSError):
+    with pytest.raises(ProjectError, match=r"Proof\.lean cannot be read; symlinked"):
         collect_lean_sources(root)
 
 
@@ -214,3 +216,160 @@ def test_explicit_bundle_choice_accepts_any_build_of_a_listed_environment():
     assert not selects(current, "lean-4.34-mathlib-" + "a" * 20)
     # Older services list builds without an environment.
     assert not selects({"bundle_id": "lean426"}, "lean-4.26-mathlib")
+
+
+def test_ignore_files_exclude_an_archive_that_could_not_be_uploaded(tmp_path: Path) -> None:
+    (tmp_path / "Main.lean").write_text("theorem main : True := trivial\n")
+    archive = tmp_path / "archive-2024"
+    archive.mkdir()
+    (archive / "Old Draft.lean").write_text("-- not a module path\n")
+    with pytest.raises(ProjectError, match=r"Exclude it in \.leanwarpignore"):
+        collect_lean_sources(tmp_path)
+
+    (tmp_path / ".leanwarpignore").write_text("archive-2024/\n")
+    assert collect_lean_sources(tmp_path) == {"Main.lean": "theorem main : True := trivial\n"}
+
+
+def test_gitignore_is_honoured_and_leanwarpignore_can_override_it(tmp_path: Path) -> None:
+    (tmp_path / "Main.lean").write_text("import Generated.Data\n")
+    (tmp_path / "Scratch.lean").write_text("-- scratch\n")
+    generated = tmp_path / "Generated"
+    generated.mkdir()
+    (generated / "Data.lean").write_text("def data := 1\n")
+    (tmp_path / ".gitignore").write_text("Scratch.lean\n/Generated/*.lean\n")
+    # Leaving out a file that an uploaded file imports would only fail on the worker.
+    with pytest.raises(ProjectError, match=r"Main\.lean imports Generated\.Data, but an ignore"):
+        collect_lean_sources(tmp_path)
+
+    (tmp_path / ".leanwarpignore").write_text("!/Generated/Data.lean\n")
+    assert set(collect_lean_sources(tmp_path)) == {"Main.lean", "Generated/Data.lean"}
+
+
+def test_upload_plan_lists_files_and_every_problem(tmp_path: Path) -> None:
+    (tmp_path / "Main.lean").write_text("theorem main : True := trivial\n")
+    (tmp_path / "Ignored.lean").write_text("-- ignored\n")
+    (tmp_path / "Bad-Name.lean").write_text("-- bad\n")
+    (tmp_path / "Latin1.lean").write_bytes(b"-- caf\xe9\n")
+    (tmp_path / ".leanwarpignore").write_text("Ignored.lean\n")
+
+    plan = plan_upload(tmp_path).public()
+
+    assert plan["files"] == [{"path": "Main.lean", "bytes": 31}]
+    assert plan["file_count"] == 1
+    assert plan["total_bytes"] == 31 + len("Main.lean")
+    assert plan["limits"] == {"files": 256, "bytes": 1024 * 1024}
+    assert plan["ignored_lean_files"] == 1
+    assert plan["ignore_files"] == [".leanwarpignore"]
+    assert len(plan["problems"]) == 2
+    assert plan["problems"][0].startswith("Bad-Name.lean is not an uploadable Lean module path")
+    assert plan["problems"][1] == "Latin1.lean is not UTF-8 text"
+
+
+def test_too_many_files_points_to_the_preview_and_the_ignore_file(tmp_path: Path) -> None:
+    for index in range(257):
+        (tmp_path / f"File{index}.lean").write_text("-- x\n")
+    with pytest.raises(ProjectError, match=r"leanwarp files.*\.leanwarpignore"):
+        collect_lean_sources(tmp_path)
+    assert plan_upload(tmp_path).public()["file_count"] == 257
+
+
+def test_imports_from_an_ignored_directory_are_reported(tmp_path: Path) -> None:
+    main = "module\n\npublic import Vendor.Util\n\ntheorem t : True := trivial\n"
+    (tmp_path / "Main.lean").write_text(main)
+    vendor = tmp_path / "Vendor"
+    vendor.mkdir()
+    (vendor / "Util.lean").write_text("def util := 1\n")
+    (tmp_path / ".leanwarpignore").write_text("Vendor/\n")
+    problems = plan_upload(tmp_path).problems
+    assert problems == (
+        "Main.lean imports Vendor.Util, but an ignore rule in .gitignore or .leanwarpignore "
+        "leaves out Vendor/Util.lean. Change the rule so it is uploaded; `leanwarp files` "
+        "shows the result",
+    )
+
+
+def test_unreadable_files_say_why(tmp_path: Path) -> None:
+    locked = tmp_path / "Locked.lean"
+    locked.write_text("-- private\n")
+    locked.chmod(0)
+    try:
+        if os.access(locked, os.R_OK):
+            pytest.skip("running with permission to read any file")
+        assert plan_upload(tmp_path).problems == ("Locked.lean cannot be read: Permission denied",)
+    finally:
+        locked.chmod(0o600)
+
+
+def test_size_problems_state_the_limits_in_force(tmp_path: Path) -> None:
+    (tmp_path / "Big.lean").write_text("-- " + "x" * 2048 + "\n")
+    assert plan_upload(tmp_path, max_file_bytes=1024).problems == (
+        "Big.lean is larger than the 1 KiB upload limit",
+    )
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        "/- Copyright /- nested -/ notice -/\nimport Aux\n",
+        "import\n  Aux\n",
+        "import /- comment -/ Aux -- note\n",
+        "import «Aux»\n",
+        "module\nmeta import all Aux\n",
+    ],
+)
+def test_ignored_dependencies_are_found_through_lean_header_whitespace(tmp_path, header):
+    (tmp_path / "Aux.lean").write_text("def aux := 1\n")
+    (tmp_path / ".leanwarpignore").write_text("Aux.lean\n")
+    (tmp_path / "Main.lean").write_text(header + "example : True := trivial\n")
+    with pytest.raises(ProjectError, match=r"Main\.lean imports Aux"):
+        collect_lean_sources(tmp_path)
+
+
+def test_comment_words_are_not_imports_and_body_import_text_is_not_a_header(tmp_path):
+    (tmp_path / "Aux.lean").write_text("def aux := 1\n")
+    (tmp_path / ".leanwarpignore").write_text("Aux.lean\n")
+    main = 'import Init -- Aux\n/- import Aux -/\ndef text := "import Aux"\n'
+    (tmp_path / "Main.lean").write_text(main)
+    assert collect_lean_sources(tmp_path) == {"Main.lean": main}
+
+
+def test_lowercase_module_imports_are_checked(tmp_path):
+    (tmp_path / "aux.lean").write_text("def aux := 1\n")
+    (tmp_path / ".leanwarpignore").write_text("aux.lean\n")
+    (tmp_path / "Main.lean").write_text("import aux\nexample : True := trivial\n")
+    with pytest.raises(ProjectError, match=r"Main\.lean imports aux"):
+        collect_lean_sources(tmp_path)
+
+
+def test_preview_keeps_complete_metadata_without_retaining_oversized_source_bodies(tmp_path):
+    from dataclasses import asdict
+
+    source = "-- " + "x" * (64 * 1024)
+    for index in range(300):
+        (tmp_path / f"File{index}.lean").write_text(source)
+    plan = plan_upload(tmp_path)
+    assert plan.public()["file_count"] == 300
+    assert plan.total_bytes > 18 * 1024 * 1024
+    assert "exceed the upload limit" in plan.problems[0]
+    assert "sources" not in asdict(plan)
+    assert source not in repr(asdict(plan))
+    with pytest.raises(ProjectError, match="exceed the upload limit"):
+        collect_lean_sources(tmp_path)
+
+
+def test_quoted_and_unicode_imports_do_not_hide_later_ignored_modules(tmp_path):
+    vendor = tmp_path / "Foo"
+    vendor.mkdir()
+    (vendor / "Bar.lean").write_text("def bar := 1\n")
+    (tmp_path / ".leanwarpignore").write_text("Foo/Bar.lean\n")
+    (tmp_path / "Main.lean").write_text(
+        "import «外部»\nimport Foo.«Bar»\nexample : True := trivial\n"
+    )
+    assert "Main.lean imports Foo.Bar" in plan_upload(tmp_path).problems[0]
+
+
+def test_repeated_imports_produce_one_actionable_problem_per_file(tmp_path):
+    (tmp_path / "Aux.lean").write_text("def aux := 1\n")
+    (tmp_path / ".leanwarpignore").write_text("Aux.lean\n")
+    (tmp_path / "Main.lean").write_text("import Aux\n" * 1000)
+    assert len(plan_upload(tmp_path).problems) == 1

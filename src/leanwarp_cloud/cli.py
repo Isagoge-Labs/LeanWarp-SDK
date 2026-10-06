@@ -17,7 +17,7 @@ from .client import LeanWarpCloud, LeanWarpCloudError, OperationTimeout
 from .config import credentials_path, load_client, save_credentials
 from .endpoints import ConfigurationError
 from .outcome import OperationOutcome, reported
-from .project import ProjectError
+from .project import ProjectError, plan_upload
 from .session import MAX_INLINE_WAIT_SECONDS, ProjectSession, SessionError, UsageError
 
 DEFAULT_WAIT_SECONDS = 30.0
@@ -29,6 +29,7 @@ Every command prints one JSON object."""
 _EPILOG = f"""\
 a typical session:
   leanwarp doctor            show which environment this project runs on
+  leanwarp files             list the Lean files that would upload
   leanwarp connect           create the project's workspace (no compute yet)
   leanwarp check Main.lean   compile a file and report Lean errors
   leanwarp verify Main.lean --declaration NAME --target 'STATEMENT'
@@ -103,6 +104,13 @@ def parser() -> argparse.ArgumentParser:
         "doctor", help="show which environment this project runs on (no compute)"
     )
     doctor.add_argument("--environment", metavar="NAME", help=environment_help)
+    commands.add_parser(
+        "files",
+        help=(
+            "list the Lean files that would upload, with sizes and problems; .gitignore and "
+            ".leanwarpignore exclude files (no key needed)"
+        ),
+    )
 
     connect = commands.add_parser(
         "connect", help="create this project's workspace (no compute until the first operation)"
@@ -122,6 +130,14 @@ def parser() -> argparse.ArgumentParser:
 
     check = commands.add_parser("check", help="compile a file and report Lean errors and warnings")
     check.add_argument("file", metavar="FILE", help="a .lean file in the project")
+    check.add_argument(
+        "--draft",
+        action="store_true",
+        help=(
+            "a faster check while you edit: Lean reuses its work on the unchanged part of "
+            "the file, and `sorry` is only a warning"
+        ),
+    )
 
     inspect = commands.add_parser(
         "inspect", help="show the goals and local context at a position in a proof"
@@ -242,7 +258,7 @@ def _operation(project: ProjectSession, args: argparse.Namespace) -> dict[str, A
     payload: dict[str, Any] = {"file": args.file}
     kind = args.command.replace("-", "_")
     if kind == "check":
-        payload["strict"] = True
+        payload["strict"] = not args.draft
     elif kind in {"inspect", "try_tactics"}:
         payload.update(line=args.line, column=args.column)
         if kind == "try_tactics":
@@ -282,6 +298,10 @@ def main(argv: list[str] | None = None) -> int:
                 .read_text(encoding="utf-8")
             )
             return 0
+        if args.command == "files":
+            plan = plan_upload(args.project)
+            _emit(plan.public())
+            return 1 if plan.problems else 0
         if args.command == "mcp":
             from .mcp_server import serve
 

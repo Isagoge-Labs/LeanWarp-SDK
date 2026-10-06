@@ -61,6 +61,11 @@ leanwarp connect
 
 Add `.leanwarp/` to `.gitignore`; it holds this project's connection.
 
+Only `.lean` files upload, at most 256 files and 1 MiB. `leanwarp files` lists
+them. If an archive or scratch folder gets in the way, add it to
+`.leanwarpignore` in the project's root, with git's syntax (`archive/`); paths in
+`.gitignore` are already left out.
+
 ## 3. Check and verify
 
 `LeanWarpExample.lean` in the example contains:
@@ -96,15 +101,21 @@ result. Abbreviated:
   "revision": 1,
   "result": {
     "result": {
+      "file": "LeanWarpExample.lean",
       "status": "ok",
       "receipt": {
         "policy": "fixed_target_kernel_check_v1",
         "candidate_declaration": "add_zero_example"
       }
     }
-  }
+  },
+  "execution": {"worker": "warm"},
+  "timing": {"queued_ms": 3, "worker_ms": 41, "upload_ms": 18, "run_ms": 612}
 }
 ```
+
+`execution` says what was reused: here the worker that the check started, still
+running with Lean loaded. `timing` says where the time went.
 
 `success` is `true` when the check passed or the proof was verified and `false`
 when it did not; Lean's messages are in `result.result`. If the work takes longer

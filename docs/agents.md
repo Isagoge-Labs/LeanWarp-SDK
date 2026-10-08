@@ -50,6 +50,11 @@ Use the absolute path of `leanwarp` if the client can't find it on its `PATH`.
 The server starts even before you sign in, so the agent can read its guides; tools
 that call LeanWarp then explain how to sign in.
 
+If the user specifies a workspace budget, pass it to `connect` as
+`max_spend_microusd` ($1 = 1,000,000). Reconnecting without that argument keeps
+the existing cap; a supplied different cap is rejected. Existing caps can be
+changed in the dashboard.
+
 The agent should read the resources `leanwarp://guide` and `leanwarp://reference`
 first. The tools are `doctor`, `environments`, `connect`, `check`, `inspect`,
 `try_tactics`, `verify_target`, `wait`, `status`, `cancel`, `stop`, `recover`,

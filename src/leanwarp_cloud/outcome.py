@@ -62,7 +62,21 @@ class OperationOutcome:
             return False
         kind = self.operation.get("kind")
         if kind == "inspect":
-            return result.get("status") in {"proof_state", "metadata_only"}
+            # Goal availability is separate from whether the worker retained a
+            # proof state. Older services expose only that retention status.
+            goals = result.get("goal_contexts")
+            return (
+                result.get("status") in {"available", "proof_state", "metadata_only"}
+                and ("goal_status" not in result or result["goal_status"] == "available")
+                and isinstance(goals, list)
+                and bool(goals)
+                and all(
+                    isinstance(goal, dict)
+                    and isinstance(goal.get("target"), str)
+                    and bool(goal["target"].strip())
+                    for goal in goals
+                )
+            )
         if kind == "try_tactics":
             # A completed trial batch can contain unsuccessful candidate tactics.
             # This says nothing about whether the theorem has been proved.

@@ -64,6 +64,43 @@ def test_retry_preserves_mutation_identity_and_body() -> None:
     assert requests[0].url.path == "/v1/leanwarp/workspaces/workspace-1/operations"
 
 
+def test_capped_workspace_retry_keeps_exact_cap_and_idempotency_key() -> None:
+    requests: list[httpx.Request] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if len(requests) == 1:
+            raise httpx.ReadTimeout("lost creation response", request=request)
+        return httpx.Response(200, json={"workspace_id": "w"})
+
+    with (
+        LeanWarpCloud(
+            "secret", base_url="https://cloud.example", transport=httpx.MockTransport(handle)
+        ) as api,
+        patch("leanwarp_cloud.client.time.sleep"),
+    ):
+        api.create_workspace("b", max_spend_microusd=2_000_001)
+    assert len(requests) == 2
+    assert requests[0].content == requests[1].content
+    assert requests[0].headers["Idempotency-Key"] == requests[1].headers["Idempotency-Key"]
+    assert json.loads(requests[0].content)["max_spend_microusd"] == 2_000_001
+
+
+@pytest.mark.parametrize("cap", [True, -1, 1.0, 10**12 + 1])
+def test_invalid_workspace_cap_sends_no_request(cap) -> None:
+    requests: list[httpx.Request] = []
+    with (
+        LeanWarpCloud(
+            "secret",
+            base_url="https://cloud.example",
+            transport=httpx.MockTransport(lambda request: requests.append(request)),
+        ) as api,
+        pytest.raises(ValueError, match="max_spend_microusd"),
+    ):
+        api.create_workspace("b", max_spend_microusd=cap)
+    assert requests == []
+
+
 def test_revision_conflict_is_not_retried_or_rebased() -> None:
     requests: list[httpx.Request] = []
 
@@ -257,11 +294,15 @@ def test_project_selects_exact_environment_and_rejects_mismatch(tmp_path: Path) 
     with LeanWarpCloud(
         "secret", base_url="https://cloud.example", transport=httpx.MockTransport(handle)
     ) as api:
-        assert api.create_workspace_for_project(tmp_path)["workspace_id"] == "w"
+        assert (
+            api.create_workspace_for_project(tmp_path, max_spend_microusd=2_000_001)["workspace_id"]
+            == "w"
+        )
         (tmp_path / "lean-toolchain").write_text("leanprover/lean4:v4.27.0\n")
         with pytest.raises(ValueError, match="No LeanWarp environment matches"):
             api.create_workspace_for_project(tmp_path)
     assert len(created) == 1 and created[0]["bundle_id"] == "exact"
+    assert created[0]["max_spend_microusd"] == 2_000_001
 
 
 def test_project_connects_using_locked_dependencies_not_example_name(tmp_path: Path) -> None:

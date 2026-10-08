@@ -13,6 +13,7 @@ from typing import Any, NoReturn
 import httpx
 
 from . import __version__
+from .amounts import usd_spending_cap
 from .client import LeanWarpCloud, LeanWarpCloudError, OperationTimeout
 from .config import credentials_path, load_client, save_credentials
 from .endpoints import ConfigurationError
@@ -22,6 +23,14 @@ from .resources import published_worker_resources
 from .session import MAX_INLINE_WAIT_SECONDS, ProjectSession, SessionError, UsageError
 
 DEFAULT_WAIT_SECONDS = 30.0
+
+
+def _spending_cap(value: str) -> int:
+    try:
+        return usd_spending_cap(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+
 
 _DESCRIPTION = """\
 Check and verify Lean proofs on LeanWarp's hosted workers.
@@ -125,6 +134,12 @@ def parser() -> argparse.ArgumentParser:
         "--max-profile",
         metavar="SIZE",
         help=argparse.SUPPRESS,
+    )
+    connect.add_argument(
+        "--max-spend",
+        metavar="USD",
+        type=_spending_cap,
+        help="cap total workspace spending in USD (up to six decimals); no cap by default",
     )
 
     check = commands.add_parser("check", help="compile a file and report Lean errors and warnings")
@@ -343,6 +358,7 @@ def main(argv: list[str] | None = None) -> int:
                     project.connect(
                         resource_profile=args.profile,
                         max_resource_profile=args.max_profile,
+                        max_spend_microusd=args.max_spend,
                         environment=args.environment,
                         bundle_id=args.bundle,
                     )

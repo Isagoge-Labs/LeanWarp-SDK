@@ -15,6 +15,7 @@ from uuid import uuid4
 
 import httpx
 
+from .amounts import validate_spending_cap
 from .client import LeanWarpCloud, LeanWarpCloudError, OperationTimeout
 from .project import (
     ProjectError,
@@ -207,6 +208,7 @@ class ProjectSession:
         *,
         resource_profile: str | None = None,
         max_resource_profile: str | None = None,
+        max_spend_microusd: int | None = None,
         environment: str | None = None,
         bundle_id: str | None = None,
     ) -> dict[str, Any]:
@@ -215,8 +217,16 @@ class ProjectSession:
         LeanWarp picks the environment that matches the project's toolchain and
         lockfile, or the newest one for a project that pins neither. Name an
         environment to run a project that matches none of them.
+
+        A cap limits total workspace spending, including reserved credit. On an
+        existing connection, an omitted cap keeps its current limit; a supplied
+        cap must match. Change an existing cap in the account dashboard.
         """
         validate_selection(environment, bundle_id)
+        try:
+            validate_spending_cap(max_spend_microusd)
+        except ValueError as error:
+            raise UsageError(str(error)) from error
         with self._locked() as state:
             self._ready(state)
             if state.get("workspace_id"):
@@ -234,6 +244,14 @@ class ProjectSession:
                         "`leanwarp stop` and `leanwarp disconnect` before choosing another "
                         "environment"
                     )
+                if max_spend_microusd is not None and (
+                    type(workspace.get("max_spend_microusd")) is not int
+                    or workspace["max_spend_microusd"] != max_spend_microusd
+                ):
+                    raise SessionError(
+                        "this project's workspace has a different spending cap; "
+                        "change it in the account dashboard, or omit the cap to keep it"
+                    )
                 return workspace
             identity = project_identity(self.root)
             choice = choose_environment(
@@ -242,7 +260,7 @@ class ProjectSession:
             state["environment"] = list(identity.journal())
             arguments: dict[str, Any] = {
                 "bundle_id": choice.build["bundle_id"],
-                "max_spend_microusd": None,
+                "max_spend_microusd": max_spend_microusd,
             }
             if resource_profile is not None:
                 arguments["resource_profile"] = resource_profile
@@ -480,8 +498,8 @@ class ProjectSession:
         method = pending["method"]
         try:
             if method == "create_workspace":
-                # Older journals can contain an explicit cap. Replay that exact
-                # payload: stripping it changes the durable request's identity.
+                # Replay the exact creation body, including older journals that
+                # omit defaults. Adding or stripping a cap changes its identity.
                 result = self.cloud._request(
                     "POST",
                     "workspaces",

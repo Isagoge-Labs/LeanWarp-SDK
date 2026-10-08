@@ -5,9 +5,10 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from functools import partial, wraps
 from importlib.resources import files
-from typing import Any
+from typing import Annotated, Any
 
 import httpx
+from pydantic import Field
 
 from .client import LeanWarpCloud, LeanWarpCloudError, OperationTimeout
 from .config import load_client
@@ -150,13 +151,19 @@ def create_server(cloud: LeanWarpCloud | Callable[[], LeanWarpCloud], root: str)
 
     @server.tool(annotations=write)
     @_safe_tool
-    def connect(environment: str | None = None) -> dict[str, Any]:
+    def connect(
+        environment: str | None = None,
+        max_spend_microusd: Annotated[int, Field(strict=True, ge=0, le=10**12)] | None = None,
+    ) -> dict[str, Any]:
         """Create this project's workspace once. Does not start compute.
 
         LeanWarp picks the environment matching the project's toolchain and lockfile.
         Pass environment only to run a project that matches none.
+        Optionally cap total workspace spending in microdollars ($1 = 1000000).
+        Omit the cap to keep an existing connection's cap. A different supplied
+        cap is rejected; change an existing cap in the account dashboard.
         """
-        return session().connect(environment=environment)
+        return session().connect(environment=environment, max_spend_microusd=max_spend_microusd)
 
     @server.tool(annotations=read)
     @_safe_tool

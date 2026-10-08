@@ -147,7 +147,17 @@ def test_cli_installed_project_workflow_and_skill(tmp_path):
         }
         upload = json.loads(command("files"))
         assert [file["path"] for file in upload["files"]] == ["Main.lean"]
-        assert json.loads(command("connect", "--bundle", "b"))["workspace_id"] == "w"
+        assert (
+            json.loads(command("connect", "--bundle", "b", "--max-spend", "2.000001"))[
+                "workspace_id"
+            ]
+            == "w"
+        )
+        creation = next(r for r in service.requests if r.method == "POST")
+        assert json.loads(creation.content)["max_spend_microusd"] == 2_000_001
+        assert json.loads(command("connect"))["max_spend_microusd"] == 2_000_001
+        mismatch = json.loads(command("connect", "--max-spend", "3", expected=2))
+        assert "different spending cap" in mismatch["message"]
         assert json.loads(command("versions"))["versions"]
         assert json.loads(command("resources")) == {"worker": {"usage_based": False}}
         assert json.loads(command("sync"))["revision"] == 1
@@ -219,13 +229,19 @@ def test_mcp_stdio_uses_same_project_session_without_key_arguments(tmp_path):
                     t.name for t in catalog.tools
                 }
                 assert "api_key" not in json.dumps([t.inputSchema for t in catalog.tools])
-                assert "max_spend" not in json.dumps([t.inputSchema for t in catalog.tools])
+                connect_schema = next(t.inputSchema for t in catalog.tools if t.name == "connect")
+                assert "max_spend_microusd" in connect_schema["properties"]
                 assert "profile" not in json.dumps([t.inputSchema for t in catalog.tools])
                 resources = await client.call_tool("resources", {})
                 assert not resources.isError, resources
                 assert json.loads(resources.content[0].text) == {"worker": {"usage_based": False}}
-                connected = await client.call_tool("connect", {})
+                connected = await client.call_tool("connect", {"max_spend_microusd": 2_000_001})
                 assert not connected.isError, connected
+                body = json.loads(next(r.content for r in service.requests if r.method == "POST"))
+                assert body["max_spend_microusd"] == 2_000_001
+                conflict = await client.call_tool("connect", {"max_spend_microusd": 3_000_000})
+                assert conflict.isError
+                assert "different spending cap" in conflict.content[0].text
                 submitted = await client.call_tool("check", {"file": "Main.lean"})
                 assert not submitted.isError, submitted
                 # The default inline wait returns the finished result in the same call.
@@ -267,8 +283,30 @@ def test_mcp_redacts_unexpected_transport_details(tmp_path):
 @pytest.mark.parametrize(
     "kind,result,success",
     [
-        ("inspect", {"status": "proof_state"}, True),
-        ("inspect", {"status": "metadata_only"}, True),
+        ("inspect", {"status": "available", "goal_contexts": [{"target": "True"}]}, True),
+        ("inspect", {"status": "proof_state", "goal_contexts": [{"target": "True"}]}, True),
+        ("inspect", {"status": "metadata_only", "goal_contexts": [{"target": "True"}]}, True),
+        (
+            "inspect",
+            {
+                "status": "metadata_only",
+                "goal_status": "available",
+                "goal_contexts": [{"target": "True"}],
+            },
+            True,
+        ),
+        (
+            "inspect",
+            {
+                "status": "metadata_only",
+                "goal_status": "unavailable",
+                "goal_contexts": [{"target": "True"}],
+            },
+            False,
+        ),
+        ("inspect", {"status": "metadata_only", "goal_contexts": []}, False),
+        ("inspect", {"status": "unavailable", "goal_contexts": []}, False),
+        ("inspect", {"status": "available", "goal_contexts": [{}]}, False),
         ("inspect", {"status": "error"}, False),
         ("try_tactics", {"results": [{"status": "failed"}]}, True),
         ("check", {"status": "rejected"}, False),
@@ -286,6 +324,43 @@ def test_engine_outcomes_do_not_confuse_trial_execution_with_proof(kind, result,
     )
     assert outcome.successful is success
     assert not outcome.verified
+
+
+@pytest.mark.parametrize("value", ["nan", "1.0000001", "1000000.000001", "-1"])
+def test_cli_cap_rejects_invalid_amounts_before_loading_credentials(value, monkeypatch, capsys):
+    from leanwarp_cloud import cli
+
+    def not_loaded():
+        pytest.fail("invalid cap must not load credentials or contact the service")
+
+    monkeypatch.setattr(cli, "load_client", not_loaded)
+    with pytest.raises(SystemExit) as stopped:
+        cli.main(["connect", "--max-spend", value])
+    assert stopped.value.code == 2
+    output = json.loads(capsys.readouterr().out)
+    assert output["error"] == "invalid_arguments"
+
+
+@pytest.mark.parametrize("cap", [-1, 10**12 + 1, True, 1.0, 1.5, "2000000"])
+def test_mcp_rejects_invalid_cap_before_contacting_service(tmp_path, cap):
+    from leanwarp_cloud import LeanWarpCloud
+    from leanwarp_cloud.mcp_server import create_server
+
+    requests: list[httpx.Request] = []
+    with LeanWarpCloud(
+        TEST_KEY,
+        base_url="https://api.example",
+        transport=httpx.MockTransport(lambda request: requests.append(request)),
+    ) as cloud:
+        server = create_server(cloud, str(tmp_path))
+
+        async def call():
+            with pytest.raises(Exception, match="max_spend_microusd"):
+                await server.call_tool("connect", {"max_spend_microusd": cap})
+
+        asyncio.run(call())
+    assert requests == []
+    assert not (tmp_path / ".leanwarp").exists()
 
 
 def test_credentials_require_key_and_reject_public_readable_file(tmp_path, monkeypatch):

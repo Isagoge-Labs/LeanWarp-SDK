@@ -23,6 +23,12 @@ If it reports `"compatible": false`, tell the user which environments exist and
 let them choose; then pass `--environment NAME` to `connect`. Never edit the
 project's `lean-toolchain` or `lake-manifest.json` to make it match.
 
+If the user gives a budget, set it when first connecting: `leanwarp connect
+--max-spend 2` caps that workspace at $2, including reserved credit (MCP:
+`connect(max_spend_microusd=2000000)`). Reconnecting without a cap keeps the
+existing one. Change an existing cap in the dashboard; don't create another
+workspace to bypass it.
+
 ## Work in a loop
 
 ```sh
@@ -38,7 +44,7 @@ without `--draft` before you call a file done.
 Each operation uploads changed files, waits up to 30 seconds and returns the
 result. Read `success` first:
 
-- `true`: the check passed (or the inspection or tactic trial ran).
+- `true`: the check passed, inspection returned goal context, or the tactic trial ran.
 - `false`: it did not; Lean's messages are in `result.result`. For a failed
   operation, `error_message` says what went wrong.
 - `null` (exit code `3`): still running. Run `leanwarp wait`. Never submit it again.
@@ -49,6 +55,11 @@ in `result.result.results` names its `tactic` and `outcome`: `closed_proof`,
 `open_proof_state` (goals remain; read its diagnostics), or a failure. Apply a
 tactic that works, then check again; a successful trial is not a proof. Edit
 and repeat; the same workspace and warm worker are reused.
+
+For inspection, `goal_status: available` means `goal_contexts` contains the goals.
+`goal_status: unavailable` means the context could not be captured, not that the proof
+is finished. `retained_proof_state` describes capture capability; trial
+`execution` reports the actual path used.
 
 ## Verify against the user's statement
 

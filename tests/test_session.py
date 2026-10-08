@@ -26,6 +26,7 @@ class Service:
         self.lose = ""
         self.reject = False
         self.workspace_count = 0
+        self.max_spend_microusd: int | None = None
         # Operation reads before a submitted operation completes; zero completes on submit.
         self.pending_polls = 0
         self.fail_operation_reads = 0
@@ -64,7 +65,11 @@ class Service:
             value = (
                 self.operation
                 if "/operations/" in path
-                else {"workspace_id": "w", "revision": self.revision}
+                else {
+                    "workspace_id": "w",
+                    "revision": self.revision,
+                    "max_spend_microusd": self.max_spend_microusd,
+                }
             )
             return httpx.Response(200, json=value)
         key = request.headers.get("Idempotency-Key", "")
@@ -78,6 +83,7 @@ class Service:
             return httpx.Response(409, json={"error": {"code": "revision_conflict"}})
         if path.endswith("/workspaces"):
             self.workspace_count += 1
+            self.max_spend_microusd = body.get("max_spend_microusd")
             result = {"workspace_id": "w", "revision": 0}
         elif path.endswith("/files"):
             assert body["expected_revision"] == self.revision
@@ -688,6 +694,46 @@ def test_new_connection_explicitly_selects_prepaid_policy(project):
     assert body["max_spend_microusd"] is None
     assert "resource_profile" not in body
     assert "max_resource_profile" not in body
+
+
+@pytest.mark.parametrize("cap", [0, 2_000_001, 10**12])
+def test_capped_connection_recovers_exact_creation_intent(project, cap):
+    root, service, cloud, session = project
+    service.lose = "/workspaces"
+    with pytest.raises(httpx.ReadTimeout):
+        session.connect(max_spend_microusd=cap)
+    journal = json.loads(session.path.read_text())
+    assert journal["pending"]["arguments"]["max_spend_microusd"] == cap
+    resumed = ProjectSession(cloud, root)
+    resumed.recover()
+    assert resumed.connect(max_spend_microusd=cap)["max_spend_microusd"] == cap
+    assert resumed.connect()["max_spend_microusd"] == cap
+    assert service.workspace_count == 1
+    posts = [r for r in service.requests if r.method == "POST"]
+    assert len(posts) == 2
+    assert posts[0].content == posts[1].content
+    assert posts[0].headers["Idempotency-Key"] == posts[1].headers["Idempotency-Key"]
+
+
+@pytest.mark.parametrize("saved, requested", [(None, 0), (2_000_000, 0), (2_000_000, 3_000_000)])
+def test_reconnect_rejects_conflicting_cap_without_mutation(project, saved, requested):
+    _, service, _, session = project
+    session.connect(max_spend_microusd=saved)
+    journal = session.path.read_bytes()
+    with pytest.raises(SessionError, match="different spending cap"):
+        session.connect(max_spend_microusd=requested)
+    assert session.path.read_bytes() == journal
+    assert service.workspace_count == 1
+    assert service.max_spend_microusd == saved
+
+
+@pytest.mark.parametrize("cap", [-1, 10**12 + 1, True, 1.5, "2000000"])
+def test_invalid_cap_starts_no_request_and_creates_no_journal(project, cap):
+    _, service, _, session = project
+    with pytest.raises(ValueError, match="max_spend_microusd"):
+        session.connect(max_spend_microusd=cap)
+    assert service.requests == []
+    assert not session.directory.exists()
 
 
 def test_recovery_keeps_server_default_selection_omitted(project):

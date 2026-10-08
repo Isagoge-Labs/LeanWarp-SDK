@@ -12,6 +12,7 @@ from uuid import uuid4
 
 import httpx
 
+from .amounts import validate_spending_cap
 from .endpoints import api_origin
 from .project import choose_environment, project_identity, validate_selection
 from .transport import DeadlineTransport
@@ -111,10 +112,12 @@ class LeanWarpCloud:
         bundle_id: str | None = None,
         resource_profile: str | None = None,
         max_resource_profile: str | None = None,
+        max_spend_microusd: int | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         """Create a workspace in the environment `ProjectSession.connect` would choose."""
         validate_selection(environment, bundle_id)
+        validate_spending_cap(max_spend_microusd)
         catalog = self.versions()["versions"]
         choice = choose_environment(
             project_identity(root), catalog, environment, bundle_id=bundle_id
@@ -123,6 +126,7 @@ class LeanWarpCloud:
             choice.build["bundle_id"],
             resource_profile=resource_profile,
             max_resource_profile=max_resource_profile,
+            max_spend_microusd=max_spend_microusd,
             idempotency_key=idempotency_key,
         )
 
@@ -132,13 +136,22 @@ class LeanWarpCloud:
         *,
         resource_profile: str | None = None,
         max_resource_profile: str | None = None,
+        max_spend_microusd: int | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
+        """Create a workspace without compute, optionally capped in exact microdollars.
+
+        The cap covers total spending plus reserved credit; None means no cap.
+        """
         # Omitted profiles use the service's reviewed default. Explicit names
         # still select that profile, including clients that request standard.
         # Explicit null prevents an older API's implicit zero-dollar cap from
         # creating a workspace that can never execute.
-        body: dict[str, Any] = {"bundle_id": bundle_id, "max_spend_microusd": None}
+        validate_spending_cap(max_spend_microusd)
+        body: dict[str, Any] = {
+            "bundle_id": bundle_id,
+            "max_spend_microusd": max_spend_microusd,
+        }
         if resource_profile is not None:
             body["resource_profile"] = resource_profile
         if max_resource_profile is not None:

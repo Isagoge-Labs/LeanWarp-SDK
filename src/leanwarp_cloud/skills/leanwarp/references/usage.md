@@ -10,7 +10,7 @@ command prints one JSON object; `leanwarp COMMAND --help` lists its options.
 | `auth login`, `auth logout` | Save or forget the API key on this machine. |
 | `doctor [--environment NAME]` | Show which environment the project runs on, and summarise the upload. No compute. |
 | `files` | List the Lean files that would upload, their sizes and any problems. No key needed. |
-| `connect [--environment NAME]` | Create the project's workspace. No compute. |
+| `connect [--environment NAME] [--max-spend USD]` | Create the project's workspace, optionally with a spending cap. No compute. |
 | `check FILE [--draft]` | Compile a file and report Lean's errors and warnings. |
 | `inspect FILE --line N --column N` | Show the goals and local context at a position. |
 | `try-tactics FILE --line N --column N --tactic T [--tactic T …]` | Try tactics without editing the file. |
@@ -81,7 +81,7 @@ returned it:
 
 | `success` | Meaning | Exit code |
 | --- | --- | --- |
-| `true` | The check passed, the proof was verified, or the inspection or trial ran. | `0` |
+| `true` | The check passed, the proof was verified, inspection returned goal context, or the tactic trial ran. | `0` |
 | `false` | It did not pass. Read `result.result`, or `error_message` if the operation failed. | `1` |
 | `null` | Still running. Run `wait`; never submit it again. | `3` |
 
@@ -93,16 +93,26 @@ What to read in `result.result`:
 | Operation | Fields |
 | --- | --- |
 | `check` | `status` (`ok` when there are no errors), `diagnostics` and `cached`. |
-| `inspect` | `status`: `proof_state` with `goal_contexts`, or `metadata_only` when the position has no goal. Also `selected_hole`, `enclosing_declaration`, `premise_hints` and `context_omitted`. |
+| `inspect` | `goal_status`: `available` with `goal_contexts`, or `unavailable` with `unavailable_reason`. `retained_proof_state`, when present, says whether the worker retained a proof state; it does not promise which tactic execution path will run. Also `selected_hole`, `enclosing_declaration`, `premise_hints` and `context_omitted`. |
 | `try_tactics` | `results`: one entry per tactic, in the order given, with `tactic`, `outcome`, `status`, `diagnostics`, `elapsed_ms` and `execution`. `skipped` lists tactics that did not run, with a reason. |
 | `verify_target` | `status` `ok` and `receipt.policy` `fixed_target_kernel_check_v1`; a rejection has `failure_kind`. |
 
 A trial's `outcome` is `closed_proof`, `open_proof_state` (the tactic ran and
 goals remain, shown in its diagnostics), `tactic_error`, `timeout` or
-`rejected`. `metadata_only` doesn't mean a goal is solved, and a tactic that
+`rejected`. An unavailable context doesn't mean a goal is solved, and a tactic that
 succeeds in a trial isn't a proof until the file checks with it. Engine errors,
 such as a position outside any proof, arrive as `status` `error` with an `error`
 object holding `code` and `message`.
+
+Inspection supports ordinary `sorry` drafts and explicit proof holes. The selected
+position must identify one goal context. Tactic inputs are bare Lean tactics; a
+`by` wrapper is optional.
+
+For successful inspections, `status` retains the older `proof_state` or
+`metadata_only` marker for compatibility. These describe retention, not goal
+availability: `metadata_only` can still contain useful goals. Use `goal_status`
+and `goal_contexts` to decide whether context was returned. An unavailable
+context has `status: unavailable`, so older clients also report it as unsuccessful.
 
 ### How it ran
 
@@ -258,9 +268,19 @@ in the dashboard to disable it.
 Workers are billed per second while they run, including idle time. `resources`
 reports one published `worker`: its starting minute quote, `usage_based`,
 resource limits, startup credit hold and idle timeout. LeanWarp selects the
-worker; you set a spending cap in the dashboard. Existing workspaces keep their
+worker; you can set a spending cap when connecting or in the dashboard. Existing workspaces keep their
 saved billing terms. The service holds credit while a worker runs and returns
-the unused part after stopping.
+the unused part once shutdown and final usage are confirmed. A stopped workspace
+can temporarily retain reserved credit while that billing cleanup finishes.
+
+`leanwarp connect --max-spend 2` creates a workspace capped at $2 in total,
+including reserved credit. USD amounts allow up to six decimal places without
+rounding. Python accepts `max_spend_microusd=2_000_000` on `connect`,
+`create_workspace` and `create_workspace_for_project`; MCP `connect` accepts
+`max_spend_microusd` in the same units. The allowed range is zero to $1,000,000.
+Omitting the cap creates an uncapped workspace on a first connection and keeps
+the existing cap on reconnect. A different supplied cap on reconnect is rejected;
+change an existing cap in the dashboard. A cap of zero prevents compute starts.
 
 When `usage_based` is true, CPU and RAM charges increase independently above
 their reserved baselines. The starting rate remains a paid minimum while
@@ -271,8 +291,7 @@ A worker starts with the first operation and stays warm between operations until
 the idle timeout, its maximum lifetime or `stop`. Closing the SDK client only
 closes its HTTP connection; it does not stop compute or billing. `stop` discards
 in-memory state but retains uploaded files and completed results; the next
-operation reconstructs the worker without another upload. Spending caps are set
-per workspace in the dashboard. A cap change applies to future worker starts and
+operation reconstructs the worker without another upload. A cap change applies to future worker starts and
 elastic lease renewals; if the next credit hold cannot fit, the worker stops and
 an unfinished operation reports `leanwarp_budget_exceeded`.
 

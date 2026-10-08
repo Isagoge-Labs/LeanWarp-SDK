@@ -61,6 +61,10 @@ LeanWarp selects the published worker when you create a workspace. Set
 dashboard. Existing workspaces and identical creation retries retain their saved
 billing terms.
 
+For example, `{"bundle_id": "…", "max_spend_microusd": 2000000}` creates a
+workspace capped at $2, including reserved credit. The cap is an integer from
+zero to 1,000,000,000,000 microdollars, or `null` for no workspace cap.
+
 The CLI and MCP `resources` command reports one `worker`, its
 `starting_minute_microusd`, `usage_based`, `hold_microusd` and resource limits,
 plus `idle_seconds`. CPU values are physical cores (one physical core is two
@@ -74,6 +78,7 @@ The raw HTTP catalog retains compatibility fields described below.
 Stop the worker explicitly when finished; disconnecting HTTP does not stop
 billing. Stopping discards in-memory state while retaining uploaded files and
 completed results; the next operation reconstructs the worker.
+Unused reserved credit is released after shutdown and final usage are confirmed.
 
 ## Writes are safe to retry
 

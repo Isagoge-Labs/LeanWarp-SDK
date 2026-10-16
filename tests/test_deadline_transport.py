@@ -173,3 +173,43 @@ def test_environment_proxy_normalization_and_full_origin_bypass(
     assert deadline_transport._environment_proxy(httpx.URL(origin)) == (
         None if direct else "http://proxy.example:8080"
     )
+
+
+@pytest.mark.parametrize("action", ["cancel", "stop", "delete", "submit"])
+@pytest.mark.parametrize("slow_part", ["headers", "body"])
+def test_cleanup_deadline_bounds_real_transport_headers_and_body(monkeypatch, action, slow_part):
+    clock = [1000.0]
+
+    class BodyStream(HeaderStream):
+        def __init__(self, clock):
+            super().__init__(clock)
+            body = b'{"workspace_id":"owned-workspace","state":"stopping"}'
+            self.parts = [f"HTTP/1.1 200 OK\r\nContent-Length: {len(body)}\r\n\r\n".encode()]
+            self.parts += [bytes([byte]) for byte in body]
+
+    stream = HeaderStream(clock) if slow_part == "headers" else BodyStream(clock)
+    monkeypatch.setattr(deadline_transport.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(deadline_transport, "getproxies", dict)
+    with (
+        LeanWarpCloud(
+            "test",
+            base_url="http://127.0.0.1",
+            retries=1,
+            transport=DeadlineTransport("http://127.0.0.1", network_backend=Backend(stream)),
+        ) as cloud,
+        pytest.raises(httpx.TimeoutException),
+    ):
+        if action == "submit":
+            cloud.submit(
+                "owned-id",
+                "check",
+                expected_revision=0,
+                payload={"file": "Main.lean"},
+                idempotency_key="saved-key",
+                deadline=1020.0,
+            )
+        else:
+            getattr(cloud, action)("owned-id", deadline=1020.0)
+    assert clock[0] == pytest.approx(1020)
+    assert all(start < 1020 for start, _ in stream.reads)
+    assert stream.closed

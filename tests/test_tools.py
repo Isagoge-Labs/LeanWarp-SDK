@@ -9,6 +9,7 @@ import sys
 import threading
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any
 
 import httpx
 import pytest
@@ -16,7 +17,7 @@ from leanwarp_cloud import OperationOutcome
 from leanwarp_cloud.config import load_client
 from leanwarp_cloud.session import SessionError
 
-from .test_session import Service
+from .test_session import AccountWorkspaces, Service
 
 TEST_KEY = f"lw_test_{'a' * 32}.{'s' * 43}"
 # Only the test process redirects the fixed staging origin to its local fixture.
@@ -225,9 +226,18 @@ def test_mcp_stdio_uses_same_project_session_without_key_arguments(tmp_path):
                     assert TEST_KEY not in resource.contents[0].text
                 assert not (tmp_path / ".leanwarp").exists()
                 catalog = await client.list_tools()
-                assert {"connect", "verify_target", "recover", "stop"} <= {
-                    t.name for t in catalog.tools
-                }
+                assert {
+                    "connect",
+                    "verify_target",
+                    "recover",
+                    "stop",
+                    "workspaces",
+                    "history",
+                    "delete",
+                } <= {t.name for t in catalog.tools}
+                hints = {t.name: t.annotations for t in catalog.tools}
+                assert hints["delete"].destructiveHint is True
+                assert hints["history"].readOnlyHint is True
                 assert "api_key" not in json.dumps([t.inputSchema for t in catalog.tools])
                 connect_schema = next(t.inputSchema for t in catalog.tools if t.name == "connect")
                 assert "max_spend_microusd" in connect_schema["properties"]
@@ -330,7 +340,7 @@ def test_engine_outcomes_do_not_confuse_trial_execution_with_proof(kind, result,
 def test_cli_cap_rejects_invalid_amounts_before_loading_credentials(value, monkeypatch, capsys):
     from leanwarp_cloud import cli
 
-    def not_loaded():
+    def not_loaded(*, interface):
         pytest.fail("invalid cap must not load credentials or contact the service")
 
     monkeypatch.setattr(cli, "load_client", not_loaded)
@@ -430,10 +440,11 @@ def test_cli_forwards_legacy_profile_flags_for_existing_automation(tmp_path, mon
     monkeypatch.setattr(
         cli,
         "load_client",
-        lambda: LeanWarpCloud(
+        lambda *, interface: LeanWarpCloud(
             TEST_KEY,
             base_url="https://api.example",
             transport=httpx.MockTransport(service.handle),
+            interface=interface,
         ),
     )
     assert (
@@ -494,3 +505,292 @@ def test_mcp_starts_and_explains_sign_in_before_credentials_exist(tmp_path, monk
         assert '"file_count": 0' in listing[0][0].text
 
     asyncio.run(call())
+
+
+def test_cli_exports_history_without_overwriting_and_deletes_only_when_named(
+    tmp_path, monkeypatch, capsys
+):
+    from leanwarp_cloud import LeanWarpCloud, cli
+
+    project(tmp_path)
+    service = AccountWorkspaces()
+    monkeypatch.setattr(
+        cli,
+        "load_client",
+        lambda *, interface: LeanWarpCloud(
+            TEST_KEY,
+            base_url="https://api.example",
+            transport=httpx.MockTransport(service.handle),
+            interface=interface,
+        ),
+    )
+
+    def run(*arguments: str) -> tuple[int, dict]:
+        code = cli.main(["--project", str(tmp_path), *arguments])
+        return code, json.loads(capsys.readouterr().out.splitlines()[-1])
+
+    assert run("connect", "--workspace", "w")[0] == 0
+    output = tmp_path / "history.jsonl"
+    assert run("export", "--output", str(output)) == (
+        0,
+        {"status": "exported", "operations": 5, "output": str(output)},
+    )
+    lines = output.read_text().splitlines()
+    assert [json.loads(line)["operation_id"] for line in lines] == [f"op-{n}" for n in range(5)]
+    code, refused = run("export", "--output", str(output))
+    assert code == 2 and "exists" in refused["message"]
+    assert output.read_text().splitlines() == lines
+    # A failure part-way leaves no file that could pass for a complete export.
+    service.history[4] = {**service.history[4], "workspace_id": "x"}
+    partial = tmp_path / "partial.jsonl"
+    assert run("export", "--output", str(partial))[0] == 2
+    assert not partial.exists()
+
+    with pytest.raises(SystemExit):
+        cli.main(["--project", str(tmp_path), "delete"])
+    capsys.readouterr()
+    assert service.deleted == []
+    assert run("delete", "--confirm", "w") == (
+        0,
+        {"status": "deleted", "workspace_id": "w", "disconnected": True},
+    )
+    assert TEST_KEY not in output.read_text()
+
+
+def test_doctor_checks_a_project_against_the_public_catalog_before_sign_in(
+    tmp_path, monkeypatch, capsys
+):
+    from leanwarp_cloud import LeanWarpCloud, cli, endpoints
+
+    project(tmp_path)
+    monkeypatch.delenv("LEANWARP_API_KEY", raising=False)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    service = Service()
+    monkeypatch.setitem(endpoints._API_ORIGINS, "live", "https://public.example")
+    monkeypatch.setattr(
+        cli,
+        "LeanWarpCloud",
+        lambda key, *, interface: LeanWarpCloud(
+            key, transport=httpx.MockTransport(service.handle), interface=interface
+        ),
+    )
+    assert cli.main(["--project", str(tmp_path), "doctor"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["compatible"] is True and report["signed_in"] is False
+    assert report["environment"]["match"] == "exact"
+    assert "auth login" in report["next"]
+    (request,) = service.requests
+    assert request.url == "https://public.example/v1/leanwarp/versions"
+    assert "Authorization" not in request.headers
+    assert not (tmp_path / ".leanwarp").exists()
+    (tmp_path / "lean-toolchain").write_text("leanprover/lean4:v4.99.0\n")
+    assert cli.main(["--project", str(tmp_path), "doctor"]) == 1
+    assert "No LeanWarp environment matches" in json.loads(capsys.readouterr().out)["message"]
+
+
+def _completed(kind: str, result: dict[str, Any]) -> OperationOutcome:
+    return OperationOutcome(
+        {
+            "operation_id": "o",
+            "revision": 1,
+            "state": "completed",
+            "kind": kind,
+            "result": {"operation_id": "o", "revision": 1, "generation": 1, "result": result},
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    ("kind", "result", "success"),
+    [
+        ("suggest", {"status": "closed", "verification": "strict", "patch": {}}, True),
+        ("suggest", {"status": "closed", "verification": "declaration", "patch": {}}, True),
+        ("suggest", {"status": "closed", "verification": "partial", "patch": {}}, True),
+        # A tier this client does not know is never taken for a proof.
+        ("suggest", {"status": "closed", "verification": "no_new_errors", "patch": {}}, False),
+        # A closing tactic without a recheck verdict or patch is not a usable suggestion.
+        ("suggest", {"status": "closed", "patch": {}}, False),
+        ("suggest", {"status": "closed", "verification": "strict"}, False),
+        ("suggest", {"status": "not_closed"}, False),
+        ("holes", {"status": "ok", "holes": []}, True),
+        # Listing a file that does not compile yet still lists it.
+        ("holes", {"status": "error", "holes": []}, True),
+        ("holes", {"status": "error"}, False),
+        ("extract_decls", {"status": "ok", "declarations": []}, True),
+        ("extract_decls", {"status": "error", "declarations": []}, True),
+        ("extract_decls", {"status": "timeout", "declarations": []}, False),
+        ("sorry2lemma", {"status": "extracted"}, True),
+        ("sorry2lemma", {"status": "no_targets"}, True),
+        ("sorry2lemma", {"status": "failed"}, False),
+        ("check_files", {"status": "ok", "failed": 0}, True),
+        ("check_files", {"status": "failed", "failed": 1}, False),
+        # Every file must pass, whatever an inconsistent summary claims.
+        ("check_files", {"status": "ok", "failed": 1}, False),
+    ],
+)
+def test_source_tool_outcomes_report_success_only_for_usable_results(kind, result, success):
+    outcome = _completed(kind, result)
+    assert outcome.successful is success
+    assert not outcome.verified
+
+
+@pytest.mark.parametrize(
+    ("arguments", "kind", "payload"),
+    [
+        (
+            ["suggest", "Main.lean", "--line", "2", "--column", "3"],
+            "suggest",
+            {"file": "Main.lean", "line": 2, "column": 3},
+        ),
+        (
+            [
+                "suggest",
+                "Main.lean",
+                "--line",
+                "2",
+                "--column",
+                "3",
+                "--tactic",
+                "omega",
+                "--tactic",
+                "simp",
+                "--tactic-timeout",
+                "500",
+            ],
+            "suggest",
+            {
+                "file": "Main.lean",
+                "line": 2,
+                "column": 3,
+                "tactics": ["omega", "simp"],
+                "timeout_ms": 500,
+            },
+        ),
+        (["holes", "Main.lean"], "holes", {"file": "Main.lean", "goals": True}),
+        (["holes", "Main.lean", "--no-goals"], "holes", {"file": "Main.lean", "goals": False}),
+        (["declarations", "Main.lean"], "extract_decls", {"file": "Main.lean"}),
+        (
+            ["sorry2lemma", "Main.lean", "--max", "3", "--prefix", "goal"],
+            "sorry2lemma",
+            {
+                "file": "Main.lean",
+                "max_extractions": 3,
+                "strict_final_check": False,
+                "name_prefix": "goal",
+            },
+        ),
+        (
+            ["check-files", "Main.lean", "Other.lean", "--file-timeout", "30"],
+            "check_files",
+            {"files": ["Main.lean", "Other.lean"], "strict": True, "timeout": 30},
+        ),
+        (
+            ["check-files", "Main.lean", "--draft"],
+            "check_files",
+            {"files": ["Main.lean"], "strict": False},
+        ),
+    ],
+)
+def test_cli_source_tools_submit_exactly_their_payload(
+    tmp_path, monkeypatch, capsys, arguments, kind, payload
+):
+    from leanwarp_cloud import LeanWarpCloud, cli
+
+    project(tmp_path)
+    (tmp_path / "Other.lean").write_text("theorem other : True := trivial\n")
+    service = Service()
+    monkeypatch.setattr(
+        cli,
+        "load_client",
+        lambda *, interface: LeanWarpCloud(
+            TEST_KEY,
+            base_url="https://api.example",
+            transport=httpx.MockTransport(service.handle),
+            interface=interface,
+        ),
+    )
+    assert cli.main(["--project", str(tmp_path), "connect"]) == 0
+    cli.main(["--project", str(tmp_path), *arguments, "--wait", "0"])
+    submit = next(request for request in reversed(service.requests) if request.method == "POST")
+    body = json.loads(submit.content)
+    assert body["kind"] == kind and body["payload"] == payload
+    assert TEST_KEY not in capsys.readouterr().out
+
+
+def test_mcp_exposes_every_source_tool(tmp_path):
+    from leanwarp_cloud.mcp_server import create_server
+
+    server = create_server(lambda: None, str(tmp_path))  # type: ignore[arg-type, return-value]
+
+    async def names() -> dict[str, Any]:
+        return {tool.name: tool for tool in await server.list_tools()}
+
+    tools = asyncio.run(names())
+    assert {"suggest", "holes", "extract_decls", "sorry2lemma", "check_files", "apply"} <= set(
+        tools
+    )
+    assert tools["holes"].annotations.readOnlyHint is False
+    assert set(tools["check_files"].inputSchema["required"]) == {"files"}
+    assert "tactics" in tools["suggest"].inputSchema["properties"]
+
+
+def test_edits_apply_only_to_the_exact_source_and_promised_result():
+    import hashlib
+
+    from leanwarp_cloud.edits import EditError, edited_source
+
+    source = "theorem t : True := by\n  sorry\n"
+    start = source.index("sorry")
+    edited = source.replace("sorry", "trivial")
+    result = {
+        "status": "closed",
+        "verification": "partial",
+        "source_sha256": hashlib.sha256(source.encode()).hexdigest(),
+        "patched_source_sha256": hashlib.sha256(edited.encode()).hexdigest(),
+        "patch": {
+            "start_utf8_offset": start,
+            "end_utf8_offset": start + 5,
+            "replacement": "trivial",
+        },
+    }
+    assert edited_source("suggest", result, source) == edited
+    for broken, message in (
+        ({**result, "source_sha256": "0" * 64}, "changed"),
+        ({**result, "patched_source_sha256": "0" * 64}, "checksum"),
+        ({**result, "status": "not_closed"}, "closed no hole"),
+        # Only a recheck tier this client knows makes a suggestion usable.
+        ({**result, "verification": "no_new_errors"}, "closed no hole"),
+        ({**result, "patch": {**result["patch"], "end_utf8_offset": 10_000}}, "malformed"),
+    ):
+        with pytest.raises(EditError, match=message):
+            edited_source("suggest", broken, source)
+    wide = "theorem t : True := by\n  sorry -- ∀\n"
+    split = {
+        **result,
+        "source_sha256": hashlib.sha256(wide.encode()).hexdigest(),
+        "patch": {
+            "start_utf8_offset": wide.encode().index("∀".encode()) + 1,
+            "end_utf8_offset": wide.encode().index("∀".encode()) + 2,
+            "replacement": "",
+        },
+    }
+    with pytest.raises(EditError, match="splits a character"):
+        edited_source("suggest", split, wide)
+    with pytest.raises(EditError, match="no edit"):
+        edited_source("check", result, source)
+    with pytest.raises(EditError, match="unchanged"):
+        edited_source(
+            "sorry2lemma",
+            {
+                "status": "extracted",
+                "source_sha256": result["source_sha256"],
+                "source_changed": False,
+            },
+            source,
+        )
+    with pytest.raises(EditError, match="did not complete"):
+        edited_source(
+            "sorry2lemma",
+            {"status": "failed", "source_sha256": result["source_sha256"], "source_changed": True},
+            source,
+        )

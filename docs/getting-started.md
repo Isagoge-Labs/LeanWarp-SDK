@@ -7,6 +7,11 @@ installed locally.
 If your shell can't find `leanwarp` after installing, run `uv tool update-shell`
 and open a new terminal.
 
+To find out whether your project runs on LeanWarp before you sign up, run
+`leanwarp doctor` in its root. Without a key it checks the project's
+`lean-toolchain`, `lake-manifest.json` and files against the served environments,
+and uploads nothing.
+
 ## 1. Sign in
 
 Create an API key in the [dashboard](https://isagoge.in/dashboard), then run:
@@ -122,8 +127,10 @@ when it did not; Lean's messages are in `result.result`. If the work takes longe
 than the wait, `success` is `null` and the exit code is `3`: run `leanwarp wait`
 for the result. Don't submit it again.
 
-Edit the file and run the command again. The same workspace and warm worker are
-reused, so later checks start where the last one ended.
+While you edit, use `leanwarp check --draft LeanWarpExample.lean`. The worker
+keeps the file open, so after each edit Lean reuses its work on the unchanged
+part, and `sorry` is only a warning. A plain `check` is strict: it rechecks the
+whole file as a final build would, so run it, or `verify`, when you are done.
 
 ## 4. Verify a Mathlib statement
 

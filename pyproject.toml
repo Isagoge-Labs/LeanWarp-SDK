@@ -1,6 +1,6 @@
 [project]
 name = "leanwarp-sdk"
-version = "0.1.0"
+version = "0.2.0"
 description = "Check and verify Lean proofs on LeanWarp from the command line, MCP or Python"
 readme = "README.md"
 license = "MIT"

@@ -4,7 +4,7 @@ import json
 
 import httpx
 import pytest
-from leanwarp_cloud import LeanWarpCloud, LeanWarpCloudError, config, endpoints
+from leanwarp_cloud import LeanWarpCloud, LeanWarpCloudError, __version__, config, endpoints
 from leanwarp_cloud.cli import parser
 from leanwarp_cloud.endpoints import ConfigurationError
 
@@ -32,6 +32,65 @@ def test_environment_key_chooses_exact_origin_without_fallback(monkeypatch):
             client.versions()
         assert seen[-1] == (origin + "/v1/leanwarp/versions", f"Bearer {key}")
     assert len(seen) == 2
+
+
+@pytest.mark.parametrize("interface", ["python", "cli", "mcp"])
+def test_requests_name_the_sdk_release_and_interface(interface):
+    seen = []
+
+    def record(request):
+        seen.append(request.headers["User-Agent"])
+        return httpx.Response(200, json={"versions": []})
+
+    with LeanWarpCloud(
+        TEST_KEY, transport=httpx.MockTransport(record), interface=interface
+    ) as client:
+        client.versions()
+    assert seen == [f"leanwarp-sdk/{__version__} ({interface})"]
+
+
+def test_unknown_interface_is_rejected_before_any_request():
+    with pytest.raises(ValueError, match="interface"):
+        LeanWarpCloud(TEST_KEY, interface="browser")  # type: ignore[arg-type]
+
+
+def test_entry_points_name_their_interface(monkeypatch):
+    from contextlib import nullcontext
+
+    from leanwarp_cloud import cli, mcp_server
+
+    loaded = []
+
+    class Client(nullcontext):
+        def close(self):
+            pass
+
+    def load(*, interface):
+        loaded.append(interface)
+        return Client()
+
+    monkeypatch.setattr(cli, "load_client", load)
+    monkeypatch.setattr(cli, "ProjectSession", lambda *_: type("S", (), {"recover": dict})())
+    cli.main(["recover"])
+
+    class Server:
+        def __init__(self, connect, _root):
+            self.connect = connect
+
+        def run(self, *, transport):
+            assert transport == "stdio"
+            self.connect()
+
+    monkeypatch.setattr(mcp_server, "load_client", load)
+    monkeypatch.setattr(mcp_server, "create_server", Server)
+    mcp_server.serve("/tmp/project")  # noqa: S108 - never touched; the server is replaced
+    assert loaded == ["cli", "mcp"]
+
+
+def test_environment_key_client_names_its_interface(monkeypatch):
+    monkeypatch.setenv("LEANWARP_API_KEY", TEST_KEY)
+    with config.load_client(interface="mcp") as client:
+        assert client._client.headers["User-Agent"] == f"leanwarp-sdk/{__version__} (mcp)"
 
 
 def test_released_keys_select_their_fixed_services():
@@ -76,7 +135,9 @@ def test_login_saves_only_the_key_after_authentication(tmp_path, monkeypatch):
     monkeypatch.setattr(
         config,
         "LeanWarpCloud",
-        lambda key: LeanWarpCloud(key, transport=httpx.MockTransport(authenticated)),
+        lambda key, *, interface: LeanWarpCloud(
+            key, transport=httpx.MockTransport(authenticated), interface=interface
+        ),
     )
     config.save_credentials(TEST_KEY)
     path = config.credentials_path()
@@ -84,6 +145,7 @@ def test_login_saves_only_the_key_after_authentication(tmp_path, monkeypatch):
     assert path.stat().st_mode & 0o077 == 0
     assert len(seen) == 1
     assert seen[0].headers["Authorization"] == f"Bearer {TEST_KEY}"
+    assert seen[0].headers["User-Agent"] == f"leanwarp-sdk/{__version__} (cli)"
     with config.load_client() as client:
         assert client.base_url == "https://control-api-staging-3b57.up.railway.app"
     assert parser().parse_args(["auth", "login"]).auth_command == "login"
@@ -99,11 +161,12 @@ def test_failed_login_preserves_previous_credentials(tmp_path, monkeypatch):
     monkeypatch.setattr(
         config,
         "LeanWarpCloud",
-        lambda key: LeanWarpCloud(
+        lambda key, *, interface: LeanWarpCloud(
             key,
             transport=httpx.MockTransport(
                 lambda _: httpx.Response(401, json={"error": {"code": "unauthorized"}})
             ),
+            interface=interface,
         ),
     )
     with pytest.raises(LeanWarpCloudError):

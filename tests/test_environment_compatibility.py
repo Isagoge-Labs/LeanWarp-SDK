@@ -51,7 +51,7 @@ def test_cli_recovery_and_cancellation_preserve_operation_outcomes(
         def cancel(self):
             return operation
 
-    monkeypatch.setattr(cli, "load_client", lambda: nullcontext(None))
+    monkeypatch.setattr(cli, "load_client", lambda *, interface: nullcontext(None))
     monkeypatch.setattr(cli, "ProjectSession", lambda *_: Session())
     assert cli.main([command]) == code
     assert json.loads(capsys.readouterr().out) == {"success": success, **operation}
@@ -64,7 +64,7 @@ def test_cli_recover_keeps_non_operation_receipts(monkeypatch, capsys):
         def recover(self):
             return {"revision": 2, "workspace_id": "w"}
 
-    monkeypatch.setattr(cli, "load_client", lambda: nullcontext(None))
+    monkeypatch.setattr(cli, "load_client", lambda *, interface: nullcontext(None))
     monkeypatch.setattr(cli, "ProjectSession", lambda *_: Session())
     assert cli.main(["recover"]) == 0
     assert json.loads(capsys.readouterr().out) == {"revision": 2, "workspace_id": "w"}
@@ -76,7 +76,7 @@ def test_cli_preserves_error_codes_and_recovery_fields(monkeypatch, capsys):
     from leanwarp_cloud.session import SessionError
 
     def failure(error):
-        def load():
+        def load(*, interface):
             raise error
 
         return load
@@ -282,12 +282,12 @@ def test_cli_preserves_catalog_shape_sync_and_strict_bundle(tmp_path, monkeypatc
 
     pinned(tmp_path)
     with api() as (service, cloud):
-        monkeypatch.setattr("leanwarp_cloud.cli.load_client", lambda: cloud)
+        monkeypatch.setattr("leanwarp_cloud.cli.load_client", lambda *, interface: cloud)
         assert main(["versions"]) == 0
         assert "versions" in json.loads(capsys.readouterr().out)
         # main closes the client after each command; the fixture creates one per command.
     with api() as (service, cloud):
-        monkeypatch.setattr("leanwarp_cloud.cli.load_client", lambda: cloud)
+        monkeypatch.setattr("leanwarp_cloud.cli.load_client", lambda *, interface: cloud)
         assert (
             main(["--project", str(tmp_path), "connect", "--bundle", CATALOG[1]["bundle_id"]]) == 2
         )

@@ -579,3 +579,80 @@ def test_held_reads_preserve_rate_limit_backoff(monkeypatch, held):
         result = api.wait("op-1") if held else api.operation("op-1")
     assert result["state"] == "completed"
     assert len(calls) == 2 and clock.sleeps == [1]
+
+
+@pytest.mark.parametrize("action", ["cancel", "stop", "delete", "submit"])
+def test_cleanup_requests_bound_trickling_body_with_the_shared_deadline(monkeypatch, action):
+    clock = [1000.0]
+    monkeypatch.setattr("leanwarp_cloud.client.time.monotonic", lambda: clock[0])
+    received, requests = [], []
+    payload = json.dumps({"workspace_id": "owned-workspace", "state": "stopping"}).encode()
+
+    class Trickle(httpx.SyncByteStream):
+        closed = False
+
+        def __iter__(self):
+            for byte in payload:
+                clock[0] += 1
+                received.append(byte)
+                yield bytes([byte])
+
+        def close(self):
+            self.closed = True
+
+    stream = Trickle()
+
+    def handle(request):
+        requests.append(request)
+        return httpx.Response(200, stream=stream)
+
+    with (
+        LeanWarpCloud(
+            "secret",
+            base_url="https://cloud.example",
+            retries=1,
+            transport=httpx.MockTransport(handle),
+        ) as cloud,
+        pytest.raises(httpx.TimeoutException),
+    ):
+        if action == "submit":
+            cloud.submit(
+                "owned-id",
+                "check",
+                expected_revision=0,
+                payload={"file": "Main.lean"},
+                idempotency_key="saved-key",
+                deadline=1020.0,
+            )
+        else:
+            getattr(cloud, action)("owned-id", deadline=1020.0)
+    assert len(requests) == 1
+    assert requests[0].extensions["leanwarp_deadline"] == 1020.0
+    assert requests[0].extensions["timeout"]["read"] == pytest.approx(20 / 3)
+    assert clock[0] == 1020 and len(received) < len(payload) and stream.closed
+
+
+@pytest.mark.parametrize("action", ["cancel", "stop", "delete", "submit"])
+def test_cleanup_expired_deadline_never_starts_an_attempt(monkeypatch, action):
+    monkeypatch.setattr("leanwarp_cloud.client.time.monotonic", lambda: 1000.0)
+    requests = []
+    with (
+        LeanWarpCloud(
+            "secret",
+            base_url="https://cloud.example",
+            transport=httpx.MockTransport(requests.append),
+        ) as cloud,
+        pytest.raises(httpx.TimeoutException),
+    ):
+        if action == "submit":
+            cloud.submit(
+                "owned-id",
+                "check",
+                expected_revision=0,
+                payload={"file": "Main.lean"},
+                idempotency_key="saved-key",
+                deadline=1000.0,
+            )
+        else:
+            getattr(cloud, action)("owned-id", deadline=1000.0)
+    assert requests == []

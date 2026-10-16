@@ -39,20 +39,64 @@ curl -s https://api.isagoge.in/v1/leanwarp/workspaces/$WORKSPACE/operations \
 
 | Method | Path | Permission | Purpose |
 | --- | --- | --- | --- |
-| `GET` | `/versions` | read | Served environments, one current build each. |
+| `GET` | `/versions` | none | Served environments, one current build each. A key is optional; one that is sent must be valid. |
 | `GET` | `/resources` | read | Published worker resources and billing metadata. |
 | `GET` | `/account` | read | Balance, reserved and available credit, in microdollars. |
 | `POST` | `/workspaces` | write | Create a workspace. |
 | `GET` | `/workspaces` | read | List the workspaces your key can see. |
 | `GET` | `/workspaces/{workspace_id}` | read | A workspace's state and current revision. |
+| `GET` | `/workspaces/{workspace_id}/files` | read | The current revision and each file's SHA-256, without contents. |
 | `PUT` | `/workspaces/{workspace_id}/files` | write | Upload or delete files; returns the new revision. |
-| `POST` | `/workspaces/{workspace_id}/operations` | execute | Submit `check`, `inspect`, `try_tactics` or `verify_target`. |
+| `POST` | `/workspaces/{workspace_id}/operations` | execute | Submit an operation; see [Operations](#operations). |
+| `GET` | `/workspaces/{workspace_id}/operations` | read | Stored operations with results, newest first; see below. |
+| `GET` | `/workspaces/{workspace_id}/usage` | read | Each history limit's `used` and `limit`. |
 | `GET` | `/operations/{operation_id}` | read | An operation's state and result; `?wait_seconds=N` waits up to 20 seconds for it to end. |
 | `POST` | `/operations/{operation_id}/cancel` | execute | Ask to cancel; poll until it ends. |
 | `POST` | `/workspaces/{workspace_id}/stop` | write or execute | Stop the worker; files are kept. |
 | `DELETE` | `/workspaces/{workspace_id}` | write | Delete a workspace. |
 
 A key can be limited to one workspace; it then sees only that workspace.
+
+The operation list takes `limit` (1 to 25, default 25) and `cursor`, and returns
+`{"operations": […], "next_cursor": …}`. Pass `next_cursor` unchanged to read the
+next, older page; it is `null` after the last one. A page can hold fewer than
+`limit` operations to target a 1 MiB UTF-8 response. A nonempty page always
+includes its first operation, even if that operation exceeds the target; legal
+pages remain below the SDK's 2 MiB response limit. LeanWarp keeps a window of
+finished history, so export results you need.
+
+## Operations
+
+Each operation reads the revision named by `expected_revision` and never changes
+its files. `file` is a project-relative `.lean` path; lines and columns start at 1.
+
+| `kind` | `payload` |
+| --- | --- |
+| `check` | `file`, `strict` (default `false` over HTTP; the SDK defaults to strict). |
+| `inspect` | `file`, `line`, `column`. |
+| `try_tactics` | `file`, `line`, `column`, `tactics` (1 to 32), `timeout_ms` per tactic (default 30000). |
+| `verify_target` | `file`, `candidate_declaration`, `target_statement`, `target_context`, `execution_mode` (`reusable` or `fresh`), `timeout` seconds. |
+| `holes` | `file`, `goals` (default `true`: goals for the first 16 holes). |
+| `suggest` | `file`, `line`, `column`; optional `tactics` (1 to 32) instead of LeanWarp's portfolio, and `timeout_ms` per tactic (learned budgets by default). |
+| `extract_decls` | `file`. |
+| `sorry2lemma` | `file`, `max_extractions` (1 to 256, default 64), optional `name_prefix`, `strict_final_check` (default `false`). |
+| `check_files` | `files` (1 to 64 distinct paths), `strict` (default `true`), optional `timeout` seconds per file (1 to 300). |
+
+`suggest` and `check_files` stop starting new work after four minutes; their
+default `timeout_seconds` is 600, enough for the work then in flight. A lower
+`timeout_seconds` ends the operation when it expires.
+
+### Applying an edit
+
+A completed `suggest` with `status` `closed` returns `patch`: replace the UTF-8
+bytes from `start_utf8_offset` to `end_utf8_offset` with `replacement`. A
+`sorry2lemma` with `source_changed` returns the whole `transformed_source`. Apply
+either only if your copy of the file hashes to `source_sha256`, check that the
+result hashes to `patched_source_sha256` or `transformed_source_sha256`, then
+upload it with `PUT /files` and `expected_revision` set to the operation's
+revision. A `409` revision conflict means the workspace changed meanwhile: rerun
+the operation. The Python SDK's `leanwarp_cloud.edits.edited_source` performs
+these checks.
 
 ## Worker resources and billing
 
@@ -87,6 +131,12 @@ Creating a workspace, uploading files and submitting operations require an
 request with the same key returns the original result instead of acting twice.
 Use a new key for each new request.
 
+LeanWarp keeps a window of finished history, not all of it (see
+[limits](../src/leanwarp_cloud/skills/leanwarp/references/usage.md#credentials-credit-and-limits)).
+A replay within an hour of the original always returns its result. Later, a
+submission whose operation was removed returns `operation_expired` for at least 7
+days and is not run again, and reading that operation returns `not_found`.
+
 Uploads and submissions also carry `expected_revision`, the revision you last
 saw. If someone else changed the workspace since, the request fails with
 `revision_conflict` instead of overwriting their work.
@@ -107,10 +157,15 @@ next, and may change. Common codes:
 | `authentication_required` | 401 | Missing, invalid, expired or revoked key. |
 | `leanwarp_key_scope_denied` | 403 | The key lacks the permission or is limited to another workspace. |
 | `invalid_request` | 422 | The body doesn't match the API; the message names the field. |
+| `invalid_cursor` | 422 | The page cursor was altered; pass `next_cursor` unchanged. |
 | `unsupported_bundle` | 422 | The environment isn't served. The wire code keeps its original name for compatibility. |
 | `revision_conflict` | 409 | `expected_revision` is out of date. |
 | `workspace_busy` | 409 | Another operation is running in the workspace. |
 | `idempotency_conflict` | 409 | The `Idempotency-Key` was used for a different request. |
+| `operation_expired` | 409 | The request already ran and its result is no longer stored; it was not run again. |
+| `operation_limit_exceeded` | 422 | The workspace ran 1,000 operations within the last hour. |
+| `operation_storage_limit_exceeded` | 422 | Running operations and stored results reached the account's 64 MiB. |
+| `source_history_limit_exceeded` | 422 | The workspace synced 1,000 times within the last hour, or stored source reached 64 MiB. |
 
 ## Results and failed operations
 

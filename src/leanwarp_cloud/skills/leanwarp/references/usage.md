@@ -104,9 +104,12 @@ they want (saving it as a new file if the original is hard-linked) and delete
 the marker. Run the operation again if the source changed. `status` and
 `recover` report this; they never choose between the two versions for you.
 
-`sorry2lemma` moves each unfinished `theorem` or `lemma` proof into a generated
-lemma inserted before it and rewrites the proof to use that lemma. The rest of
-the file must compile. The lemmas keep their `sorry`; prove each one next.
+`sorry2lemma` moves the proof of each `theorem` or `lemma` that still has a
+`sorry` into a generated lemma inserted before it, and rewrites the original to
+call that lemma. The rest of the file must compile. The lemmas keep their
+`sorry`; prove each one next. Section `variable`s are not supported yet: a
+theorem that uses one comes back `failed` with the file unchanged, so give it
+explicit arguments first.
 `check-files` runs each file as `check` would, one after another on the same
 warm worker, within a four-minute budget; a file the budget does not reach is
 `not_checked`, and the batch does not pass.
@@ -160,11 +163,28 @@ What to read in `result.result`:
 | `inspect` | `goal_status`: `available` with `goal_contexts`, or `unavailable` with `unavailable_reason`. `retained_proof_state`, when present, says whether the worker retained a proof state; it does not promise which tactic execution path will run. Also `selected_hole`, `enclosing_declaration`, `premise_hints` and `context_omitted`. |
 | `try_tactics` | `results`: one entry per tactic, in the order given, with `tactic`, `outcome`, `status`, `diagnostics`, `elapsed_ms` and `execution`. `skipped` lists tactics that did not run, with a reason. |
 | `verify_target` | `status` `ok` and `receipt.policy` `fixed_target_kernel_check_v1`; a rejection has `failure_kind`. |
-| `holes` | `holes`: each `kind` (`sorry` or `named`), `token`, `start_line`, `start_column`, `end_line`, `end_column`; for the first 16, `goal_status` and `goals` (`target`, `hypotheses`) and the enclosing `declaration`. `hole_count`, `holes_omitted` and `goals_omitted` count the rest; a result too large to return drops goals first (`goal_status: omitted`). `status` is `error` when the file does not compile, and the positions are still listed; if the result also has an `error` object, LeanWarp itself failed instead. |
-| `suggest` | `status` `closed` with `tactic`, `found_by` when `tactic` is what a search such as `exact?` found, `verification` (`strict`, `declaration` or `partial`), `patch` (`start_utf8_offset`, `end_utf8_offset`, `replacement`), `source_sha256` and `patched_source_sha256`; or `not_closed` with `tried`, `candidates`, `rejected_by_recheck` and `exhausted` (`portfolio` or `budget`). `portfolio` is `leanwarp` or `caller`. |
+| `holes` | `holes`: each `kind` (`sorry` or `named`), `token`, `unfinished`, `start_line`, `start_column`, `end_line`, `end_column`; for the first 16, `goal_status` and `goals` (`target`, `hypotheses`) and the enclosing `declaration`. `unfinished` is conservative: a `?_` is false only when its known enclosing declaration has no own `sorry`. A separate `sorry` in the same proof keeps filled placeholders flagged too; anonymous examples and unknown declarations stay flagged. Literal `sorry` is always flagged, including unused branches rejected by strict checking. `unfinished_count` counts flagged tokens, not remaining goals. `hole_count` counts all tokens; `holes_omitted` counts entries not returned and `goals_omitted` counts omitted goal inspections. A result too large to return drops goals first (`goal_status: omitted`). `status` is `error` when the file does not compile, and the positions are still listed; if the result also has an `error` object, LeanWarp itself failed instead. |
+| `suggest` | `status` `closed` with `tactic`, `found_by` when `tactic` is what a search such as `exact?` found, `verification` (`strict`, `declaration` or `partial`), `patch` (`start_utf8_offset`, `end_utf8_offset`, `replacement`), `source_sha256` and `patched_source_sha256`; or `not_closed` with `tried`, `candidates`, `rejected_by_recheck`, `rejections` (each closing `tactic` the recheck refused, with its `reason`; see below) and `exhausted` (`portfolio` or `budget`). `portfolio` is `leanwarp` or `caller`. |
 | `extract_decls` | `declarations` written in the file (not those Lean generates, such as recursors): `name`, `kind`, `type`, `local_dependencies`, `dependencies` (up to 128, then `dependencies_omitted`), `level_params`, `is_unsafe`, `is_partial` and the source range. `declarations_omitted` counts any beyond 512 or beyond the result's size. |
 | `sorry2lemma` | `status` (`extracted`, `partial`, `unchanged`, `no_targets` or `failed`), `targets` with `declaration_name`, `generated_lemma_name` and `status`; `transformed_source` with its `transformed_source_sha256` when `source_changed`; `final_check` and, if requested, `strict_final_check`. A transformed file too large to return is `status` `error` with `error.code` `result_too_large`. |
 | `check_files` | `status` (`ok` only when every file passed), `passed`, `failed`, and `results` in the order given, each with `file`, `status`, `diagnostics` and `elapsed_ms`. A file whose imports could not be prepared has `phase` `dependencies`; one the batch's time did not reach is `not_checked`. |
+
+A `suggest` rejection `reason` is one of:
+
+- `uses_sorry`: the tactic is or contains `sorry` or `admit`.
+- `changes_other_holes`: the edit removed or added another hole, such as a new `?_`.
+- `changes_declarations`: the edit added, removed or changed a declaration.
+- `edit_outside_declaration`: the edit reaches past the declaration it is in.
+- `uses_unproved_lemma`: the proof cites a lemma that still has a `sorry`.
+- `uses_unproved_or_extra_axiom`: the proof relies on `sorry` or an axiom beyond
+  `propext`, `Classical.choice` and `Quot.sound` (for example `native_decide`).
+- `new_errors`: the file has an error it did not have before.
+- `axiom_audit_unavailable`: Lean could not report the declaration's axioms.
+- `recheck_incomplete`: the recheck timed out or did not finish. The tactic may
+  still be correct; add it by hand and check the file.
+
+A recheck that runs out of the operation's time ends the search with
+`exhausted: budget` and is not counted as a rejection.
 
 A trial's `outcome` is `closed_proof`, `open_proof_state` (the tactic ran and
 goals remain, shown in its diagnostics), `tactic_error`, `timeout` or

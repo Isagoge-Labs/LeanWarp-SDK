@@ -300,7 +300,9 @@ def create_server(cloud: LeanWarpCloud | Callable[[], LeanWarpCloud], root: str)
         hole (this declaration still has others). The file is not changed until
         apply, which writes only the latest result: call it before any other tool,
         then call holes again, since line numbers change. wait and status start no
-        operation, so they are safe in between. May use credit.
+        operation, so they are safe in between. If not_closed, rejections gives each
+        refused tactic's reason (recheck_incomplete may still be a correct tactic).
+        May use credit.
         """
         payload: dict[str, Any] = {"file": file, "line": line, "column": column}
         if tactics is not None:
@@ -317,7 +319,13 @@ def create_server(cloud: LeanWarpCloud | Callable[[], LeanWarpCloud], root: str)
         """List every sorry and ?_ in a file with its position, and goals for the first 16.
 
         Lines and columns are 1-based; pass them unchanged to inspect or suggest.
-        success means the listing ran; status error means the file does not compile.
+        unfinished is conservative: a ?_ is finished only when its known enclosing
+        declaration has no remaining sorry of its own. Another sorry in that proof
+        keeps even filled placeholders flagged; anonymous examples and unknown
+        declarations stay flagged too. Literal sorry is always flagged.
+        unfinished_count counts flagged tokens, not remaining goals: inspect the
+        surrounding proof before choosing a position. success means the listing
+        ran; status error means the file does not compile.
         May use credit.
         """
         return reported(
@@ -343,10 +351,12 @@ def create_server(cloud: LeanWarpCloud | Callable[[], LeanWarpCloud], root: str)
         strict_final_check: bool = False,
         wait_seconds: float = DEFAULT_WAIT_SECONDS,
     ) -> dict[str, Any]:
-        """Lift each sorry into a named lemma the proof then uses; call apply to write it.
+        """Move each unfinished theorem's proof into a named lemma; call apply to write it.
 
-        The lemmas keep their sorry: prove each one next, for example with suggest.
-        name_prefix names them. The file is not changed. May use credit.
+        The original theorem then calls the new lemma, which keeps its sorry: prove
+        each one next, for example with suggest. name_prefix names them. Section
+        variables are not supported yet (status failed, file unchanged). The file is
+        not changed until apply. May use credit.
         """
         payload: dict[str, Any] = {
             "file": file,

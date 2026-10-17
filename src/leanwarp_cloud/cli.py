@@ -243,7 +243,8 @@ def parser() -> argparse.ArgumentParser:
 
     obligations = commands.add_parser(
         "sorry2lemma",
-        help="lift each sorry into a named lemma; `leanwarp apply` writes the new file",
+        help="move each unfinished theorem's proof into a named lemma; "
+        "`leanwarp apply` writes the new file",
     )
     obligations.add_argument("file", metavar="FILE", help="a .lean file in the project")
     obligations.add_argument(

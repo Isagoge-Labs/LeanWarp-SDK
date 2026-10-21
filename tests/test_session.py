@@ -13,6 +13,7 @@ from leanwarp_cloud import (
     LeanWarpCloud,
     LeanWarpCloudError,
     OperationOutcome,
+    OperationTimeout,
     ProjectSession,
     SessionError,
 )
@@ -429,8 +430,35 @@ def test_inline_wait_does_not_contend_for_the_project_lock(project, monkeypatch)
     account_reads = sum(r.url.path.endswith("/account") for r in service.requests)
     result = session.submit_and_wait("check", {"file": "Main.lean"}, wait_seconds=5)
     assert result["state"] == "completed"
-    # Only the submission itself takes the lock and re-reads the account owner.
-    assert sum(r.url.path.endswith("/account") for r in service.requests) == account_reads + 1
+    # The owner was read when connecting; one client's key never changes owner,
+    # so neither the submission nor the wait reads it again.
+    assert sum(r.url.path.endswith("/account") for r in service.requests) == account_reads
+
+
+def test_the_account_owner_is_read_once_per_client(project):
+    _, service, _, session = project
+    session.connect()
+    for _ in range(3):
+        session.submit_and_wait("check", {"file": "Main.lean"}, wait_seconds=0)
+    assert sum(r.url.path.endswith("/account") for r in service.requests) == 1
+
+
+def test_a_wait_never_sends_a_read_too_short_to_finish(project, monkeypatch):
+    _, service, cloud, session = project
+    session.connect()
+    service.pending_polls = 100  # Never finishes within the wait.
+    clock = [0.0]
+    monkeypatch.setattr("leanwarp_cloud.client.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        "leanwarp_cloud.client.time.sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds)
+    )
+    operation = session.submit("check", {"file": "Main.lean"})
+    before = len(service.requests)
+    with pytest.raises(OperationTimeout):
+        cloud.wait(operation["operation_id"], timeout=3.5)
+    reads = [r for r in service.requests[before:] if "/operations/" in r.url.path]
+    # Reads at 0 s, 1 s and 2 s; at 3 s only 0.5 s is left, too little to finish.
+    assert len(reads) == 3
 
 
 @pytest.mark.parametrize("stall", ["read", "connect"])

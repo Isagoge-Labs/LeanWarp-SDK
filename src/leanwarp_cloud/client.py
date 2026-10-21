@@ -43,6 +43,8 @@ OPERATION_KINDS: frozenset[str] = frozenset(get_args(OperationKind))
 MAX_BATCH_FILES = 64
 # Time allowed for a held response to arrive after the server stops waiting.
 _RESPONSE_MARGIN = 2.0
+# A plain read gets a third of what remains; below this it cannot finish.
+_MIN_READ_SECONDS = 1.0
 
 
 class LeanWarpCloudError(RuntimeError):
@@ -115,6 +117,7 @@ class LeanWarpCloud:
         self._retries = retries
         self._timeout = timeout
         self.base_url = base_url.rstrip("/")
+        self._owner: str | None = None
 
     def close(self) -> None:
         self._client.close()
@@ -127,7 +130,17 @@ class LeanWarpCloud:
 
     def account(self) -> dict[str, Any]:
         """Authenticated owner and exact posted, reserved and available microdollars."""
-        return self._request("GET", "account")
+        account = self._request("GET", "account")
+        owner = account.get("owner_id") if isinstance(account, dict) else None
+        if isinstance(owner, str) and owner:
+            self._owner = owner
+        return account
+
+    def owner_id(self) -> str | None:
+        """The key's account, read once: a client's key, and so its owner, never changes."""
+        if self._owner is None:
+            self.account()
+        return self._owner
 
     def versions(self) -> dict[str, Any]:
         """Served environments under `versions`, one current build per environment."""
@@ -530,6 +543,9 @@ class LeanWarpCloud:
             )
             if not use_held_reads:
                 hold = 0
+            if hold <= 0 and operation is not None and deadline - started < _MIN_READ_SECONDS:
+                # A read this short would be abandoned before the API answers.
+                raise OperationTimeout(operation_id, operation)
             held = False
             try:
                 operation = self.operation(operation_id, deadline=deadline, wait_seconds=hold)

@@ -300,6 +300,16 @@ def test_mcp_redacts_unexpected_transport_details(tmp_path):
             "inspect",
             {
                 "status": "metadata_only",
+                "goal_contexts": [{"target": "True"}],
+                "retained_proof_state": False,
+                "observation_only": True,
+            },
+            True,
+        ),
+        (
+            "inspect",
+            {
+                "status": "metadata_only",
                 "goal_status": "available",
                 "goal_contexts": [{"target": "True"}],
             },

@@ -101,7 +101,7 @@ class ProjectSession:
                     "another LeanWarp command is using this project; let it finish"
                 ) from error
             state = self._read()
-            owner = self.cloud.account().get("owner_id")
+            owner = self.cloud.owner_id()
             if not isinstance(owner, str) or not owner:
                 raise SessionError("API returned an invalid account identity")
             if state.get("owner_id", owner) != owner:
@@ -509,7 +509,7 @@ class ProjectSession:
         identity = project_identity(self.root, allow_empty=bool(state.get("workspace_id")))
         report.update(_project_report(self.root, identity, catalog))
         if state.get("workspace_id"):
-            owner = self.cloud.account().get("owner_id")
+            owner = self.cloud.owner_id()
             if not isinstance(owner, str) or not owner or owner != state.get("owner_id", owner):
                 raise SessionError(
                     "this project belongs to another account; restore its credentials"

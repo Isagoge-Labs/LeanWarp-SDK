@@ -316,16 +316,15 @@ def create_server(cloud: LeanWarpCloud | Callable[[], LeanWarpCloud], root: str)
     def holes(
         file: str, goals: bool = True, wait_seconds: float = DEFAULT_WAIT_SECONDS
     ) -> dict[str, Any]:
-        """List every sorry and ?_ in a file with its position, and goals for the first 16.
+        """List sorry and ?_ positions with their observed state from one elaboration.
 
-        Lines and columns are 1-based; pass them unchanged to inspect or suggest.
-        unfinished is conservative: a ?_ is finished only when its known enclosing
-        declaration has no remaining sorry of its own. Another sorry in that proof
-        keeps even filled placeholders flagged; anonymous examples and unknown
-        declarations stay flagged too. Literal sorry is always flagged.
-        unfinished_count counts flagged tokens, not remaining goals: inspect the
-        surrounding proof before choosing a position. success means the listing
-        ran; status error means the file does not compile.
+        Lines and columns are 1-based. States are resolved, sorry, unresolved, or
+        unknown. unfinished_count counts only sorry/unresolved placeholders;
+        unknown_count is separate and must not be treated as proof completion.
+        The legacy unfinished flag stays true for unknowns; only resolved is false.
+        hole_count includes resolved syntax placeholders. Goals are bounded to
+        the first 16 unfinished/unknown entries; omitted contexts are explicit.
+        success means the listing ran; status error means the file does not compile.
         May use credit.
         """
         return reported(
@@ -355,8 +354,9 @@ def create_server(cloud: LeanWarpCloud | Callable[[], LeanWarpCloud], root: str)
 
         The original theorem then calls the new lemma, which keeps its sorry: prove
         each one next, for example with suggest. name_prefix names them. Section
-        variables are not supported yet (status failed, file unchanged). The file is
-        not changed until apply. May use credit.
+        variables are preserved in the generated lemma application. A failed
+        transformation leaves the source unchanged. The file is not changed until
+        apply. May use credit.
         """
         payload: dict[str, Any] = {
             "file": file,

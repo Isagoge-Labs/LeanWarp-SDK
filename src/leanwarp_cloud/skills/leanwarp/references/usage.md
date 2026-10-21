@@ -107,9 +107,8 @@ the marker. Run the operation again if the source changed. `status` and
 `sorry2lemma` moves the proof of each `theorem` or `lemma` that still has a
 `sorry` into a generated lemma inserted before it, and rewrites the original to
 call that lemma. The rest of the file must compile. The lemmas keep their
-`sorry`; prove each one next. Section `variable`s are not supported yet: a
-theorem that uses one comes back `failed` with the file unchanged, so give it
-explicit arguments first.
+`sorry`; prove each one next. Section variables are preserved in the generated
+lemma application. A failed transformation leaves the source unchanged.
 `check-files` runs each file as `check` would, one after another on the same
 warm worker, within a four-minute budget; a file the budget does not reach is
 `not_checked`, and the batch does not pass.
@@ -163,7 +162,7 @@ What to read in `result.result`:
 | `inspect` | `goal_status`: `available` with `goal_contexts`, or `unavailable` with `unavailable_reason`. `retained_proof_state`, when present, says whether the worker retained a proof state; it does not promise which tactic execution path will run. Also `selected_hole`, `enclosing_declaration`, `premise_hints` and `context_omitted`. |
 | `try_tactics` | `results`: one entry per tactic, in the order given, with `tactic`, `outcome`, `status`, `diagnostics`, `elapsed_ms` and `execution`. `skipped` lists tactics that did not run, with a reason. |
 | `verify_target` | `status` `ok` and `receipt.policy` `fixed_target_kernel_check_v1`; a rejection has `failure_kind`. |
-| `holes` | `holes`: each `kind` (`sorry` or `named`), `token`, `unfinished`, `start_line`, `start_column`, `end_line`, `end_column`; for the first 16, `goal_status` and `goals` (`target`, `hypotheses`) and the enclosing `declaration`. `unfinished` is conservative: a `?_` is false only when its known enclosing declaration has no own `sorry`. A separate `sorry` in the same proof keeps filled placeholders flagged too; anonymous examples and unknown declarations stay flagged. Literal `sorry` is always flagged, including unused branches rejected by strict checking. `unfinished_count` counts flagged tokens, not remaining goals. `hole_count` counts all tokens; `holes_omitted` counts entries not returned and `goals_omitted` counts omitted goal inspections. A result too large to return drops goals first (`goal_status: omitted`). `status` is `error` when the file does not compile, and the positions are still listed; if the result also has an `error` object, LeanWarp itself failed instead. |
+| `holes` | `holes`: each `kind`, `token`, exact semantic `state` (`resolved`, `sorry`, `unresolved`, `unknown`), `unfinished` and source positions. A filled `?_` is resolved independently of other holes in its declaration. `unfinished_count` counts confirmed sorry/unresolved placeholders; `unknown_count` is separate. The legacy `unfinished` boolean stays true for unknowns; false means positively resolved. `hole_count` includes all syntax placeholders, not remaining goals. `resolved_count`, `holes_omitted`, and `goals_omitted` account for resolved entries and output limits. Goals (`target`, `hypotheses`) are bounded to the first 16 unfinished/unknown entries. `goal_status: omitted` means the context was not returned. `status: error` and `diagnostics` preserve compilation errors; `diagnostics_complete` reports whether elaboration finished. |
 | `suggest` | `status` `closed` with `tactic`, `found_by` when `tactic` is what a search such as `exact?` found, `verification` (`strict`, `declaration` or `partial`), `patch` (`start_utf8_offset`, `end_utf8_offset`, `replacement`), `source_sha256` and `patched_source_sha256`; or `not_closed` with `tried`, `candidates`, `rejected_by_recheck`, `rejections` (each closing `tactic` the recheck refused, with its `reason`; see below) and `exhausted` (`portfolio` or `budget`). `portfolio` is `leanwarp` or `caller`. |
 | `extract_decls` | `declarations` written in the file (not those Lean generates, such as recursors): `name`, `kind`, `type`, `local_dependencies`, `dependencies` (up to 128, then `dependencies_omitted`), `level_params`, `is_unsafe`, `is_partial` and the source range. `declarations_omitted` counts any beyond 512 or beyond the result's size. |
 | `sorry2lemma` | `status` (`extracted`, `partial`, `unchanged`, `no_targets` or `failed`), `targets` with `declaration_name`, `generated_lemma_name` and `status`; `transformed_source` with its `transformed_source_sha256` when `source_changed`; `final_check` and, if requested, `strict_final_check`. A transformed file too large to return is `status` `error` with `error.code` `result_too_large`. |
@@ -179,7 +178,7 @@ A `suggest` rejection `reason` is one of:
 - `uses_unproved_or_extra_axiom`: the proof relies on `sorry` or an axiom beyond
   `propext`, `Classical.choice` and `Quot.sound` (for example `native_decide`).
 - `new_errors`: the file has an error it did not have before.
-- `axiom_audit_unavailable`: Lean could not report the declaration's axioms.
+- `axiom_audit_unavailable`: the engine could not supply structured, kernel-checked axiom evidence for the exact declaration. This is not a verdict that the proposed tactic is invalid.
 - `recheck_incomplete`: the recheck timed out or did not finish. The tactic may
   still be correct; add it by hand and check the file.
 
@@ -236,8 +235,12 @@ target means. Supply the target's imports and definitions with `--context-file`
 The checked theorem's axioms are audited transitively: only `propext`,
 `Classical.choice` and `Quot.sound` are allowed. `sorry`, `admit` and any other
 axiom are rejected, including ones reached through imports. Source using
-`native_decide`, `set_option` or custom elaborators is rejected, and declaration
+`native_decide`, unsupported `set_option` commands or custom elaborators is rejected, and declaration
 names must be ASCII. A rejection is not permission to weaken the statement.
+
+Fixed-target verification permits `set_option autoImplicit false`, including its
+scoped `in` form, preserving the source and scope. Other options (including
+`autoImplicit true` and kernel-check controls) remain rejected.
 
 The receipt records hashes and environment identities for the check. It is not a
 signed, portable certificate: Lean and the environment's dependencies remain

@@ -76,7 +76,7 @@ its files. `file` is a project-relative `.lean` path; lines and columns start at
 | `inspect` | `file`, `line`, `column`. |
 | `try_tactics` | `file`, `line`, `column`, `tactics` (1 to 32), `timeout_ms` per tactic (default 30000). |
 | `verify_target` | `file`, `candidate_declaration`, `target_statement`, `target_context`, `execution_mode` (`reusable` or `fresh`), `timeout` seconds. |
-| `holes` | `file`, `goals` (default `true`: goals for the first 16 holes). |
+| `holes` | `file`, `goals` (default `true`: bounded goals for the first 16 unfinished/unknown placeholders). |
 | `suggest` | `file`, `line`, `column`; optional `tactics` (1 to 32) instead of LeanWarp's portfolio, and `timeout_ms` per tactic (learned budgets by default). |
 | `extract_decls` | `file`. |
 | `sorry2lemma` | `file`, `max_extractions` (1 to 256, default 64), optional `name_prefix`, `strict_final_check` (default `false`). |

@@ -413,12 +413,16 @@ an unfinished operation reports `leanwarp_budget_exceeded`.
 | Inline wait | 0 to 40 seconds (`wait` can poll longer) |
 | Operation time limit | 1 to 600 seconds |
 | Operations per workspace | One at a time |
-| Operation history | The newest 1,000 operations per workspace |
-| File sync history | The newest 1,000 syncs per workspace |
-| Stored results | 64 MiB per account, across workspaces; each running operation reserves 1 MiB |
-| Stored source | 64 MiB per account, across workspaces |
-| Workspaces | 100 per account |
-| Active API keys | 100 per account |
+| Operation history | The newest 1,000 operations per workspace\* |
+| File sync history | The newest 1,000 syncs per workspace\* |
+| Stored results | 64 MiB per account, across workspaces\*; each running operation reserves 1 MiB |
+| Stored source | 64 MiB per account, across workspaces\* |
+| Workspaces | 100 per account\* |
+| Active API keys | 100 per account\* |
+
+\* The default. These limits are per account, and an account's own limits may be
+higher: email contact@isagoge.in to raise them. `status` reports the account's
+history limits.
 
 History is a window, not a lifetime allowance. When a new operation or sync
 would pass a history limit, LeanWarp removes the oldest finished operations and

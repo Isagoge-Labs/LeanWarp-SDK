@@ -449,6 +449,41 @@ class _Clock:
         self.now += seconds
 
 
+@pytest.mark.parametrize(
+    ("timeout", "poll_interval", "completes_after", "expected_elapsed"),
+    [(0.8, 0.1, 0.15, 0.2), (3.5, 1.0, 3.0, 3.2)],
+)
+def test_wait_observes_completion_in_the_final_fraction_of_its_budget(
+    monkeypatch, timeout, poll_interval, completes_after, expected_elapsed
+) -> None:
+    clock = _Clock()
+    started = clock.now
+    monkeypatch.setattr("leanwarp_cloud.client.time.monotonic", clock.monotonic)
+    monkeypatch.setattr("leanwarp_cloud.client.time.sleep", clock.sleep)
+    read_timeouts: list[float] = []
+    response_seconds = 0.05
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        read_timeout = request.extensions["timeout"]["read"]
+        read_timeouts.append(read_timeout)
+        # Even the last read has enough time for this API's response.
+        assert response_seconds < read_timeout <= timeout - (clock.now - started)
+        clock.now += response_seconds
+        state = "completed" if clock.now - started >= completes_after else "running"
+        return httpx.Response(200, json={"operation_id": "op-1", "state": state})
+
+    with LeanWarpCloud(
+        "secret", base_url="https://cloud.example", transport=httpx.MockTransport(handle)
+    ) as api:
+        operation = api.wait("op-1", timeout=timeout, poll_interval=poll_interval)
+
+    assert operation["state"] == "completed"
+    assert len(read_timeouts) > 1
+    assert read_timeouts[-1] < 1
+    assert clock.now - started == pytest.approx(expected_elapsed)
+    assert clock.now - started < timeout
+
+
 def test_waiting_asks_the_server_to_hold_each_read_until_the_operation_ends(monkeypatch) -> None:
     clock = _Clock()
     monkeypatch.setattr("leanwarp_cloud.client.time.monotonic", clock.monotonic)

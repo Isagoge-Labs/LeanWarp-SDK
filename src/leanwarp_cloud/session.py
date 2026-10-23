@@ -35,9 +35,9 @@ from .resources import published_worker_resources
 
 _MAX_JOURNAL_BYTES = 8 * 1024 * 1024
 _TERMINAL_STATES = frozenset({"completed", "failed", "cancelled"})
-# Each page holds at least one of the roughly 1,000 operations a workspace stores;
-# this only stops a cursor that never ends.
-_MAX_HISTORY_PAGES = 2000
+# Account overrides allow 100,000 retained operations. A byte-bounded page may
+# hold only one; allow the full history while still bounding a broken server.
+_MAX_HISTORY_PAGES = 100_001
 # Polling shares this budget (see LeanWarpCloud.wait). Even one bounded overrun
 # read keeps an inline wait under the common 60-second MCP client tool deadline.
 MAX_INLINE_WAIT_SECONDS = 40
@@ -438,9 +438,14 @@ class ProjectSession:
         keep. Pages are read as the iterator advances.
         """
         cursor = None
+        seen: set[str] = set()
         for _ in range(_MAX_HISTORY_PAGES):
             page = self.history_page(workspace_id=workspace_id, cursor=cursor)
             workspace_id, cursor = page["workspace_id"], page["next_cursor"]
+            if cursor is not None:
+                if cursor in seen:
+                    raise SessionError("LeanWarp's operation history repeated a cursor; try again")
+                seen.add(cursor)
             yield from page["operations"]
             if cursor is None:
                 return

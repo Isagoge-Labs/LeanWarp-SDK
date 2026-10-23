@@ -49,7 +49,7 @@ curl -s https://api.isagoge.in/v1/leanwarp/workspaces/$WORKSPACE/operations \
 | `PUT` | `/workspaces/{workspace_id}/files` | write | Upload or delete files; returns the new revision. |
 | `POST` | `/workspaces/{workspace_id}/operations` | execute | Submit an operation; see [Operations](#operations). |
 | `GET` | `/workspaces/{workspace_id}/operations` | read | Stored operations with results, newest first; see below. |
-| `GET` | `/workspaces/{workspace_id}/usage` | read | Each history limit's `used` and `limit`. |
+| `GET` | `/workspaces/{workspace_id}/usage` | read | Each history limit's `used` and the account's `limit`. |
 | `GET` | `/operations/{operation_id}` | read | An operation's state and result; `?wait_seconds=N` waits up to 20 seconds for it to end. |
 | `POST` | `/operations/{operation_id}/cancel` | execute | Ask to cancel; poll until it ends. |
 | `POST` | `/workspaces/{workspace_id}/stop` | write or execute | Stop the worker; files are kept. |
@@ -163,9 +163,9 @@ next, and may change. Common codes:
 | `workspace_busy` | 409 | Another operation is running in the workspace. |
 | `idempotency_conflict` | 409 | The `Idempotency-Key` was used for a different request. |
 | `operation_expired` | 409 | The request already ran and its result is no longer stored; it was not run again. |
-| `operation_limit_exceeded` | 422 | The workspace ran 1,000 operations within the last hour. |
-| `operation_storage_limit_exceeded` | 422 | Running operations and stored results reached the account's 64 MiB. |
-| `source_history_limit_exceeded` | 422 | The workspace synced 1,000 times within the last hour, or stored source reached 64 MiB. |
+| `operation_limit_exceeded` | 422 | The workspace reached the account's operation limit (1,000 by default) within the last hour. |
+| `operation_storage_limit_exceeded` | 422 | Running operations and stored results reached the account's limit (64 MiB by default). |
+| `source_history_limit_exceeded` | 422 | The workspace reached the account's sync limit (1,000 by default) within the last hour, or stored source reached the account's limit (64 MiB by default). |
 
 ## Results and failed operations
 

@@ -43,8 +43,6 @@ OPERATION_KINDS: frozenset[str] = frozenset(get_args(OperationKind))
 MAX_BATCH_FILES = 64
 # Time allowed for a held response to arrive after the server stops waiting.
 _RESPONSE_MARGIN = 2.0
-# A plain read gets a third of what remains; below this it cannot finish.
-_MIN_READ_SECONDS = 1.0
 
 
 class LeanWarpCloudError(RuntimeError):
@@ -543,9 +541,6 @@ class LeanWarpCloud:
             )
             if not use_held_reads:
                 hold = 0
-            if hold <= 0 and operation is not None and deadline - started < _MIN_READ_SECONDS:
-                # A read this short would be abandoned before the API answers.
-                raise OperationTimeout(operation_id, operation)
             held = False
             try:
                 operation = self.operation(operation_id, deadline=deadline, wait_seconds=hold)

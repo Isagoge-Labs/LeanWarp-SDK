@@ -443,7 +443,7 @@ def test_the_account_owner_is_read_once_per_client(project):
     assert sum(r.url.path.endswith("/account") for r in service.requests) == 1
 
 
-def test_a_wait_never_sends_a_read_too_short_to_finish(project, monkeypatch):
+def test_a_pending_wait_uses_its_deadline_and_preserves_the_operation(project, monkeypatch):
     _, service, cloud, session = project
     session.connect()
     service.pending_polls = 100  # Never finishes within the wait.
@@ -454,11 +454,17 @@ def test_a_wait_never_sends_a_read_too_short_to_finish(project, monkeypatch):
     )
     operation = session.submit("check", {"file": "Main.lean"})
     before = len(service.requests)
-    with pytest.raises(OperationTimeout):
+    with pytest.raises(OperationTimeout) as caught:
         cloud.wait(operation["operation_id"], timeout=3.5)
     reads = [r for r in service.requests[before:] if "/operations/" in r.url.path]
-    # Reads at 0 s, 1 s and 2 s; at 3 s only 0.5 s is left, too little to finish.
-    assert len(reads) == 3
+    # Reads at 0, 1, 2 and 3 seconds, then the final sleep ends at the deadline.
+    assert len(reads) == 4
+    assert all(request.method == "GET" for request in reads)
+    assert reads[-1].extensions["timeout"]["read"] == pytest.approx(0.5 / 3)
+    assert clock[0] == 3.5
+    assert caught.value.operation_id == operation["operation_id"]
+    assert caught.value.operation == service.operation
+    assert service.operation["state"] == "queued"
 
 
 @pytest.mark.parametrize("stall", ["read", "connect"])
@@ -1827,3 +1833,38 @@ def test_apply_interrupted_after_rename_preserves_recovery_before_python_records
         with pytest.raises(SessionError, match="needs recovery"):
             command()
     assert service.revision == revision and service.sources["Main.lean"] == SORRY
+
+
+def test_history_exports_raised_account_history_beyond_two_thousand_pages(account, monkeypatch):
+    _, _, session = account
+    total = 50_001
+
+    def operations(workspace_id, *, cursor=None):
+        start = int(cursor or 0)
+        end = min(start + 25, total)
+        return {
+            "operations": [
+                {"operation_id": str(index), "workspace_id": workspace_id}
+                for index in range(start, end)
+            ],
+            "next_cursor": str(end) if end < total else None,
+        }
+
+    monkeypatch.setattr(session.cloud, "operations", operations)
+    assert sum(1 for _ in session.history("w")) == total
+
+
+def test_history_refuses_repeated_cursor_before_yielding_duplicate_page(account, monkeypatch):
+    _, _, session = account
+    calls = []
+
+    def operations(workspace_id, *, cursor=None):
+        calls.append(cursor)
+        return {"operations": [{"workspace_id": workspace_id}], "next_cursor": "same"}
+
+    monkeypatch.setattr(session.cloud, "operations", operations)
+    history = session.history("w")
+    next(history)
+    with pytest.raises(SessionError, match="repeated a cursor"):
+        next(history)
+    assert calls == [None, "same"]

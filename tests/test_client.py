@@ -691,3 +691,32 @@ def test_cleanup_expired_deadline_never_starts_an_attempt(monkeypatch, action):
         else:
             getattr(cloud, action)("owned-id", deadline=1000.0)
     assert requests == []
+
+
+@pytest.mark.parametrize(
+    "status,method,attempts", [(503, "GET", 3), (503, "POST", 1), (500, "GET", 1)]
+)
+def test_transient_persistence_retries_remain_bounded_and_safe(status, method, attempts):
+    requests = []
+
+    def handle(request):
+        requests.append(request)
+        return httpx.Response(status, json={"error": {"code": "persistence_request_unavailable"}})
+
+    with (
+        LeanWarpCloud(
+            "secret",
+            base_url="https://cloud.example",
+            retries=2,
+            transport=httpx.MockTransport(handle),
+        ) as api,
+        patch("leanwarp_cloud.client.time.sleep"),
+        pytest.raises(LeanWarpCloudError) as raised,
+    ):
+        if method == "GET":
+            api.workspace("w")
+        else:
+            api.stop("w")  # No idempotency key: never replay this POST.
+    assert raised.value.status_code == status
+    assert len(requests) == attempts
+    assert all("Idempotency-Key" not in request.headers for request in requests)

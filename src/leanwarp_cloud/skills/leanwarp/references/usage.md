@@ -7,7 +7,9 @@ command prints one JSON object; `leanwarp COMMAND --help` lists its options.
 
 | Command | What it does |
 | --- | --- |
-| `auth login`, `auth logout` | Save or forget the API key on this machine. |
+| `auth login [--no-browser]`, `auth logout` | Open the dashboard to create a key and save the pasted key, or forget it on this machine. |
+| `setup [--agent NAME] [--no-mcp]` | Install the skill and MCP server for Claude Code, Codex, Cursor and `~/.agents`. No key needed. |
+| `update` | Upgrade `leanwarp` to the latest release and refresh the skills `setup` installed. |
 | `doctor [--environment NAME]` | Show which environment the project runs on, and summarise the upload. No compute; before signing in it checks against the public catalog. |
 | `files` | List the Lean files that would upload, their sizes and any problems. No key needed. |
 | `connect [--environment NAME] [--max-spend USD]` | Create the project's workspace, optionally with a spending cap. No compute. |
@@ -19,7 +21,7 @@ command prints one JSON object; `leanwarp COMMAND --help` lists its options.
 | `holes FILE [--no-goals]` | List every `sorry` and `?_` with its position, and the goals of the first 16. |
 | `suggest FILE --line N --column N [--tactic T …] [--tactic-timeout MS]` | Find a tactic that closes the hole at a position. Never edits the file. |
 | `apply` | Write the latest `suggest` or `sorry2lemma` result into its file and upload it. |
-| `sorry2lemma FILE [--max N] [--prefix NAME] [--strict-final-check]` | Lift each `sorry` into a named lemma the proof then uses. Never edits the file. |
+| `sorry2lemma FILE [--max N] [--prefix NAME] [--strict-final-check]` | Move the proof of each theorem that still has a `sorry` into a named lemma the theorem then uses. Never edits the file. |
 | `declarations FILE` | List the declarations a file adds, with types and dependencies. |
 | `check-files FILE [FILE …] [--draft] [--file-timeout SECONDS]` | Check up to 64 files in one operation, strictly unless `--draft`. |
 | `wait [--timeout SECONDS]` | Wait for the latest operation's result. |
@@ -28,6 +30,7 @@ command prints one JSON object; `leanwarp COMMAND --help` lists its options.
 | `export --output FILE [--workspace ID]` | Save every stored operation and result, newest first, as JSON Lines in a new file. |
 | `cancel` | Cancel the latest operation. |
 | `stop` | Stop the worker. Files are kept. |
+| `feedback --kind KIND --summary TEXT [--details TEXT] [--severity S] [--operation ID]` | Report a confirmed problem with LeanWarp itself to its team, naming the latest operation. Free; no compute. |
 | `recover` | Resend a request whose response was lost. |
 | `reconcile` | After another client changed the workspace, adopt its revision. Reports what the next sync uploads or deletes. |
 | `disconnect` | Forget a stopped workspace so the project can connect to another environment. |
@@ -154,6 +157,13 @@ returned it:
 Other exit codes: `1` from `doctor` when no environment matches, and `2` when a
 command could not run. Its JSON then has `error` (a stable code) and `message`.
 
+Any result, CLI or MCP, can also carry `update_available` with `current`,
+`latest` and `command` when the service names a newer SDK release. An SDK older
+than the service's minimum is refused with `sdk_upgrade_required` until it is
+updated with `leanwarp update`. An SDK installed from GitHub before the PyPI
+package (`leanwarp-sdk`) has no `update`; replace it with
+`uv tool uninstall leanwarp-sdk && uv tool install leanwarp`.
+
 What to read in `result.result`:
 
 | Operation | Fields |
@@ -273,7 +283,8 @@ Tools: `doctor`, `files`, `environments`, `connect`, `check` (`draft`), `inspect
 `target_context`), `holes`, `suggest` (`tactics` optional), `apply`, `sorry2lemma`,
 `extract_decls`, `check_files` (`files`, `draft`), `wait`, `status`, `cancel`, `stop`, `recover`, `reconcile`,
 `disconnect`, `workspaces`, `history` (one page; pass `next_cursor` for older ones),
-`delete` (`workspace_id`), `account` and `resources`. `connect` accepts
+`delete` (`workspace_id`), `account`, `resources` and `feedback` (`kind`, `summary`,
+`details`, `severity`, `operation_id`). `connect` accepts
 `workspace_id` to connect to an existing workspace. Operation tools wait up to `wait_seconds` (default 20,
 at most 40) and lead their result with `success`, like the CLI.
 
@@ -282,10 +293,10 @@ at most 40) and lead their result with `success`, like the CLI.
 Install the library in your application's environment:
 
 ```sh
-uv add 'leanwarp-sdk @ git+https://github.com/Isagoge-Labs/LeanWarp-SDK.git'
+uv add leanwarp
 ```
 
-Without uv, use `python -m pip install` with the same requirement. The CLI's
+Without uv, use `python -m pip install leanwarp`. The CLI's
 isolated installation doesn't make the library importable in your application.
 
 ```python
@@ -320,6 +331,9 @@ client doesn't stop the worker; call `stop()`.
 does. With the lower-level client, `leanwarp_cloud.edits.edited_source(kind,
 result, source)` returns the edited file, or raises `EditError` unless the
 source and the result's checksums match.
+
+`project.feedback(kind, summary, details=..., severity=...)` reports a problem
+with LeanWarp itself, naming the project's workspace and latest operation.
 
 `LeanWarpCloud(api_key)` is the lower-level HTTP client for applications that
 manage their own state. Before each create, sync or submit, save the request and
@@ -418,6 +432,7 @@ an unfinished operation reports `leanwarp_budget_exceeded`.
 | Stored results | 64 MiB per account, across workspaces\*; each running operation reserves 1 MiB |
 | Stored source | 64 MiB per account, across workspaces\* |
 | Workspaces | 100 per account\* |
+| Feedback | 60 requests an hour and 300 a day per account, repeats included, of which 20 an hour and 100 a day may be new reports; a summary of 8 to 200 characters and up to 4,000 characters of details. Reports expire 180 days after their last repeat, at most 500 are kept per account, and they are deleted with their workspace |
 | Active API keys | 100 per account\* |
 
 \* The default. These limits are per account, and an account's own limits may be

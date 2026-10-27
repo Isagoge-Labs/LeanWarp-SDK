@@ -17,6 +17,7 @@ from .amounts import validate_spending_cap
 from .endpoints import api_origin, public_origin
 from .project import choose_environment, project_identity, validate_selection
 from .transport import DeadlineTransport
+from .updates import record as record_releases
 
 _MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 #: Which SDK surface sends requests; the service reads it from the User-Agent.
@@ -41,6 +42,15 @@ OperationKind = Literal[
 OPERATION_KINDS: frozenset[str] = frozenset(get_args(OperationKind))
 #: The most files one check_files operation checks.
 MAX_BATCH_FILES = 64
+#: What a feedback report is about, and how much it got in the way.
+FeedbackKind = Literal["bug", "missing_feature", "confusing_result", "docs", "performance", "other"]
+FeedbackSeverity = Literal["blocking", "worked_around", "minor"]
+FEEDBACK_KINDS: frozenset[str] = frozenset(get_args(FeedbackKind))
+FEEDBACK_SEVERITIES: frozenset[str] = frozenset(get_args(FeedbackSeverity))
+#: The service's bounds on a feedback summary and its details, in characters.
+MIN_FEEDBACK_SUMMARY = 8
+MAX_FEEDBACK_SUMMARY = 200
+MAX_FEEDBACK_DETAILS = 4000
 # Time allowed for a held response to arrive after the server stops waiting.
 _RESPONSE_MARGIN = 2.0
 
@@ -571,6 +581,42 @@ class LeanWarpCloud:
                 # is retried at the polling pace.
                 time.sleep(min(poll_interval, remaining))
 
+    def feedback(
+        self,
+        kind: FeedbackKind,
+        summary: str,
+        *,
+        details: str = "",
+        severity: FeedbackSeverity = "minor",
+        workspace_id: str | None = None,
+        operation_id: str | None = None,
+        idempotency_key: str | None = None,
+        deadline: float | None = None,
+    ) -> dict[str, Any]:
+        """Send the LeanWarp team a report about LeanWarp itself; free, and starts no compute.
+
+        A workspace or operation the account does not hold is dropped, not refused.
+        Returns ``feedback_id``, ``duplicate`` and ``occurrences``. Sent once: a
+        failed report is not retried, so it never delays the caller's work.
+        """
+        if kind not in FEEDBACK_KINDS or severity not in FEEDBACK_SEVERITIES:
+            raise ValueError("unknown feedback kind or severity")
+        return self._request(
+            "POST",
+            "feedback",
+            body={
+                "kind": kind,
+                "summary": summary,
+                "details": details,
+                "severity": severity,
+                "workspace_id": workspace_id,
+                "operation_id": operation_id,
+            },
+            idempotency_key=idempotency_key or uuid4().hex,
+            deadline=deadline,
+            retry=False,
+        )
+
     def cancel(self, operation_id: str, *, deadline: float | None = None) -> dict[str, Any]:
         return self._request(
             "POST", f"operations/{_segment(operation_id)}/cancel", deadline=deadline
@@ -591,8 +637,9 @@ class LeanWarpCloud:
         idempotency_key: str | None = None,
         deadline: float | None = None,
         hold_seconds: float = 0,
+        retry: bool = True,
     ) -> dict[str, Any]:
-        """Send with bounded retries.
+        """Send with bounded retries, unless ``retry`` is false.
 
         With a ``deadline`` (``time.monotonic()``), no attempt or backoff starts
         after it, and each attempt splits its remaining budget across connect,
@@ -609,12 +656,13 @@ class LeanWarpCloud:
                 body, ensure_ascii=False, allow_nan=False, separators=(",", ":")
             ).encode("utf-8")
             headers["Content-Type"] = "application/json"
-        retryable = method == "GET" or idempotency_key is not None
+        retryable = retry and (method == "GET" or idempotency_key is not None)
         attempts = self._retries + 1 if retryable else 1
         for attempt in range(attempts):
             timeout = _attempt_timeout(deadline, hold_seconds, default=self._timeout)
             try:
                 response = self._send(method, path, content, headers, timeout, deadline)
+                record_releases(response.headers)
             except httpx.TransportError as transport_error:
                 # wait() retries an expired held read without the hold. Other
                 # transport failures keep the usual bounded retry policy.

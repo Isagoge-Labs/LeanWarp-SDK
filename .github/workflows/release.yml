@@ -1,0 +1,65 @@
+name: Release
+
+# Publishing a GitHub release tagged vX.Y.Z uploads that commit's tested
+# distribution to PyPI once the `pypi` environment's reviewer approves it. A tag
+# on a commit outside `main` fails before anything is built. Trusted Publishing
+# authenticates this workflow and the protected `pypi` environment; the
+# repository stores no PyPI token.
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  on-main:
+    name: Tagged commit is on main
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Refuse a tag outside main
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          test "$(git rev-parse "refs/tags/$TAG^{commit}")" = "$GITHUB_SHA"
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main; then
+            echo "::error::$TAG points to $GITHUB_SHA, which is not on main"
+            exit 1
+          fi
+
+  checks:
+    needs: on-main
+    uses: ./.github/workflows/ci.yml
+
+  pypi:
+    name: Publish to PyPI
+    needs: [on-main, checks]
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/project/leanwarp/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: leanwarp-${{ github.sha }}
+          path: dist
+      - name: Check the release tag names the packaged version
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          version="${TAG#v}"
+          test "v$version" = "$TAG"
+          test -f "dist/leanwarp-$version-py3-none-any.whl"
+          test -f "dist/leanwarp-$version.tar.gz"
+          test "$(ls dist | wc -l)" -eq 2
+          sha256sum dist/*
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2

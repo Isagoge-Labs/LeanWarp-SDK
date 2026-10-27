@@ -54,6 +54,7 @@ curl -s https://api.isagoge.in/v1/leanwarp/workspaces/$WORKSPACE/operations \
 | `POST` | `/operations/{operation_id}/cancel` | execute | Ask to cancel; poll until it ends. |
 | `POST` | `/workspaces/{workspace_id}/stop` | write or execute | Stop the worker; files are kept. |
 | `DELETE` | `/workspaces/{workspace_id}` | write | Delete a workspace. |
+| `POST` | `/feedback` | any | Report a problem with LeanWarp itself; see [Feedback](#feedback). |
 
 A key can be limited to one workspace; it then sees only that workspace.
 
@@ -123,6 +124,40 @@ Stop the worker explicitly when finished; disconnecting HTTP does not stop
 billing. Stopping discards in-memory state while retaining uploaded files and
 completed results; the next operation reconstructs the worker.
 Unused reserved credit is released after shutdown and final usage are confirmed.
+
+## Feedback
+
+`POST /feedback` sends the LeanWarp team a report about the service itself. It
+needs an `Idempotency-Key`, accepts a key with any permission, is free and starts
+no compute:
+
+```json
+{
+  "kind": "bug",
+  "severity": "worked_around",
+  "summary": "try_tactics returned ambiguous_cursor_capture on a plain by block",
+  "details": "What you did, what you expected and what happened.",
+  "workspace_id": "…",
+  "operation_id": "…"
+}
+```
+
+`kind` is `bug`, `missing_feature`, `confusing_result`, `docs`, `performance` or
+`other`; `severity` is `blocking`, `worked_around` or `minor` (the default). The
+summary is one line of 8 to 200 characters; `details` holds up to 4,000. Name
+the workspace and operation the report is about instead of quoting source: one
+your account does not hold is dropped, and a key limited to one workspace always
+reports about that workspace. The reply is `201` with `feedback_id`,
+`duplicate` and `occurrences`: the same kind and summary within a day counts
+another occurrence of the first report. Resending a request with the same
+`Idempotency-Key` within a day returns its first reply and counts nothing again.
+An account can send 60 feedback requests an hour and 300 a day, repeats and
+refused reports included, of which 20 an hour and 100 a day may be new reports;
+beyond that the reply is `feedback_limit_exceeded`. A request the API rejects
+before it reaches storage, such as a malformed body, stores nothing and is not
+counted. A report expires 180 days after its last repeat and is not shown after
+that; an account keeps at most 500, and deleting a workspace deletes the reports
+about it, and deleting reports never resets these limits. The SDK sends a report once and never retries it.
 
 ## Writes are safe to retry
 
@@ -195,6 +230,14 @@ operation kind. It contains no successful tactic trials.
 Held operation reads share the API's per-account and overall request limits. A
 busy service returns HTTP 503 with `Retry-After`. The SDK falls back to ordinary
 polling if a proxy cannot hold the connection, within the original wait deadline.
+
+## SDK releases
+
+Every response under `/v1/leanwarp` carries `LeanWarp-SDK-Latest` and
+`LeanWarp-SDK-Minimum`, the newest SDK release and the oldest one the service
+accepts. A request whose `User-Agent` is the SDK's (`leanwarp-sdk/VERSION
+(cli|mcp|python)`) and older than the minimum is refused with `426` and
+`sdk_upgrade_required`. Other clients are never refused for their version.
 
 ## Historical wire compatibility
 

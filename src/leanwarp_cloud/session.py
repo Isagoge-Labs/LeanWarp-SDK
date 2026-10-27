@@ -12,12 +12,22 @@ from collections.abc import Iterator, Mapping
 from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 
 from .amounts import validate_spending_cap
-from .client import OPERATION_KINDS, LeanWarpCloud, LeanWarpCloudError, OperationTimeout
+from .client import (
+    MAX_FEEDBACK_DETAILS,
+    MAX_FEEDBACK_SUMMARY,
+    MIN_FEEDBACK_SUMMARY,
+    OPERATION_KINDS,
+    FeedbackKind,
+    FeedbackSeverity,
+    LeanWarpCloud,
+    LeanWarpCloudError,
+    OperationTimeout,
+)
 from .edits import EDITING_KINDS, EditError, edited_sha256, edited_source
 from .outcome import OperationOutcome
 from .project import (
@@ -954,6 +964,47 @@ class ProjectSession:
                 result = {**result, "recovery_required": True}
             return result
 
+    def feedback(
+        self,
+        kind: FeedbackKind,
+        summary: str,
+        *,
+        details: str = "",
+        severity: FeedbackSeverity = "minor",
+        operation_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Send the LeanWarp team a report, naming this project's workspace and, unless
+        another is given, its latest operation, so the report needs no source.
+
+        It reads the journal without the project lock, so it works while another
+        command runs, and starts no compute. Over-long text is shortened, not refused.
+        """
+        summary = " ".join(summary.split())
+        if len(summary) < MIN_FEEDBACK_SUMMARY:
+            raise UsageError(f"a feedback summary needs at least {MIN_FEEDBACK_SUMMARY} characters")
+        details = details.strip()
+        shortened = len(summary) > MAX_FEEDBACK_SUMMARY or len(details) > MAX_FEEDBACK_DETAILS
+        summary = _shorten(summary, MAX_FEEDBACK_SUMMARY)
+        details = _shorten(details, MAX_FEEDBACK_DETAILS)
+        try:
+            state = self._read()
+        except (SessionError, OSError):
+            state = {}
+        workspace = state.get("workspace_id")
+        if operation_id is None and isinstance(state.get("operation_id"), str):
+            operation_id = state["operation_id"]
+        # An identifier that is not one is dropped, so the report itself still goes.
+        operation_id = _uuid(operation_id)
+        receipt = self.cloud.feedback(
+            kind,
+            summary,
+            details=details,
+            severity=severity,
+            workspace_id=_uuid(workspace),
+            operation_id=operation_id,
+        )
+        return {"recorded": True, **receipt, "operation_id": operation_id, "shortened": shortened}
+
     def reconcile(self) -> dict[str, Any]:
         """Adopt the workspace's current revision after another client changed it.
 
@@ -1270,3 +1321,14 @@ def _replace_file(path: Path, text: str, *, expected: str, recovery: Path) -> No
         if not displaced:
             (backup / "RECOVERY.txt").unlink(missing_ok=True)
             backup.rmdir()
+
+
+def _shorten(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def _uuid(value: object) -> str | None:
+    try:
+        return str(UUID(value)) if isinstance(value, str) else None
+    except ValueError:
+        return None

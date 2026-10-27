@@ -14,13 +14,14 @@ and uploads nothing.
 
 ## 1. Sign in
 
-Create an API key in the [dashboard](https://isagoge.in/dashboard), then run:
+Run:
 
 ```sh
 leanwarp auth login
 ```
 
-Paste the key at the hidden prompt. In CI or other automation, set
+It opens the [dashboard](https://isagoge.in/dashboard?section=keys) to create an
+API key (`--no-browser` only prints the link); paste the key at the hidden prompt. In CI or other automation, set
 `LEANWARP_API_KEY` from your secret manager instead. Keep keys out of source files
 and agent conversations.
 

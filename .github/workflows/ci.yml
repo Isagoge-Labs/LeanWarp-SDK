@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_call:
   workflow_dispatch:
 
 permissions:
@@ -47,7 +48,7 @@ jobs:
         if: matrix.python == '3.12'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: leanwarp-sdk-${{ github.sha }}
+          name: leanwarp-${{ github.sha }}
           path: dist/*
           if-no-files-found: error
           retention-days: 14

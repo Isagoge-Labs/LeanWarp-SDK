@@ -8,13 +8,20 @@ import json
 import sys
 from importlib.resources import files
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Any, NoReturn, get_args
 
 import httpx
 
 from . import __version__
+from .agents import AGENTS, setup
 from .amounts import usd_spending_cap
-from .client import LeanWarpCloud, LeanWarpCloudError, OperationTimeout
+from .client import (
+    FeedbackKind,
+    FeedbackSeverity,
+    LeanWarpCloud,
+    LeanWarpCloudError,
+    OperationTimeout,
+)
 from .config import credentials_path, load_client, save_credentials, signed_in
 from .endpoints import ConfigurationError
 from .outcome import OperationOutcome, reported
@@ -27,8 +34,11 @@ from .session import (
     UsageError,
     check_project,
 )
+from .updates import noted, update
 
 DEFAULT_WAIT_SECONDS = 30.0
+#: Where an account creates API keys.
+KEYS_URL = "https://isagoge.in/dashboard?section=keys"
 
 
 def _spending_cap(value: str) -> int:
@@ -106,9 +116,13 @@ def parser() -> argparse.ArgumentParser:
 
     auth = commands.add_parser("auth", help="sign in with an API key, or sign out")
     auth_commands = auth.add_subparsers(dest="auth_command", required=True, metavar="ACTION")
-    auth_commands.add_parser(
+    login = auth_commands.add_parser(
         "login",
-        help="paste an API key at a hidden prompt (in automation, set LEANWARP_API_KEY instead)",
+        help="open the dashboard's API keys, then paste a key at a hidden prompt "
+        "(in automation, set LEANWARP_API_KEY instead)",
+    )
+    login.add_argument(
+        "--no-browser", action="store_true", help="print the dashboard link without opening it"
     )
     auth_commands.add_parser(
         "logout", help="forget the saved key on this machine (revoke it in the dashboard)"
@@ -358,13 +372,73 @@ def parser() -> argparse.ArgumentParser:
         "environments", aliases=["versions"], help="list the Lean environments LeanWarp serves"
     )
     commands.add_parser("resources", help="show worker resources and pricing")
+    report = commands.add_parser(
+        "feedback",
+        help="report a confirmed problem with LeanWarp itself to the LeanWarp team "
+        "(free; names this project's latest operation)",
+    )
+    report.add_argument("--kind", required=True, choices=get_args(FeedbackKind))
+    report.add_argument(
+        "--summary", required=True, metavar="TEXT", help="one line, 8 to 200 characters"
+    )
+    report.add_argument(
+        "--details",
+        default="",
+        metavar="TEXT",
+        help="what you did, expected and got, up to 4000 characters; never the user's source",
+    )
+    report.add_argument(
+        "--severity", choices=get_args(FeedbackSeverity), default="minor", help="default: minor"
+    )
+    report.add_argument(
+        "--operation", metavar="ID", help="the operation it is about (default: the latest)"
+    )
+    install = commands.add_parser(
+        "setup",
+        help="install the LeanWarp skill and MCP server for Claude Code, Codex, Cursor and "
+        "~/.agents (no key needed)",
+    )
+    install.add_argument(
+        "--agent",
+        action="append",
+        choices=AGENTS,
+        default=[],
+        help="set up only this agent, even if it is not found (repeatable)",
+    )
+    install.add_argument("--no-mcp", action="store_true", help="install the skill only")
+    install.add_argument(
+        "--refresh",
+        action="store_true",
+        help="only replace skills setup already installed; leave MCP configuration alone",
+    )
+    commands.add_parser(
+        "update", help="upgrade leanwarp to the latest release and refresh its skills"
+    )
     skill = commands.add_parser("skill", help="print the instructions for AI agents")
     skill.add_argument("--reference", action="store_true", help="print the full reference instead")
     commands.add_parser("mcp", help="run the MCP server for this project over stdio")
     return root
 
 
+def _open_keys_page(*, browser: bool) -> None:
+    """Point the user at the page that creates keys. The prompt and messages go to
+    the terminal's stderr, keeping stdout for the one JSON result."""
+    opened = False
+    if browser:
+        import webbrowser
+
+        try:
+            opened = webbrowser.open(KEYS_URL, new=2)
+        except webbrowser.Error:
+            opened = False
+    action = "Opened" if opened else "Open"
+    sys.stderr.write(f"{action} {KEYS_URL} to create an API key, then paste it below.\n")
+
+
 def _emit(value: object) -> None:
+    # Every result, refusals included, says when the service names a newer SDK.
+    if isinstance(value, dict):
+        value = noted(value)
     sys.stdout.write(json.dumps(value, ensure_ascii=False, allow_nan=False) + "\n")
 
 
@@ -395,8 +469,8 @@ def _check_before_sign_in(root: str, environment: str | None) -> int:
         {
             **report,
             "signed_in": False,
-            "next": "create an API key at https://isagoge.in/dashboard, then run "
-            "`leanwarp auth login` and `leanwarp connect`",
+            "next": "run `leanwarp auth login` in your terminal (it opens the page that "
+            "creates an API key), then `leanwarp connect`",
         }
     )
     return 0 if report["compatible"] else 1
@@ -484,6 +558,21 @@ def main(argv: list[str] | None = None) -> int:
             plan = plan_upload(args.project)
             _emit(plan.public())
             return 1 if plan.problems else 0
+        if args.command == "setup":
+            report = setup(agents=args.agent, mcp=not args.no_mcp, refresh=args.refresh)
+            if not args.refresh:
+                report["next"] = (
+                    "restart your agent so it loads LeanWarp"
+                    if signed_in()
+                    else "run `leanwarp auth login` in your terminal, then restart your agent"
+                )
+            _emit(report)
+            unfinished = {"failed", "unreadable_config"}
+            return 2 if any(entry.get("mcp") in unfinished for entry in report["agents"]) else 0
+        if args.command == "update":
+            report = update()
+            _emit(report)
+            return 0 if report["status"] in {"updated", "current"} else 2
         if args.command == "mcp":
             from .mcp_server import serve
 
@@ -499,6 +588,7 @@ def main(argv: list[str] | None = None) -> int:
                         "auth login needs an interactive terminal; in automation, set "
                         "LEANWARP_API_KEY instead"
                     )
+                _open_keys_page(browser=not args.no_browser)
                 save_credentials(getpass.getpass("LeanWarp API key (hidden): "))
                 _emit({"status": "authenticated"})
             return 0
@@ -538,6 +628,17 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             if args.command == "delete":
                 _emit(project.delete(args.confirm))
+                return 0
+            if args.command == "feedback":
+                _emit(
+                    project.feedback(
+                        args.kind,
+                        args.summary,
+                        details=args.details,
+                        severity=args.severity,
+                        operation_id=args.operation,
+                    )
+                )
                 return 0
             if args.command == "export":
                 _emit(_export(project, args.output, args.workspace))

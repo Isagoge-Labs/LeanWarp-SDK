@@ -1,0 +1,47 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.Isagoge-Labs/leanwarp",
+  "title": "LeanWarp",
+  "description": "Check and verify Lean 4 proofs on hosted, warm Lean and Mathlib workers.",
+  "websiteUrl": "https://isagoge.in/leanwarp",
+  "repository": {
+    "url": "https://github.com/Isagoge-Labs/LeanWarp-SDK",
+    "source": "github",
+    "id": "1447677520"
+  },
+  "version": "0.2.5",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "registryBaseUrl": "https://pypi.org",
+      "identifier": "leanwarp",
+      "version": "0.2.5",
+      "runtimeHint": "uvx",
+      "transport": {
+        "type": "stdio"
+      },
+      "packageArguments": [
+        {
+          "type": "named",
+          "name": "--project",
+          "description": "Absolute path to the Lean project directory to check.",
+          "format": "filepath",
+          "isRequired": true
+        },
+        {
+          "type": "positional",
+          "value": "mcp"
+        }
+      ],
+      "environmentVariables": [
+        {
+          "name": "LEANWARP_API_KEY",
+          "description": "Your LeanWarp API key (lw_live_...), from https://isagoge.in/dashboard?section=keys.",
+          "format": "string",
+          "isRequired": true,
+          "isSecret": true
+        }
+      ]
+    }
+  ]
+}

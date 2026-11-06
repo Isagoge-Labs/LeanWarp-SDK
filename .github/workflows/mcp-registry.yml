@@ -1,0 +1,54 @@
+name: Publish LeanWarp to the MCP Registry
+
+# Lists server.json in the official MCP Registry as
+# io.github.Isagoge-Labs/leanwarp. Run it by hand only after that server.json's
+# version is on PyPI: the registry reads that release's README for its
+# `mcp-name:` marker and rejects the listing otherwise. GitHub OIDC proves
+# this repository's owner, so no registry secret exists. Never automatic.
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: mcp-registry
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      MCP_PUBLISHER_VERSION: v1.8.7
+      MCP_PUBLISHER_SHA256: 00b21004149a4ce66f0782508ae4a2bce67d1bea395a8da0bd8028159fb59579
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned registry publisher
+        run: |
+          curl --proto '=https' --tlsv1.2 --location --fail --silent --show-error \
+            --output "$RUNNER_TEMP/mcp-publisher.tar.gz" \
+            "https://github.com/modelcontextprotocol/registry/releases/download/$MCP_PUBLISHER_VERSION/mcp-publisher_linux_amd64.tar.gz"
+          printf '%s  %s\n' "$MCP_PUBLISHER_SHA256" "$RUNNER_TEMP/mcp-publisher.tar.gz" |
+            sha256sum --check --strict -
+          tar --extract --gzip --file "$RUNNER_TEMP/mcp-publisher.tar.gz" \
+            --directory "$RUNNER_TEMP" mcp-publisher
+
+      - name: Check that the listed release is on PyPI
+        run: |
+          version=$(jq --exit-status --raw-output '.version' server.json)
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --output /dev/null \
+            "https://pypi.org/pypi/leanwarp/$version/json" ||
+            { echo "::error::leanwarp $version is not on PyPI; release the SDK first"; exit 1; }
+
+      - name: Validate, authenticate and publish
+        run: |
+          "$RUNNER_TEMP/mcp-publisher" validate server.json
+          "$RUNNER_TEMP/mcp-publisher" login github-oidc
+          "$RUNNER_TEMP/mcp-publisher" publish server.json

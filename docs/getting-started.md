@@ -75,6 +75,11 @@ leanwarp connect
 Add `.leanwarp/` to `.gitignore`. It holds this project's connection.
 
 A project can upload at most 256 `.lean` files and 1 MiB in total.
+Workspaces use their environment's build settings, not your `lakefile`. If your
+project sets Lean options there, such as `maxSynthPendingDepth`, add the same
+`set_option` lines to the files that need them. Checks honour them, but fixed
+statement verification rejects `set_option`.
+
 `leanwarp files` lists what will upload. Files listed in `.gitignore` are left
 out. To leave out more, such as an archive folder, list it in
 `.leanwarpignore` in the project's root, using the same syntax as `.gitignore`

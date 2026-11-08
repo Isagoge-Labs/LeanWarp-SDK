@@ -214,8 +214,8 @@ What to read in `result.result`:
 | `suggest` | Either `status` `closed`, with `tactic`, `found_by` (when `tactic` is what a search such as `exact?` found), `verification` (`strict`, `declaration` or `partial`), `patch` (`start_utf8_offset`, `end_utf8_offset`, `replacement`), `source_sha256` and `patched_source_sha256`. Or `not_closed`, with `tried`, `candidates`, `rejected_by_recheck`, `rejections` (each closing `tactic` the recheck refused, with its `reason`, listed below) and `exhausted` (`portfolio` or `budget`). `portfolio` is `leanwarp` or `caller`. |
 | `extract_decls` | `declarations` written in the file, not those Lean generates, such as recursors. Each has `name`, `kind`, `type`, `local_dependencies`, `dependencies` (up to 128, then `dependencies_omitted`), `level_params`, `is_unsafe`, `is_partial` and the source range. `declarations_omitted` counts any beyond 512 or beyond the result's size. |
 | `sorry2lemma` | `status` (`extracted`, `partial`, `unchanged`, `no_targets` or `failed`), and `targets`, each with `declaration_name`, `generated_lemma_name` and `status`. When `source_changed`, also `transformed_source` with its `transformed_source_sha256`. Then `final_check` and, if requested, `strict_final_check`. A transformed file too large to return gives `status` `error` with `error.code` `result_too_large`. |
-| `check_files` | `status` (`ok` only when every file passed), `passed`, `failed`, and `results` in the order given. Each result has `file`, `status`, `diagnostics` and `elapsed_ms`. A file whose imports could not be prepared has `phase` `dependencies`. A file the batch's time did not reach is `not_checked`. |
-| `verify_batch` | `status` (`ok` only when every proof passed), `strict`, `passed`, `failed`, and `results` in the order given. Each result has `custom_id`, `status`, `diagnostics` and, when known, `elapsed_ms`. A proof whose imports were refused or could not be read has `phase` `dependencies`. A proof the batch's time did not reach is `not_checked`. |
+| `check_files` | `status` (`ok` only when every file passed), `passed`, `failed`, and `results` in the order given. Each result has `file`, `status`, `diagnostics` and `elapsed_ms`. A file whose imports could not be prepared has `phase` `dependencies`. A file the batch's time did not reach is `not_checked`. A file the engine could not finish has status `error` and an `error.code` starting with `engine_`; the other results still count. |
+| `verify_batch` | `status` (`ok` only when every proof passed), `strict`, `passed`, `failed`, and `results` in the order given. Each result has `custom_id`, `status`, `diagnostics` and, when known, `elapsed_ms`. A proof whose imports were refused or could not be read has `phase` `dependencies`. A proof the batch's time did not reach is `not_checked`. A proof the engine could not finish has status `error` and an `error.code` starting with `engine_`; the other results still count. |
 
 A `suggest` rejection `reason` is one of:
 
@@ -267,8 +267,9 @@ and `timing`, which says where the time went. Only the facts that apply appear.
 | `trials` | Tactic trials, counted by how they ran. `proof_state`: from Lean's captured proof state. `document_state`: replayed from the captured document. `source_recheck`: the file was rechecked with the tactic in place. `cached`: an identical earlier trial. |
 
 `timing` has `queued_ms`, `worker_ms` (getting a ready worker, including any
-start), `upload_ms` and `run_ms`. `queued_ms` is left out
-when the operation was recovered after a failed attempt. Trials also report
+start), `upload_ms` and `run_ms`. Parts of `run_ms` appear when Lean timed them:
+`elaboration_ms` (checks), and `proof_state_ms` and `tactics_ms` (tactic trials). `queued_ms` is
+left out when the operation was recovered after a failed attempt. Trials also report
 their own `execution` and `elapsed_ms`.
 
 Each result names the operation ID and source revision it belongs to. The SDK

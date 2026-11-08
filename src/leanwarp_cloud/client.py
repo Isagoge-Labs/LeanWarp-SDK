@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import time
 from collections.abc import Mapping
@@ -129,6 +131,13 @@ class LeanWarpCloud:
         self._timeout = timeout
         self.base_url = base_url.rstrip("/")
         self._owner: str | None = None
+        # Proves an account binding was made with this key at this service, so a
+        # project can trust its saved account without asking again.
+        self._binding_secret = (
+            None
+            if api_key is None
+            else hashlib.sha256(f"leanwarp-account\0{self.base_url}\0{api_key}".encode()).digest()
+        )
 
     def close(self) -> None:
         self._client.close()
@@ -146,6 +155,15 @@ class LeanWarpCloud:
         if isinstance(owner, str) and owner:
             self._owner = owner
         return account
+
+    def account_binding(self, owner_id: str) -> str | None:
+        """An HMAC binding ``owner_id`` to this key, or None without a key.
+
+        Only a holder of the key can produce it, so a saved binding cannot be forged.
+        """
+        if self._binding_secret is None:
+            return None
+        return hmac.new(self._binding_secret, owner_id.encode(), hashlib.sha256).hexdigest()
 
     def owner_id(self) -> str | None:
         """The key's account, read once: a client's key, and so its owner, never changes."""
@@ -297,6 +315,54 @@ class LeanWarpCloud:
             body=body,
             idempotency_key=idempotency_key or uuid4().hex,
             deadline=deadline,
+        )
+
+    def run(
+        self,
+        workspace_id: str,
+        kind: str,
+        *,
+        expected_revision: int,
+        payload: Mapping[str, Any],
+        files: Mapping[str, str] | None = None,
+        delete_paths: tuple[str, ...] | list[str] = (),
+        resource_profile: str | None = None,
+        timeout_seconds: int | None = None,
+        idempotency_key: str | None = None,
+        deadline: float | None = None,
+        wait_seconds: float = 0,
+    ) -> dict[str, Any]:
+        """Upload changed sources and submit an operation on the revision they create.
+
+        One request in place of ``sync_files`` and then ``submit``. The response is
+        ``{"workspace_id", "revision", "operation"}``. With ``wait_seconds`` (at most
+        20), the server holds it until the operation ends, as ``operation`` does.
+        """
+        if not 0 <= wait_seconds <= MAX_SERVER_WAIT_SECONDS:
+            raise ValueError(f"wait_seconds must be between 0 and {MAX_SERVER_WAIT_SECONDS:g}")
+        body: dict[str, Any] = {
+            "kind": kind,
+            "expected_revision": expected_revision,
+            "payload": dict(payload),
+            "files": dict(files or {}),
+            "delete_paths": list(delete_paths),
+        }
+        if resource_profile is not None:
+            body["resource_profile"] = resource_profile
+        if timeout_seconds is not None:
+            if type(timeout_seconds) is not int or not 1 <= timeout_seconds <= 600:
+                raise ValueError("timeout_seconds must be an integer between 1 and 600")
+            body["timeout_seconds"] = timeout_seconds
+        path = f"workspaces/{_segment(workspace_id)}/run"
+        if wait_seconds > 0:
+            path += f"?wait_seconds={wait_seconds:.3f}"
+        return self._request(
+            "POST",
+            path,
+            body=body,
+            idempotency_key=idempotency_key or uuid4().hex,
+            deadline=deadline,
+            hold_seconds=wait_seconds,
         )
 
     def operation(

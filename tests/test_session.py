@@ -31,6 +31,8 @@ class Service:
         self.operation: dict[str, Any] = {}
         self.lose = ""
         self.reject = False
+        # Refuse the next combined request's submission after committing its update.
+        self.reject_submission = False
         self.workspace_count = 0
         self.max_spend_microusd: int | None = None
         # Operation reads before a submitted operation completes; zero completes on submit.
@@ -80,10 +82,11 @@ class Service:
                 }
             )
             return httpx.Response(200, json=value)
-        key = request.headers.get("Idempotency-Key", "")
+        # Updates and submissions keep separate idempotency records, as the service does.
+        key = path.rsplit("/", 1)[-1] + ":" + request.headers.get("Idempotency-Key", "")
         if key in self.receipts:
             body, result = self.receipts[key]
-            assert body == request.content
+            assert body == json.loads(request.content)
             return httpx.Response(200, json=result)
         body = json.loads(request.content)
         if self.reject:
@@ -94,37 +97,59 @@ class Service:
             self.max_spend_microusd = body.get("max_spend_microusd")
             result = {"workspace_id": "w", "revision": 0}
         elif path.endswith("/files"):
-            assert body["expected_revision"] == self.revision
-            self.sources.update(body["files"])
-            for name in body["delete_paths"]:
-                del self.sources[name]
-            self.revision += 1
-            result = {"workspace_id": "w", "revision": self.revision}
+            result = self._commit(body)
+        elif path.endswith("/run"):
+            # The combined request: an update when sources changed, then the submission.
+            if body["files"] or body["delete_paths"]:
+                update = {
+                    name: body[name] for name in ("expected_revision", "files", "delete_paths")
+                }
+                self.receipts["files:" + key.split(":", 1)[1]] = update, self._commit(update)
+            if self.reject_submission:
+                self.reject_submission = False
+                return httpx.Response(409, json={"error": {"code": "operation_limit_exceeded"}})
+            body = {**body, "expected_revision": self.revision}
+            result = {
+                "workspace_id": "w",
+                "revision": self.revision,
+                "operation": self._submit(body),
+            }
         else:
             assert path.endswith("/operations")
-            assert body["expected_revision"] == self.revision
-            self.operation = {
-                "operation_id": f"op-{len(self.receipts)}",
-                "workspace_id": "w",
-                "kind": body["kind"],
-                "state": "completed",
-                "revision": self.revision,
-                "result": {
-                    "operation_id": f"op-{len(self.receipts)}",
-                    "revision": self.revision,
-                    "generation": 1,
-                    "result": self.result_for(body),
-                },
-            }
-            if self.pending_polls:
-                self._completion = self.operation
-                self.operation = {**self.operation, "state": "queued", "result": None}
-            result = self.operation
-        self.receipts[key] = request.content, result
+            result = self._submit(body)
+        self.receipts[key] = json.loads(request.content), result
         if self.lose and path.endswith(self.lose):
             self.lose = ""
             raise httpx.ReadTimeout("response lost", request=request)
         return httpx.Response(200, json=result)
+
+    def _commit(self, body: dict[str, Any]) -> dict[str, Any]:
+        assert body["expected_revision"] == self.revision
+        self.sources.update(body["files"])
+        for name in body["delete_paths"]:
+            del self.sources[name]
+        self.revision += 1
+        return {"workspace_id": "w", "revision": self.revision}
+
+    def _submit(self, body: dict[str, Any]) -> dict[str, Any]:
+        assert body["expected_revision"] == self.revision
+        self.operation = {
+            "operation_id": f"op-{len(self.receipts)}",
+            "workspace_id": "w",
+            "kind": body["kind"],
+            "state": "completed",
+            "revision": self.revision,
+            "result": {
+                "operation_id": f"op-{len(self.receipts)}",
+                "revision": self.revision,
+                "generation": 1,
+                "result": self.result_for(body),
+            },
+        }
+        if self.pending_polls:
+            self._completion = self.operation
+            self.operation = {**self.operation, "state": "queued", "result": None}
+        return self.operation
 
 
 @pytest.fixture
@@ -142,7 +167,7 @@ def project(tmp_path: Path):
         yield tmp_path, service, cloud, ProjectSession(cloud, tmp_path)
 
 
-@pytest.mark.parametrize("kind", ["workspaces", "files", "operations"])
+@pytest.mark.parametrize("kind", ["workspaces", "files", "operations", "run"])
 def test_lost_response_recovers_exact_intent_after_restart(project, kind):
     root, service, cloud, session = project
     if kind != "workspaces":
@@ -171,11 +196,14 @@ def test_lost_response_recovers_exact_intent_after_restart(project, kind):
     with pytest.raises(SessionError, match="recover"):
         resumed.submit("check", {"file": "Main.lean"})
     count = len(service.receipts)
-    resumed.recover()
+    recovered = resumed.recover()
     assert len(service.receipts) == count
+    if kind in {"operations", "run"}:
+        # A recovered submission is its operation, however it was sent.
+        assert recovered["operation_id"] == service.operation["operation_id"]
     assert service.workspace_count == 1
     assert json.loads((root / ".leanwarp/session.json").read_text())["pending"] is None
-    if kind == "files":
+    if kind in {"files", "run"}:
         assert "True" in service.sources["Main.lean"]
         resumed.sync()
         assert "False" in service.sources["Main.lean"]
@@ -218,8 +246,8 @@ def test_pending_request_owns_nested_payload_and_recovers_exact_snapshot(project
         session.submit("try_tactics", {"file": "Main.lean", "tactics": tactics})
     pending = json.loads((root / ".leanwarp/session.json").read_text())["pending"]
     assert pending["arguments"]["payload"]["tactics"] == ["simp"]
-    wire, _ = service.receipts[pending["idempotency_key"]]
-    assert json.loads(wire)["payload"] == pending["arguments"]["payload"]
+    wire, _ = service.receipts["operations:" + pending["idempotency_key"]]
+    assert wire["payload"] == pending["arguments"]["payload"]
     count = len(service.receipts)
     ProjectSession(cloud, root).recover()
     assert len(service.receipts) == count
@@ -402,7 +430,7 @@ def test_submit_and_wait_returns_running_work_without_losing_the_submission(proj
     service.pending_polls = 1_000
     pending = session.submit_and_wait("check", {"file": "Main.lean"}, wait_seconds=0.05)
     assert pending["state"] == "queued" and pending["result"] is None
-    submissions = [r for r in service.requests if r.url.path.endswith("/operations")]
+    submissions = [r for r in service.requests if r.url.path.endswith(("/operations", "/run"))]
     assert len(submissions) == 1
     service.pending_polls = 1
     completed = ProjectSession(cloud, root).wait(timeout=1)
@@ -932,7 +960,7 @@ class SharedWorkspace(Service):
         if path.endswith("/stop"):
             self.requests.append(request)
             return httpx.Response(200, json={"workspace_id": "w", "state": "stopped"})
-        if path.endswith("/operations") and self.denied_submissions:
+        if path.endswith(("/operations", "/run")) and self.denied_submissions:
             self.denied_submissions -= 1
             self.requests.append(request)
             return httpx.Response(
@@ -1868,3 +1896,94 @@ def test_history_refuses_repeated_cursor_before_yielding_duplicate_page(account,
     with pytest.raises(SessionError, match="repeated a cursor"):
         next(history)
     assert calls == [None, "same"]
+
+
+def _sent(service: Service, since: int) -> list[tuple[str, str]]:
+    return [(r.method, r.url.path.rsplit("/", 1)[-1]) for r in service.requests[since:]]
+
+
+def test_changed_sources_travel_with_their_operation_in_one_request(project):
+    root, service, _, session = project
+    session.connect()
+    before = len(service.requests)
+    session.submit_and_wait("check", {"file": "Main.lean"}, wait_seconds=5)
+    # The operation completed on submission, so nothing is read afterwards.
+    assert _sent(service, before) == [("POST", "run")]
+    assert "True" in service.sources["Main.lean"]
+    (root / "Main.lean").write_text("theorem candidate : False := by sorry\n")
+    before = len(service.requests)
+    session.submit_and_wait("check", {"file": "Main.lean"}, wait_seconds=5)
+    # The previous operation is known to have finished, so it is not read again.
+    assert _sent(service, before) == [("POST", "run")]
+    assert "False" in service.sources["Main.lean"]
+    before = len(service.requests)
+    session.submit_and_wait("check", {"file": "Main.lean"}, wait_seconds=5)
+    assert _sent(service, before) == [("POST", "operations")]
+
+
+def test_an_unfinished_previous_operation_is_still_read_before_submitting(project):
+    root, service, cloud, session = project
+    session.connect()
+    service.pending_polls = 1_000
+    session.submit_and_wait("check", {"file": "Main.lean"}, wait_seconds=0)
+    before = len(service.requests)
+    with pytest.raises(SessionError, match="still running"):
+        ProjectSession(cloud, root).submit("check", {"file": "Main.lean"})
+    assert _sent(service, before) == [("GET", service.operation["operation_id"])]
+
+
+def test_a_new_client_with_the_same_key_reuses_the_saved_account(project):
+    root, service, _, session = project
+    session.connect()
+    session.submit("check", {"file": "Main.lean"})
+    reads = sum(r.url.path.endswith("/account") for r in service.requests)
+    for key, expected in (("secret", reads), ("another", reads + 1)):
+        with LeanWarpCloud(
+            key,
+            base_url="https://api.example",
+            retries=0,
+            transport=httpx.MockTransport(service.handle),
+        ) as cloud:
+            ProjectSession(cloud, root).status()
+        assert sum(r.url.path.endswith("/account") for r in service.requests) == expected
+    cache = root / ".leanwarp/cache.json"
+    assert "secret" not in cache.read_text()
+    # A damaged cache only costs the read it would have saved.
+    for damaged in ("{", '{"account": "\u00e9"}', '{"account": 7}'):
+        cache.write_text(damaged)
+        ProjectSession(session.cloud, root).status()
+
+
+def test_a_refused_submission_keeps_the_sources_its_request_committed(project):
+    _, service, _, session = project
+    session.connect()
+    service.reject_submission = True
+    with pytest.raises(LeanWarpCloudError):
+        session.submit("check", {"file": "Main.lean"})
+    journal = json.loads(session.path.read_text())
+    assert journal["pending"] is None
+    assert journal["revision"] == service.revision == 1
+    # The next submission builds on that revision instead of conflicting with it.
+    before = len(service.requests)
+    assert session.submit("check", {"file": "Main.lean"})["revision"] == 1
+    assert _sent(service, before) == [("POST", "operations")]
+
+
+def test_an_interrupted_settlement_of_a_refused_submission_stays_recoverable(project, monkeypatch):
+    root, service, cloud, session = project
+    session.connect()
+    service.reject_submission = True
+    sync = cloud.sync_files
+
+    def interrupted(**arguments):
+        monkeypatch.setattr(cloud, "sync_files", sync)
+        raise httpx.ConnectError("connection reset")
+
+    monkeypatch.setattr(cloud, "sync_files", interrupted)
+    with pytest.raises(LeanWarpCloudError):
+        session.submit("check", {"file": "Main.lean"})
+    # The committed update is still recorded, not forgotten with the refusal.
+    assert json.loads(session.path.read_text())["pending"]["method"] == "sync_files"
+    ProjectSession(cloud, root).recover()
+    journal = json.loads(session.path.read_text())
+    assert journal["pending"] is None and journal["revision"] == service.revision == 1

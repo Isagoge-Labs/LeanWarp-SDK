@@ -28,6 +28,16 @@ Authorization: Bearer lw_live_…
    quickly.
 6. `POST /workspaces/{workspace_id}/stop` stops the worker.
 
+Steps 3 to 5 can be one request: `POST /workspaces/{workspace_id}/run` takes the
+files to upload or delete (`files`, `delete_paths`) with the operation (`kind`,
+`payload`, and optionally `resource_profile` and `timeout_seconds`). It returns
+the new `revision` and the `operation`. Add `?wait_seconds=20` to hold it until
+the operation ends. One `Idempotency-Key` covers the upload and the operation;
+resending replays whichever already happened. Use a new key for each different
+request: the upload commits first, so files sent under a key already used for
+another operation are committed before that conflict is reported. Uploading
+needs write permission as well as execute. Without files it only submits.
+
 ```sh
 curl -s https://api.isagoge.in/v1/leanwarp/workspaces/$WORKSPACE/operations \
   -H "Authorization: Bearer $LEANWARP_API_KEY" \
@@ -49,6 +59,7 @@ curl -s https://api.isagoge.in/v1/leanwarp/workspaces/$WORKSPACE/operations \
 | `GET` | `/workspaces/{workspace_id}/files` | read | The current revision and each file's SHA-256, without contents. |
 | `PUT` | `/workspaces/{workspace_id}/files` | write | Upload or delete files. Returns the new revision. |
 | `POST` | `/workspaces/{workspace_id}/operations` | execute | Submit an operation. See [Operations](#operations). |
+| `POST` | `/workspaces/{workspace_id}/run` | execute, and write to upload | Upload files and submit an operation on the new revision. `?wait_seconds=N` waits up to 20 seconds for it to end. |
 | `GET` | `/workspaces/{workspace_id}/operations` | read | Stored operations with results, newest first. See below. |
 | `GET` | `/workspaces/{workspace_id}/usage` | read | Each history limit's `used` and the account's `limit`. |
 | `GET` | `/operations/{operation_id}` | read | An operation's state and result. `?wait_seconds=N` waits up to 20 seconds for it to end. |
@@ -83,12 +94,18 @@ start at 1.
 | `suggest` | `file`, `line`, `column`. Optional `tactics` (1 to 32) to use instead of LeanWarp's portfolio, and `timeout_ms` per tactic (learned budgets by default). |
 | `extract_decls` | `file`. |
 | `sorry2lemma` | `file`, `max_extractions` (1 to 256, default 64), optional `name_prefix`, `strict_final_check` (default `false`). |
-| `check_files` | `files` (1 to 64 distinct paths), `strict` (default `true`), optional `timeout` seconds per file (1 to 300). |
-| `verify_batch` | `codes`: 1 to 64 objects `{"custom_id", "proof"}`. Each `custom_id` is unique and 1 to 128 characters, without control characters. Proofs must not be blank. The payload is at most 256 KiB of UTF-8. Also `strict` (default `true`) and optional `timeout` seconds per proof (1 to 300). The proofs run in the workspace's environment. They may import its packages, such as Mathlib, but not the workspace's own modules. Such a proof is refused with `error.code` `unsupported_import`. |
+| `check_files` | `files` (1 to 64 distinct paths), `strict` (default `true`), optional `timeout` seconds per file (1 to 300), which starts once the file's imports have loaded, except in a file using `native_decide`. |
+| `verify_batch` | `codes`: 1 to 64 objects `{"custom_id", "proof"}`. Each `custom_id` is unique and 1 to 128 characters, without control characters. Proofs must not be blank. The payload is at most 256 KiB of UTF-8. Also `strict` (default `true`) and optional `timeout` seconds per proof (1 to 300), which starts once the proof's imports have loaded, except in a proof using `native_decide`. The proofs run in the workspace's environment. They may import its packages, such as Mathlib, but not the workspace's own modules. Such a proof is refused with `error.code` `unsupported_import`. |
 
 `suggest`, `check_files` and `verify_batch` stop starting new work after four
 minutes. Their default `timeout_seconds` is 600, enough for the work still in
-flight to finish. A lower `timeout_seconds` ends the operation when it expires.
+flight to finish. A lower `timeout_seconds` stops starting new work ten seconds
+before it expires, or halfway through a limit under 20 seconds, so finished
+results still return. With a limit of one or two seconds, `check_files` and
+`verify_batch` run at most one source. Any they do not reach are `not_checked`.
+
+`native_decide` runs in its own fresh Lean process, so a source that uses it
+loads its imports again within its `timeout`. Allow for that when setting one.
 
 ### Applying an edit
 
@@ -239,8 +256,11 @@ operation's own fields are under `result.result`, and the
 [reference](../src/leanwarp_cloud/skills/leanwarp/references/usage.md#results)
 lists them. Completed operations also have `execution`, which says which worker
 ran them and what was reused, and `timing`, with `queued_ms`, `worker_ms`,
-`upload_ms` and `run_ms`. After dispatch recovery, `queued_ms` is absent rather
-than an estimate of earlier attempts. Clients should tolerate absent timing.
+`upload_ms` and `run_ms`. Parts of `run_ms` appear when Lean timed them:
+`elaboration_ms` (checks: importing and checking the file), `proof_state_ms` and
+`tactics_ms` (tactic trials: capturing the proof state, then running the
+tactics). After dispatch recovery, `queued_ms` is absent rather than an estimate
+of earlier attempts. Clients should tolerate absent timing.
 
 A failure to prepare dependencies is also a completed receipt, for any operation
 kind. It has `status: error`, `diagnostics` explaining the failure, and

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -44,6 +45,7 @@ from .project import (
 from .resources import published_worker_resources
 
 _MAX_JOURNAL_BYTES = 8 * 1024 * 1024
+_MAX_CACHE_BYTES = 4096
 _TERMINAL_STATES = frozenset({"completed", "failed", "cancelled"})
 # Account overrides allow 100,000 retained operations. A byte-bounded page may
 # hold only one; allow the full history while still bounding a broken server.
@@ -92,6 +94,8 @@ class ProjectSession:
         # Which files the latest operation was asked about. It lives beside the
         # journal, not in it, so clients that predate it still read the journal.
         self.submitted = self.directory / "operation.json"
+        # Saves requests only; see `_cached`.
+        self.cache = self.directory / "cache.json"
 
     @contextmanager
     def _locked(self) -> Iterator[dict[str, Any]]:
@@ -111,6 +115,18 @@ class ProjectSession:
                     "another LeanWarp command is using this project; let it finish"
                 ) from error
             state = self._read()
+            # A key belongs to one account. A binding this key made to the saved
+            # account needs no request; otherwise the account is read and compared.
+            saved = state.get("owner_id")
+            binding = getattr(self.cloud, "account_binding", None)
+            if (
+                isinstance(saved, str)
+                and binding is not None
+                and (proof := binding(saved)) is not None
+                and hmac.compare_digest(str(self._cached("account")).encode(), proof.encode())
+            ):
+                yield state
+                return
             owner = self.cloud.owner_id()
             if not isinstance(owner, str) or not owner:
                 raise SessionError("API returned an invalid account identity")
@@ -120,6 +136,8 @@ class ProjectSession:
                     "from that account"
                 )
             state["owner_id"] = owner
+            if binding is not None and (proof := binding(owner)) is not None:
+                self._cache("account", proof)
             yield state
         finally:
             os.close(fd)
@@ -163,6 +181,27 @@ class ProjectSession:
             )
         _validate_journal(state)
         return state
+
+    def _cached(self, name: str) -> Any:
+        """A value saved by `_cache`, or None. The cache only saves requests: a
+        missing, foreign or damaged one is ignored, and older SDKs never read it."""
+        try:
+            fd = os.open(self.cache, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except OSError:
+            return None
+        with os.fdopen(fd, "rb") as stream:
+            raw = stream.read(_MAX_CACHE_BYTES + 1) if stat.S_ISREG(os.fstat(fd).st_mode) else b""
+        try:
+            cache = json.loads(raw) if len(raw) <= _MAX_CACHE_BYTES else None
+        except ValueError:
+            return None
+        return cache.get(name) if isinstance(cache, dict) else None
+
+    def _cache(self, name: str, value: Any) -> None:
+        cache = {key: self._cached(key) for key in ("account", "finished_operation") if key != name}
+        cache[name] = value
+        with suppress(OSError):
+            self._write(self.cache, json.dumps(cache, ensure_ascii=False).encode("utf-8"))
 
     def _save(self, state: dict[str, Any]) -> None:
         # Never persist an intent that recovery cannot read. Validation happens
@@ -578,6 +617,13 @@ class ProjectSession:
             return self._sync(state)
 
     def _sync(self, state: dict[str, Any]) -> dict[str, Any]:
+        update, hashes = self._source_update(state)
+        if update is None:
+            return {"workspace_id": self._workspace(state), "revision": state["revision"]}
+        return self._request(state, "sync_files", update, hashes=hashes)
+
+    def _source_update(self, state: dict[str, Any]) -> tuple[dict[str, Any] | None, dict[str, str]]:
+        """The update this project's sources need, or None, and every source's hash."""
         _check_apply_recovery(self.directory)
         workspace = self._workspace(state)
         self._environment(state)
@@ -588,18 +634,13 @@ class ProjectSession:
         }
         deleted = sorted(set(state["files"]) - set(sources))
         if not files and not deleted:
-            return {"workspace_id": workspace, "revision": state["revision"]}
-        return self._request(
-            state,
-            "sync_files",
-            {
-                "workspace_id": workspace,
-                "expected_revision": state["revision"],
-                "files": files,
-                "delete_paths": deleted,
-            },
-            hashes=hashes,
-        )
+            return None, hashes
+        return {
+            "workspace_id": workspace,
+            "expected_revision": state["revision"],
+            "files": files,
+            "delete_paths": deleted,
+        }, hashes
 
     def submit(
         self,
@@ -621,14 +662,18 @@ class ProjectSession:
         json.dumps(dict(payload), allow_nan=False)
         with self._locked() as state:
             self._ready(state)
-            if state.get("operation_id"):
+            # A finished operation never runs again, so only an unfinished one is read.
+            if (
+                state.get("operation_id")
+                and self._cached("finished_operation") != state["operation_id"]
+            ):
                 previous = self._previous_operation(state)
                 if previous is not None and previous.get("state") not in _TERMINAL_STATES:
                     raise SessionError(
                         "the previous operation is still running; run `leanwarp wait` or "
                         "`leanwarp cancel` first"
                     )
-            self._sync(state)
+            update, hashes = self._source_update(state)
             body: dict[str, Any] = {
                 "workspace_id": self._workspace(state),
                 "kind": kind,
@@ -639,7 +684,10 @@ class ProjectSession:
                 body["resource_profile"] = resource_profile
             if timeout_seconds is not None:
                 body["timeout_seconds"] = timeout_seconds
-            return self._request(state, "submit", body)
+            if update is None:
+                return self._request(state, "submit", body)
+            # Changed sources travel with the operation: one request, not two.
+            return self._request(state, "run", {**update, **body}, hashes=hashes)
 
     def submit_and_wait(
         self,
@@ -669,6 +717,7 @@ class ProjectSession:
             kind, payload, resource_profile=resource_profile, timeout_seconds=timeout_seconds
         )
         if wait_seconds == 0 or operation.get("state") in _TERMINAL_STATES:
+            self._note_finished(operation)
             return operation
         submitted = {
             "operation_id": operation["operation_id"],
@@ -682,7 +731,18 @@ class ProjectSession:
             latest = error.operation or operation
         except (httpx.TransportError, LeanWarpCloudError):
             latest = operation
-        return self._checked_operation(submitted, latest)
+        latest = self._checked_operation(submitted, latest)
+        self._note_finished(latest)
+        return latest
+
+    def _note_finished(self, operation: Mapping[str, Any]) -> None:
+        """Remember a finished operation so the next submission need not read it.
+
+        It names the operation, so it applies only while that operation is this
+        project's latest; an operation never runs again once it has finished.
+        """
+        if operation.get("state") in _TERMINAL_STATES:
+            self._cache("finished_operation", operation.get("operation_id"))
 
     def _request(
         self,
@@ -708,7 +768,7 @@ class ProjectSession:
         pending = state["pending"]
         if (
             not isinstance(pending, dict)
-            or pending.get("method") not in {"create_workspace", "sync_files", "submit"}
+            or pending.get("method") not in {"create_workspace", "sync_files", "submit", "run"}
             or not isinstance(pending.get("arguments"), dict)
             or not isinstance(pending.get("idempotency_key"), str)
         ):
@@ -732,12 +792,17 @@ class ProjectSession:
             # Definite rejection has no accepted effect. Auth/transient/ambiguous
             # errors keep the intent recoverable, including a rotated key later.
             if error.status_code in {400, 404, 409, 413, 422}:
-                state["pending"] = None
-                self._save(state)
+                if method == "run":
+                    self._settle_rejected_run(state, pending)
+                else:
+                    state["pending"] = None
+                    self._save(state)
             raise
+        if method == "run":
+            result = self._ran_operation(pending, result)
         # A successful but malformed response is still an uncertain request.
         # Preserve the exact journal and idempotency key for recovery.
-        identifier = "operation_id" if method == "submit" else "workspace_id"
+        identifier = "operation_id" if method in {"submit", "run"} else "workspace_id"
         if (
             not isinstance(result.get(identifier), str)
             or not 0 < len(result[identifier]) <= 256
@@ -753,6 +818,7 @@ class ProjectSession:
                     or result.get("kind") != pending["arguments"]["kind"]
                 )
             )
+            or (method == "run" and result.get("kind") != pending["arguments"]["kind"])
         ):
             raise SessionError("LeanWarp's response was incomplete; run `leanwarp recover`")
         if method == "create_workspace":
@@ -762,9 +828,12 @@ class ProjectSession:
             state["revision"] = result["revision"]
             state["files"] = pending["hashes"]
         else:
+            if method == "run":
+                state["revision"] = result["revision"]
+                state["files"] = pending["hashes"]
             state["operation_id"] = result["operation_id"]
             state["operation_revision"] = result["revision"]
-        if method == "submit":
+        if method in {"submit", "run"}:
             payload = pending["arguments"]["payload"]
             files = payload.get("files") if isinstance(payload.get("files"), list) else None
             # Inline proofs (verify_batch) name no source file.
@@ -777,6 +846,47 @@ class ProjectSession:
         state["pending"] = None
         self._save(state)
         return result
+
+    @staticmethod
+    def _ran_operation(pending: Mapping[str, Any], result: Mapping[str, Any]) -> dict[str, Any]:
+        """The operation a combined request submitted, checked against its revision.
+
+        Anything malformed is returned as an empty operation, which the caller's
+        identity check reports as an uncertain request to recover.
+        """
+        operation = result.get("operation")
+        if (
+            result.get("workspace_id") != pending["arguments"]["workspace_id"]
+            or type(result.get("revision")) is not int
+            or not isinstance(operation, dict)
+            or operation.get("revision") != result["revision"]
+            or operation.get("workspace_id") != result["workspace_id"]
+        ):
+            return {}
+        return operation
+
+    def _settle_rejected_run(self, state: dict[str, Any], pending: Mapping[str, Any]) -> None:
+        """Learn whether a rejected combined request committed its sources.
+
+        The update commits before the submission, so a rejected submission can
+        follow a committed update. Replaying the update under the same key returns
+        that commit, or makes it, as a separate sync would have; either way the
+        project's revision then matches the service's. The update replaces the
+        rejected intent in one save, so an interruption leaves it to recover.
+        """
+        arguments = pending["arguments"]
+        state["pending"] = {
+            "method": "sync_files",
+            "arguments": {
+                key: arguments[key]
+                for key in ("workspace_id", "expected_revision", "files", "delete_paths")
+            },
+            "idempotency_key": pending["idempotency_key"],
+            "hashes": pending["hashes"],
+        }
+        self._save(state)
+        with suppress(LeanWarpCloudError, httpx.TransportError, SessionError):
+            self._replay(state)
 
     def _submitted_sources(self, operation_id: str) -> list[str]:
         """The files this project asked the operation about, or none if unknown."""
@@ -840,11 +950,13 @@ class ProjectSession:
                 raise SessionError("this project has not submitted an operation")
         # Do not hold the project lock while polling; another process may cancel.
         try:
-            return self._checked_operation(state, self.cloud.wait(operation, timeout=timeout))
+            latest = self._checked_operation(state, self.cloud.wait(operation, timeout=timeout))
         except LeanWarpCloudError as error:
             if error.status_code == 404 and error.code == "not_found":
                 raise SessionError(_OPERATION_EXPIRED) from error
             raise
+        self._note_finished(latest)
+        return latest
 
     def cancel(self) -> dict[str, Any]:
         with self._locked() as state:
@@ -1131,7 +1243,7 @@ def _validate_journal(state: dict[str, Any]) -> None:
             method, args, key = pending["method"], pending["arguments"], pending["idempotency_key"]
             valid = (
                 isinstance(method, str)
-                and method in {"create_workspace", "sync_files", "submit"}
+                and method in {"create_workspace", "sync_files", "submit", "run"}
                 and isinstance(args, dict)
                 and isinstance(key, str)
                 and len(key) == 32
@@ -1164,33 +1276,31 @@ def _validate_journal(state: dict[str, Any]) -> None:
                 and text(args.get("workspace_id"))
                 and revision(args.get("expected_revision"))
             )
-            if method == "sync_files":
+            update = {"files", "delete_paths"}
+            submission = {"kind", "payload", "resource_profile", "timeout_seconds"}
+            if method in {"sync_files", "run"}:
                 valid = (
                     valid
-                    and set(args) == {"workspace_id", "expected_revision", "files", "delete_paths"}
+                    and update.issubset(args)
                     and isinstance(args["files"], dict)
                     and all(text(k) and isinstance(v, str) for k, v in args["files"].items())
                     and isinstance(args["delete_paths"], list)
                     and all(map(text, args["delete_paths"]))
                     and hashes(pending["hashes"])
                 )
+            if method == "sync_files":
+                valid = valid and set(args) == {"workspace_id", "expected_revision", *update}
             else:
                 valid = (
                     valid
                     and set(args).issubset(
-                        {
-                            "workspace_id",
-                            "kind",
-                            "expected_revision",
-                            "payload",
-                            "resource_profile",
-                            "timeout_seconds",
-                        }
+                        {"workspace_id", "expected_revision", *submission}
+                        | (update if method == "run" else set())
                     )
                     and isinstance(args.get("kind"), str)
                     and _OPERATION_KIND.fullmatch(args["kind"]) is not None
                     and isinstance(args.get("payload"), dict)
-                    and pending["hashes"] is None
+                    and (method == "run" or pending["hashes"] is None)
                     and (
                         "timeout_seconds" not in args
                         or (

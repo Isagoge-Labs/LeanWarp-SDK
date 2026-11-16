@@ -1,8 +1,13 @@
 # Getting started
 
 This guide takes you from an API key to a verified proof in a few minutes. You
-need the `leanwarp` command ([install](../README.md#install)), but you don't need
-Lean on your machine.
+need the `leanwarp` command, but you don't need Lean on your machine. Install it
+with [uv](https://docs.astral.sh/uv/getting-started/installation/), on Linux,
+macOS or WSL with Python 3.10 to 3.14:
+
+```sh
+uv tool install leanwarp && leanwarp setup
+```
 
 If your shell can't find `leanwarp` after you install it, run
 `uv tool update-shell` and open a new terminal.
@@ -75,10 +80,15 @@ leanwarp connect
 Add `.leanwarp/` to `.gitignore`. It holds this project's connection.
 
 A project can upload at most 256 `.lean` files and 1 MiB in total.
-Workspaces use their environment's build settings, not your `lakefile`. If your
-project sets Lean options there, such as `maxSynthPendingDepth`, add the same
-`set_option` lines to the files that need them. Checks honour them, but fixed
-statement verification rejects `set_option`.
+The Lean options your `lakefile` sets, such as `maxSynthPendingDepth`, apply to
+every check and verification, as Lake would apply them. Options that could weaken
+checking, such as `debug.*` and `warn.sorry`, are not applied: `leanwarp status`
+lists them under `lean_options_ignored`. LeanWarp checks every file with one set
+of options, so an option that only some of your libraries or executables set, or
+that they set differently, is listed there too instead of reaching the others. A `lakefile.lean`
+must write its options as literal lists, or definitions of them, because LeanWarp
+never runs it. If LeanWarp cannot read every option the lakefile sets, including a
+`-D` argument in `moreLeanArgs`, it applies none and lists `leanOptions` there.
 
 `leanwarp files` lists what will upload. Files listed in `.gitignore` are left
 out. To leave out more, such as an archive folder, list it in
@@ -118,6 +128,7 @@ waits up to 30 seconds and prints the result. A shortened example:
 ```json
 {
   "success": true,
+  "decided": true,
   "kind": "verify_target",
   "state": "completed",
   "revision": 1,
@@ -126,7 +137,7 @@ waits up to 30 seconds and prints the result. A shortened example:
       "file": "LeanWarpExample.lean",
       "status": "ok",
       "receipt": {
-        "policy": "fixed_target_kernel_check_v1",
+        "policy": "fixed_target_kernel_check_v2",
         "candidate_declaration": "add_zero_example"
       }
     }
@@ -140,6 +151,10 @@ How to read it:
 
 - `success` is `true` when the check passed or the proof was verified, and
   `false` when it wasn't. Lean's messages are in `result.result`.
+- `decided` is `false` when there was no verdict: the check timed out
+  (`timeout`), LeanWarp could not complete it (`infrastructure_failure`) or it
+  was not checked (`not_checked`). The exit code is then `4`: run it again rather
+  than changing the proof. A wrong proof is `decided: true` with exit code `1`.
 - If the command takes longer than the wait, `success` is `null` and the exit
   code is `3`. Run `leanwarp wait` to get the result. Don't run the command
   again.
@@ -178,9 +193,10 @@ leanwarp verify SqNonneg.lean --declaration sq_nonneg_example \
 ```
 
 LeanWarp reads the statement on its own, with only that context, and checks the
-proof against it with Lean's kernel. So the proof can't change what the
-statement means. Proofs that use `sorry`, `admit`, `native_decide`,
-`set_option`, custom elaborators or new axioms are rejected.
+proof against it with Lean's kernel, in a separate checker that never runs your
+source. So the proof can't change what the statement means. The context may
+import only the environment's packages, such as Mathlib. Proofs that use
+`sorry`, `admit`, `native_decide` or new axioms are rejected.
 
 ## 5. Stop the worker
 
@@ -194,6 +210,46 @@ included, so stop it when you're done. Closing your terminal does not stop it.
 
 Stopping keeps your uploaded files and results in the workspace. The next
 command starts a new worker.
+
+## 6. Check a project in CI
+
+Three commands check every file in a fresh checkout and leave nothing behind:
+
+- `leanwarp connect --ephemeral` creates a workspace for this run alone.
+- `leanwarp check --all` checks every file that uploads, strictly, in as many
+  batches of 64 as it needs, and prints one result. It waits until the last
+  batch finishes; its exit code is `0` if every file passed, `1` if any failed,
+  `4` if a file was left without a verdict (timed out or not completed), and `3`
+  if the work outlived the wait.
+- `leanwarp stop --delete` stops the worker, cancels any running operation, then
+  deletes the workspace and its results. It deletes only the workspace that
+  `--ephemeral` created. If a request whose response was lost cannot be resent,
+  it leaves the workspace stopped, keeps the request for `leanwarp recover`, and
+  exits `2`; `errors` says which step failed.
+
+A GitHub Actions job, with your key saved as the secret `LEANWARP_API_KEY`:
+
+```yaml
+jobs:
+  lean:
+    runs-on: ubuntu-latest
+    env:
+      LEANWARP_API_KEY: ${{ secrets.LEANWARP_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv tool install leanwarp
+      - run: leanwarp connect --ephemeral --max-spend 1
+      - run: leanwarp check --all
+      - if: always()
+        run: leanwarp stop --delete
+```
+
+Any other operation takes `--block` to wait until it finishes in the same way,
+for example `leanwarp verify Main.lean --declaration NAME --target '…' --block`,
+and so does `leanwarp wait --block`. A blocking wait ends at the operation's
+`--execution-timeout` (600 seconds unless you set one) plus five minutes to start
+a worker.
 
 Next: [set up an agent](agents.md), or read the
 [reference](../src/leanwarp_cloud/skills/leanwarp/references/usage.md) for every

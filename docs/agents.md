@@ -11,7 +11,7 @@ Lean project the agent may work in.
 leanwarp setup
 ```
 
-This does two things for each agent it finds:
+This does two things for each agent installed on this machine:
 
 - It installs the LeanWarp skill: the instructions an agent follows. It goes in
   `~/.claude/skills` for Claude Code, `~/.codex/skills` for Codex and
@@ -19,9 +19,14 @@ This does two things for each agent it finds:
 - It adds the MCP server to Claude Code (with `claude mcp add`), Codex
   (`~/.codex/config.toml`) and Cursor (`~/.cursor/mcp.json`).
 
-Setup only touches agents whose configuration folder already exists. Use
-`--agent NAME` to set up one anyway, or `--no-mcp` to install only the skills.
-It never replaces an existing `leanwarp` MCP entry.
+Setup only touches agents whose configuration folder already exists, `~/.agents`
+included. Use `--agent NAME` to set up one anyway, or `--no-mcp` to install only
+the skills. It never replaces your own skill file or an existing `leanwarp` MCP
+entry; a skill file it leaves is listed under `skill_files_left`.
+
+`leanwarp setup --remove` undoes what setup added, and only what is still exactly
+as setup wrote it; anything you have changed since stays and is reported. Add
+`--agent NAME` to remove one agent's.
 
 Then run `leanwarp auth login` yourself and restart the agent. Later,
 `leanwarp update` upgrades the command and refreshes the installed skills.
@@ -41,7 +46,9 @@ a key or costs anything.
 
 The skill also asks the agent to report real problems with LeanWarp itself
 through `leanwarp feedback`, and to tell you when it does. A report names the
-command that went wrong; it doesn't quote your source.
+command that went wrong; it doesn't quote your source. To turn reports off, set
+`LEANWARP_FEEDBACK=off` in the agent's environment: the command then sends
+nothing and the MCP server offers no `feedback` tool.
 
 Sign in yourself with `leanwarp auth login`, or give the agent's environment a
 `LEANWARP_API_KEY`. Never put the key in the instruction.
@@ -53,8 +60,9 @@ The command line is built for agents:
 - Proof commands print a JSON result with `success`: `true`, `false`, or `null`
   while the operation is still running. On `null`, run `leanwarp wait` for the
   same operation; don't submit it again.
-- Exit codes tell apart "did not pass" (`1`), "could not run" (`2`) and "still
-  running" (`3`).
+- Exit codes tell apart "did not pass" (`1`), "could not run" (`2`), "still
+  running" (`3`) and "no verdict" (`4`: the check timed out or could not be
+  completed; retry it instead of changing the proof).
 
 For an agent that `leanwarp setup` doesn't know, point its skill installer at
 the [skill folder](../src/leanwarp_cloud/skills/leanwarp), including
@@ -105,7 +113,11 @@ The agent should first read the resources `leanwarp://guide` and
 
 The [MCP reference](../src/leanwarp_cloud/skills/leanwarp/references/usage.md#mcp)
 lists every tool and its arguments. Proof tools wait up to 20 seconds for their
-result by default; set `wait_seconds` up to 40.
+result by default; set `wait_seconds` up to 40. Every operation tool returns its
+`operation_id`, and `wait`, `status` and `cancel` accept one, so an agent can run
+tools in parallel: they take turns on the project. Results are compact, with
+errors first and `omitted` counting what was left out; `detail: "full"` returns
+everything.
 
 ### Spending caps
 

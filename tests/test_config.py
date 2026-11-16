@@ -222,7 +222,7 @@ def test_failed_login_preserves_previous_credentials(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("origin", [None, TEST_ORIGIN])
-def test_legacy_staging_credentials_remain_usable_without_url_input(tmp_path, monkeypatch, origin):
+def test_untagged_credentials_remain_usable_without_url_input(tmp_path, monkeypatch, origin):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
     monkeypatch.delenv("LEANWARP_API_KEY", raising=False)
     path = config.credentials_path()

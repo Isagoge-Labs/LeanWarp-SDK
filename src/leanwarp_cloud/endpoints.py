@@ -6,6 +6,8 @@ import os
 import re
 from urllib.parse import urlparse
 
+from .errors import ConfigurationError
+
 #: Names the test service's origin. Only test keys read it; live keys never do.
 TEST_ORIGIN_VARIABLE = "LEANWARP_TEST_API_ORIGIN"
 
@@ -15,10 +17,6 @@ TEST_ORIGIN_VARIABLE = "LEANWARP_TEST_API_ORIGIN"
 _LIVE_ORIGIN: str | None = "https://api.isagoge.in"
 
 
-class ConfigurationError(ValueError):
-    """An actionable configuration failure containing no credential material."""
-
-
 def api_origin(api_key: str) -> str:
     match = re.fullmatch(r"lw_(?:(test|live)_)?([a-f0-9]{32})\.([A-Za-z0-9_-]{43})", api_key)
     if match is None:
@@ -26,8 +24,8 @@ def api_origin(api_key: str) -> str:
             "this is not a LeanWarp API key; copy the whole key from the LeanWarp dashboard "
             "(it starts with lw_live_)"
         )
-    # Before production existed, only staging issued untagged keys. This legacy
-    # format always means test; production rejects it. Never probe other origins.
+    # An untagged key always means test; production rejects it. Never probe other
+    # origins.
     if (match[1] or "test") == "test":
         return _test_origin()
     if _LIVE_ORIGIN is None:

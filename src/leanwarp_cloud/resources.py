@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from .client import LeanWarpCloudError
+from .errors import LeanWarpCloudError
 
 
 def published_worker_resources(catalog: Mapping[str, Any]) -> dict[str, Any]:

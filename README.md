@@ -48,8 +48,10 @@ uv tool install leanwarp && leanwarp setup
 This installs the `leanwarp` command and its MCP server from
 [PyPI](https://pypi.org/project/leanwarp/). `leanwarp setup` adds the LeanWarp
 skill and MCP server to Claude Code, Codex and Cursor where they are installed,
-and the skill to `~/.agents/skills`. It runs on Linux, macOS and WSL. You don't
-need Lean installed: LeanWarp runs Lean and Mathlib for you.
+and the skill to `~/.agents/skills` if that folder exists; `leanwarp setup
+--remove` takes them out again. It runs on Linux, macOS and WSL, with Python
+3.10 to 3.14. You don't need Lean installed: LeanWarp runs Lean and Mathlib for
+you.
 
 Or paste this into your agent:
 
@@ -97,9 +99,15 @@ Wait for that operation to finish too, then run `leanwarp stop` when you are don
 
 Every command prints one JSON object. Results start with `success`: `true` when
 the check passed or the proof was verified, `false` when it did not, and `null`
-while the work is still running, in which case run `leanwarp wait`. The exit code
-says the same thing: `0` passed, `1` did not pass, `2` the command failed, `3`
-still running.
+while the work is still running, in which case run `leanwarp wait`. `decided` is
+`false` when there was no verdict (a timeout, or a check LeanWarp could not
+complete): retry it rather than changing the proof. The exit code says the same
+thing: `0` passed, `1` did not pass, `2` the command failed, `3` still running,
+`4` no verdict.
+
+In CI, `leanwarp connect --ephemeral`, `leanwarp check --all` and, always last,
+`leanwarp stop --delete` check every file and leave nothing behind; see the
+[GitHub Actions recipe](https://isagoge.in/leanwarp/docs/getting-started#6-check-a-project-in-ci).
 
 ## Use with an agent
 
@@ -166,6 +174,9 @@ stop it. Unused held credit is released once shutdown and final usage are confir
 Stopping keeps your uploaded files and
 completed results; the next operation reconstructs the worker. Set a spending cap
 for each workspace in the [dashboard](https://isagoge.in/dashboard).
+
+LeanWarp is in beta. For more capacity, larger workers, higher limits or a custom
+setup for your team, email contact@isagoge.in or tell us with `leanwarp feedback`.
 
 ## Concepts
 

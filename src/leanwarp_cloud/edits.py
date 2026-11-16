@@ -12,13 +12,10 @@ import hashlib
 from collections.abc import Mapping
 from typing import Any
 
+from .errors import EditError
 from .outcome import SUGGESTION_VERIFICATIONS
 
 EDITING_KINDS = frozenset({"suggest", "sorry2lemma"})
-
-
-class EditError(ValueError):
-    """The result cannot be applied to this source."""
 
 
 def _sha256(text: str) -> str:

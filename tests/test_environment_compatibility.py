@@ -7,7 +7,7 @@ from contextlib import contextmanager, nullcontext
 
 import httpx
 import pytest
-from leanwarp_cloud import LeanWarpCloud, ProjectSession
+from leanwarp_cloud import LeanWarpCloud, LeanWarpTransportError, ProjectSession
 from leanwarp_cloud.project import (
     ProjectError,
     ProjectIdentity,
@@ -21,17 +21,20 @@ from .test_session import Service
 
 @pytest.mark.parametrize("command", ["recover", "cancel"])
 @pytest.mark.parametrize(
-    "state,status,code,success",
+    "state,status,code,success,decided",
     [
-        ("completed", "ok", 0, True),
-        ("completed", "rejected", 1, False),
-        ("failed", None, 1, False),
-        ("cancelled", None, 1, False),
-        ("queued", None, 3, None),
+        ("completed", "ok", 0, True, True),
+        ("completed", "rejected", 1, False, True),
+        # No verdict: the work ended without deciding the proof.
+        ("completed", "timeout", 4, False, False),
+        ("completed", "infrastructure_failure", 4, False, False),
+        ("failed", None, 4, False, False),
+        ("cancelled", None, 4, False, False),
+        ("queued", None, 3, None, None),
     ],
 )
 def test_cli_recovery_and_cancellation_preserve_operation_outcomes(
-    monkeypatch, capsys, command, state, status, code, success
+    monkeypatch, capsys, command, state, status, code, success, decided
 ):
     from leanwarp_cloud import cli
 
@@ -41,7 +44,11 @@ def test_cli_recovery_and_cancellation_preserve_operation_outcomes(
             "operation_id": "o",
             "revision": 1,
             "generation": 1,
-            "result": {"status": status},
+            "result": {
+                "status": status,
+                "diagnostics": [],
+                "failure": {"kind": "axioms", "retryable": False, "message": "m"},
+            },
         }
 
     class Session:
@@ -54,7 +61,11 @@ def test_cli_recovery_and_cancellation_preserve_operation_outcomes(
     monkeypatch.setattr(cli, "load_client", lambda *, interface: nullcontext(None))
     monkeypatch.setattr(cli, "ProjectSession", lambda *_: Session())
     assert cli.main([command]) == code
-    assert json.loads(capsys.readouterr().out) == {"success": success, **operation}
+    assert json.loads(capsys.readouterr().out) == {
+        "success": success,
+        "decided": decided,
+        **operation,
+    }
 
 
 def test_cli_recover_keeps_non_operation_receipts(monkeypatch, capsys):
@@ -86,11 +97,12 @@ def test_cli_preserves_error_codes_and_recovery_fields(monkeypatch, capsys):
     timeout = json.loads(capsys.readouterr().out)
     assert timeout["error"] == "poll_timeout"
     assert timeout["operation_id"] == "o" and timeout["running"] is True
-    monkeypatch.setattr(cli, "load_client", failure(httpx.ConnectError("private-sentinel")))
-    assert cli.main(["account"]) == 2
+    monkeypatch.setattr(cli, "load_client", failure(LeanWarpTransportError("private-sentinel")))
+    assert cli.main(["stop"]) == 2
     lost = json.loads(capsys.readouterr().out)
-    assert lost["error"] == "transport_error"
-    assert lost["action"] == "recover any pending request; do not resubmit it"
+    assert lost["error"] == "transport_error" and lost["retryable"] is True
+    # `recover` resends a saved create, sync or submit; it has nothing to say about a stop.
+    assert "recover" not in lost["message"] and "run the command again" in lost["message"]
     assert "private-sentinel" not in str(lost)
     monkeypatch.setattr(cli, "load_client", failure(SessionError("run connect first")))
     assert cli.main(["account"]) == 2
@@ -221,7 +233,7 @@ def test_doctor_requires_recovery_for_uncertain_creation(tmp_path):
     with api() as (service, cloud):
         service.lose = "/workspaces"
         session = ProjectSession(cloud, tmp_path)
-        with pytest.raises(httpx.ReadTimeout):
+        with pytest.raises(LeanWarpTransportError):
             session.connect()
         (tmp_path / "lake-manifest.json").write_text("damaged after the request")
         before = session.path.read_bytes()

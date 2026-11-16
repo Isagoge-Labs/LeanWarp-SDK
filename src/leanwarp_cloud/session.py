@@ -9,16 +9,16 @@ import os
 import re
 import stat
 import tempfile
-from collections.abc import Iterator, Mapping
+import time
+from collections.abc import Callable, Collection, Iterator, Mapping
 from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
-import httpx
-
 from .amounts import validate_spending_cap
 from .client import (
+    MAX_BATCH_FILES,
     MAX_FEEDBACK_DETAILS,
     MAX_FEEDBACK_SUMMARY,
     MIN_FEEDBACK_SUMMARY,
@@ -26,19 +26,29 @@ from .client import (
     FeedbackKind,
     FeedbackSeverity,
     LeanWarpCloud,
-    LeanWarpCloudError,
-    OperationTimeout,
 )
-from .edits import EDITING_KINDS, EditError, edited_sha256, edited_source
-from .outcome import OperationOutcome
-from .project import (
+from .compact import summary
+from .edits import EDITING_KINDS, edited_sha256, edited_source
+from .errors import (
+    EditError,
+    LeanWarpCloudError,
+    LeanWarpError,
+    LeanWarpTransportError,
+    OperationTimeout,
     ProjectError,
+    SessionError,
+    UsageError,
+    WaitError,
+)
+from .outcome import BATCH_COUNTERS, OperationOutcome, judge_batch, reported
+from .project import (
     ProjectIdentity,
     choose_environment,
     collect_lean_sources,
     environment_name,
     plan_upload,
     project_identity,
+    project_lean_options,
     selects,
     validate_selection,
 )
@@ -53,6 +63,16 @@ _MAX_HISTORY_PAGES = 100_001
 # Polling shares this budget (see LeanWarpCloud.wait). Even one bounded overrun
 # read keeps an inline wait under the common 60-second MCP client tool deadline.
 MAX_INLINE_WAIT_SECONDS = 40
+# Commands on one project queue for its lock, so parallel tool calls run in turn.
+# Longer than a healthy request, and short enough to report a stuck one.
+_LOCK_WAIT_SECONDS = 10.0
+_LOCK_POLL_SECONDS = 0.05
+#: The longest an operation runs on the service, and so the default execution timeout.
+MAX_EXECUTION_SECONDS = 600
+# Starting a worker and queueing come before the execution timeout starts.
+_BLOCK_GRACE_SECONDS = 300
+# How long tearing down waits for a cancelled operation to end.
+_TEARDOWN_WAIT_SECONDS = 120
 _JOURNAL_DAMAGED = (
     ".leanwarp/session.json is damaged; keep it, since it may record an unfinished request"
 )
@@ -65,25 +85,14 @@ _OPERATION_EXPIRED = (
 )
 
 
-class SessionError(RuntimeError):
-    """Local recovery or project reconciliation is required before another write."""
-
-
-class UsageError(ValueError):
-    """An argument outside its supported range; nothing was sent."""
-
-
-class WaitError(UsageError):
-    """An inline wait outside its supported range; nothing was submitted."""
-
-
 class ProjectSession:
     """One local project and one durable hosted workspace.
 
-    Mutations journal their exact payload before sending. An ambiguous request is
-    replayed only through recover(), never replaced by a new request. A process
-    lock serializes CLI/MCP clients on this project; server revisions protect
-    separate devices. Closing the HTTP client does not stop paid compute.
+    Mutations journal their exact payload before sending. An unresolved request is
+    resent once, with its idempotency key, by the next command that would write, and
+    by recover(); it is never replaced by a new request. A process lock serializes
+    CLI/MCP clients on this project; server revisions protect separate devices.
+    Closing the HTTP client does not stop paid compute.
     """
 
     def __init__(self, cloud: LeanWarpCloud, root: str | Path = ".") -> None:
@@ -96,6 +105,10 @@ class ProjectSession:
         self.submitted = self.directory / "operation.json"
         # Saves requests only; see `_cached`.
         self.cache = self.directory / "cache.json"
+        # Names the one workspace `connect(ephemeral=True)` created, or the key of its
+        # unresolved creation: `stop(delete=True)` deletes that workspace and no
+        # other. It lives beside the journal so that older clients still read it.
+        self.ephemeral = self.directory / "ephemeral.json"
 
     @contextmanager
     def _locked(self) -> Iterator[dict[str, Any]]:
@@ -108,12 +121,19 @@ class ProjectSession:
             raise SessionError(".leanwarp must be a directory, not a symlink")
         fd = os.open(self.directory / "lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
         try:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError as error:
-                raise SessionError(
-                    "another LeanWarp command is using this project; let it finish"
-                ) from error
+            give_up = time.monotonic() + _LOCK_WAIT_SECONDS
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError as error:
+                    if time.monotonic() >= give_up:
+                        raise SessionError(
+                            "another LeanWarp command is using this project; let it finish",
+                            code="project_busy",
+                            retryable=True,
+                        ) from error
+                    time.sleep(_LOCK_POLL_SECONDS)
             state = self._read()
             # A key belongs to one account. A binding this key made to the saved
             # account needs no request; otherwise the account is read and compared.
@@ -236,12 +256,16 @@ class ProjectSession:
             raise SessionError("this project is not connected; run `leanwarp connect`")
         return workspace
 
-    @staticmethod
-    def _ready(state: Mapping[str, Any]) -> None:
-        if state.get("pending") is not None:
-            raise SessionError(
-                "an earlier request may not have reached LeanWarp; run `leanwarp recover` first"
-            )
+    def _settle(self, state: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        """Resend an unresolved request before acting on a newer one.
+
+        Returns the request and its result, or None if nothing was unresolved. A
+        transient failure is never the end of a project: the saved request and key
+        are resent here once, and any failure this raises leaves the request saved
+        for the next command unless the service definitely refused it.
+        """
+        pending = state.get("pending")
+        return None if pending is None else (pending, self._replay(state))
 
     def _environment(self, state: dict[str, Any]) -> None:
         identity = project_identity(self.root, allow_empty=True)
@@ -267,7 +291,7 @@ class ProjectSession:
         try:
             return self._checked_operation(state, self.cloud.operation(state["operation_id"]))
         except LeanWarpCloudError as error:
-            if error.status_code == 404 and error.code == "not_found":
+            if error.status == 404 and error.code == "not_found":
                 return None
             raise
 
@@ -287,6 +311,16 @@ class ProjectSession:
             )
         return result
 
+    def _checked_named(
+        self, state: Mapping[str, Any], operation_id: str | None, result: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Bind a result to the operation asked for: the latest, or one this workspace ran."""
+        if operation_id is None:
+            return self._checked_operation(state, result)
+        if result.get("workspace_id") != state.get("workspace_id"):
+            raise SessionError(f"operation {operation_id} belongs to another workspace")
+        return result
+
     def connect(
         self,
         *,
@@ -296,13 +330,15 @@ class ProjectSession:
         environment: str | None = None,
         bundle_id: str | None = None,
         workspace_id: str | None = None,
+        ephemeral: bool = False,
     ) -> dict[str, Any]:
         """Create this project's workspace once, without starting compute.
 
         With ``workspace_id``, connect to an existing workspace instead, such as
         one from another machine. Its current files become this project's
         baseline, so the next sync uploads only the files that differ; the
-        result lists them. Its environment must match the project, unless
+        result lists them. A file only the workspace has stays there and is listed
+        under ``remote_only``. Its environment must match the project, unless
         ``environment`` names it explicitly.
 
         LeanWarp picks the environment that matches the project's toolchain and
@@ -312,6 +348,9 @@ class ProjectSession:
         A cap limits total workspace spending, including reserved credit. On an
         existing connection, an omitted cap keeps its current limit; a supplied
         cap must match. Change an existing cap in the account dashboard.
+
+        With ``ephemeral``, the new workspace is this project's alone to delete:
+        ``stop(delete=True)`` then deletes it, as a CI job's last step should.
         """
         validate_selection(environment, bundle_id)
         try:
@@ -322,8 +361,15 @@ class ProjectSession:
             resource_profile is not None or max_resource_profile is not None or bundle_id
         ):
             raise UsageError("an existing workspace keeps its own environment and worker size")
+        if workspace_id is not None and ephemeral:
+            raise UsageError("only a workspace this project creates can be ephemeral")
         with self._locked() as state:
-            self._ready(state)
+            self._settle(state)
+            if state.get("workspace_id") and ephemeral and not self._ephemeral_matches(state):
+                raise SessionError(
+                    "this project is connected to a lasting workspace; run `leanwarp stop` and "
+                    "`leanwarp disconnect` before connecting an ephemeral one"
+                )
             if workspace_id is not None and state.get("workspace_id") not in (None, workspace_id):
                 raise SessionError(
                     f"this project is connected to workspace {state['workspace_id']}; run "
@@ -347,6 +393,8 @@ class ProjectSession:
                 _check_cap(workspace, max_spend_microusd)
                 return workspace
             identity = project_identity(self.root)
+            # Nothing is connected or being created, so any earlier mark is stale.
+            self.ephemeral.unlink(missing_ok=True)
             if workspace_id is not None:
                 return self._attach(state, identity, workspace_id, environment, max_spend_microusd)
             choice = choose_environment(
@@ -361,7 +409,11 @@ class ProjectSession:
                 arguments["resource_profile"] = resource_profile
             if max_resource_profile is not None:
                 arguments["max_resource_profile"] = max_resource_profile
-            workspace = self._request(state, "create_workspace", arguments)
+            key = uuid4().hex
+            if ephemeral:
+                # Before the request, so that a lost response still leaves it deletable.
+                self._mark_ephemeral({"create": key})
+            workspace = self._request(state, "create_workspace", arguments, idempotency_key=key)
             return {**workspace, "environment_choice": choice.public()}
 
     def _attach(
@@ -399,8 +451,8 @@ class ProjectSession:
                 "this project's toolchain or lockfile; to use it anyway, pass "
                 f"`--environment {environment_name(build)}`"
             )
-        revision, files = self._manifest(workspace_id)
-        changes = self._changes(files)
+        revision, remote = self._manifest(workspace_id)
+        files, changes = self._baseline(remote, tracked=())
         state.update(
             workspace_id=workspace_id,
             revision=revision,
@@ -430,15 +482,24 @@ class ProjectSession:
             raise SessionError("LeanWarp's file list was incomplete; try again")
         return remote["revision"], dict(files)
 
-    def _changes(self, remote: Mapping[str, str]) -> dict[str, list[str]]:
-        """What the next sync uploads or deletes, measured against ``remote``."""
+    def _baseline(
+        self, remote: Mapping[str, str], *, tracked: Collection[str]
+    ) -> tuple[dict[str, str], dict[str, list[str]]]:
+        """The baseline adopting ``remote`` gives this project, and what the next sync does.
+
+        Removing a file this project tracked is an edit the next sync publishes.
+        A file it never had says nothing about the workspace's copy, which may be
+        beyond a partial checkout or a teammate's new work, so that copy stays.
+        """
         local = {
             name: hashlib.sha256(text.encode()).hexdigest()
             for name, text in collect_lean_sources(self.root).items()
         }
-        return {
+        remote_only = {name for name in remote if name not in local and name not in tracked}
+        return {name: digest for name, digest in remote.items() if name not in remote_only}, {
             "upload": sorted(name for name in local if remote.get(name) != local[name]),
-            "delete": sorted(set(remote) - set(local)),
+            "delete": sorted(name for name in remote if name not in local and name in tracked),
+            "remote_only": sorted(remote_only),
         }
 
     def workspaces(self) -> dict[str, Any]:
@@ -514,7 +575,8 @@ class ProjectSession:
             connected = state.get("workspace_id")
             if not connected:
                 # An unresolved create could be the very workspace named here.
-                self._ready(state)
+                self._settle(state)
+                connected = state.get("workspace_id")
             try:
                 self.cloud.delete(workspace_id)
             except LeanWarpCloudError as error:
@@ -522,17 +584,11 @@ class ProjectSession:
                 # known connection can converge on absence; a typo or an unknown
                 # workspace must still report the server's error.
                 if not (
-                    workspace_id == connected
-                    and error.status_code == 404
-                    and error.code == "not_found"
+                    workspace_id == connected and error.status == 404 and error.code == "not_found"
                 ):
                     raise
             if workspace_id == connected:
-                for key in ("workspace_id", "revision", "operation_id", "operation_revision"):
-                    state.pop(key, None)
-                state["files"] = {}
-                state["pending"] = None
-                self._save(state)
+                self._forget(state)
             return {
                 "status": "deleted",
                 "workspace_id": workspace_id,
@@ -613,7 +669,7 @@ class ProjectSession:
 
     def sync(self) -> dict[str, Any]:
         with self._locked() as state:
-            self._ready(state)
+            self._settle(state)
             return self._sync(state)
 
     def _sync(self, state: dict[str, Any]) -> dict[str, Any]:
@@ -659,9 +715,31 @@ class ProjectSession:
             raise UsageError(
                 "the execution timeout must be a whole number of seconds from 1 to 600"
             )
-        json.dumps(dict(payload), allow_nan=False)
+        try:
+            json.dumps(dict(payload), allow_nan=False)
+        except ValueError as error:
+            raise UsageError(
+                "the payload holds NaN or infinity, which JSON cannot carry"
+            ) from error
         with self._locked() as state:
-            self._ready(state)
+            settled = self._settle(state)
+            update, hashes = self._source_update(state)
+            options = project_lean_options(self.root).applied
+            body: dict[str, Any] = {
+                "workspace_id": self._workspace(state),
+                "kind": kind,
+                "expected_revision": state["revision"],
+                # A project's lakefile options apply to this operation as Lake would.
+                "payload": {"lean_options": options, **payload} if options else dict(payload),
+            }
+            if resource_profile is not None:
+                body["resource_profile"] = resource_profile
+            if timeout_seconds is not None:
+                body["timeout_seconds"] = timeout_seconds
+            # Running the same command again after a lost response asks for the work
+            # the resent request just started; submitting it too would pay twice.
+            if update is None and settled is not None and _same_submission(settled[0], body):
+                return settled[1]
             # A finished operation never runs again, so only an unfinished one is read.
             if (
                 state.get("operation_id")
@@ -673,17 +751,6 @@ class ProjectSession:
                         "the previous operation is still running; run `leanwarp wait` or "
                         "`leanwarp cancel` first"
                     )
-            update, hashes = self._source_update(state)
-            body: dict[str, Any] = {
-                "workspace_id": self._workspace(state),
-                "kind": kind,
-                "expected_revision": state["revision"],
-                "payload": dict(payload),
-            }
-            if resource_profile is not None:
-                body["resource_profile"] = resource_profile
-            if timeout_seconds is not None:
-                body["timeout_seconds"] = timeout_seconds
             if update is None:
                 return self._request(state, "submit", body)
             # Changed sources travel with the operation: one request, not two.
@@ -729,7 +796,7 @@ class ProjectSession:
             latest = self.cloud.wait(operation["operation_id"], timeout=wait_seconds)
         except OperationTimeout as error:
             latest = error.operation or operation
-        except (httpx.TransportError, LeanWarpCloudError):
+        except (LeanWarpTransportError, LeanWarpCloudError):
             latest = operation
         latest = self._checked_operation(submitted, latest)
         self._note_finished(latest)
@@ -751,13 +818,14 @@ class ProjectSession:
         arguments: dict[str, Any],
         *,
         hashes: dict[str, str] | None = None,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         pending = {
             "method": method,
             # Own the JSON snapshot before saving or sending it. Caller-owned
             # lists and dictionaries must not diverge from the durable intent.
             "arguments": json.loads(json.dumps(arguments, ensure_ascii=False, allow_nan=False)),
-            "idempotency_key": uuid4().hex,
+            "idempotency_key": idempotency_key or uuid4().hex,
             "hashes": hashes,
         }
         state["pending"] = pending
@@ -768,13 +836,16 @@ class ProjectSession:
         pending = state["pending"]
         if (
             not isinstance(pending, dict)
-            or pending.get("method") not in {"create_workspace", "sync_files", "submit", "run"}
+            or pending.get("method")
+            not in {"create_workspace", "sync_files", "submit", "run", "reconcile_upload"}
             or not isinstance(pending.get("arguments"), dict)
             or not isinstance(pending.get("idempotency_key"), str)
         ):
             raise SessionError(_JOURNAL_DAMAGED)
         method = pending["method"]
         try:
+            if method == "reconcile_upload":
+                return self._reconcile_upload(state, pending)
             if method == "create_workspace":
                 # Replay the exact creation body, including older journals that
                 # omit defaults. Adding or stripping a cap changes its identity.
@@ -791,7 +862,7 @@ class ProjectSession:
         except LeanWarpCloudError as error:
             # Definite rejection has no accepted effect. Auth/transient/ambiguous
             # errors keep the intent recoverable, including a rotated key later.
-            if error.status_code in {400, 404, 409, 413, 422}:
+            if error.status in {400, 404, 409, 413, 422}:
                 if method == "run":
                     self._settle_rejected_run(state, pending)
                 else:
@@ -822,6 +893,10 @@ class ProjectSession:
         ):
             raise SessionError("LeanWarp's response was incomplete; run `leanwarp recover`")
         if method == "create_workspace":
+            # Bind an ephemeral mark to the workspace before the journal names it, so
+            # an interruption between the two leaves a mark resending can confirm.
+            if self._ephemeral_mark() == {"create": pending["idempotency_key"]}:
+                self._mark_ephemeral({"workspace_id": result["workspace_id"]})
             state["workspace_id"] = result["workspace_id"]
             state["revision"] = result["revision"]
         elif method == "sync_files":
@@ -866,27 +941,40 @@ class ProjectSession:
         return operation
 
     def _settle_rejected_run(self, state: dict[str, Any], pending: Mapping[str, Any]) -> None:
-        """Learn whether a rejected combined request committed its sources.
+        """Learn from the service whether a rejected combined request committed its sources.
 
-        The update commits before the submission, so a rejected submission can
-        follow a committed update. Replaying the update under the same key returns
-        that commit, or makes it, as a separate sync would have; either way the
-        project's revision then matches the service's. The update replaces the
-        rejected intent in one save, so an interruption leaves it to recover.
+        The update commits before the submission, so a rejection can follow a
+        committed update or none at all. The manifest says which, and the project
+        adopts only what the service already holds: a rejection never writes. That
+        read replaces the rejected intent in one save, so if it fails, recovery
+        retries the read and nothing else.
         """
         arguments = pending["arguments"]
         state["pending"] = {
-            "method": "sync_files",
+            "method": "reconcile_upload",
             "arguments": {
-                key: arguments[key]
-                for key in ("workspace_id", "expected_revision", "files", "delete_paths")
+                key: arguments[key] for key in ("workspace_id", "expected_revision", "delete_paths")
             },
             "idempotency_key": pending["idempotency_key"],
             "hashes": pending["hashes"],
         }
         self._save(state)
-        with suppress(LeanWarpCloudError, httpx.TransportError, SessionError):
+        with suppress(LeanWarpError):
             self._replay(state)
+
+    def _reconcile_upload(
+        self, state: dict[str, Any], pending: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Adopt a rejected request's upload if the service holds what it asked for."""
+        workspace_id = pending["arguments"]["workspace_id"]
+        revision, files = self._manifest(workspace_id)
+        if files.items() >= pending["hashes"].items() and not (
+            files.keys() & set(pending["arguments"]["delete_paths"])
+        ):
+            state["revision"], state["files"] = revision, pending["hashes"]
+        state["pending"] = None
+        self._save(state)
+        return {"workspace_id": workspace_id, "revision": state["revision"]}
 
     def _submitted_sources(self, operation_id: str) -> list[str]:
         """The files this project asked the operation about, or none if unknown."""
@@ -916,21 +1004,31 @@ class ProjectSession:
                 return self._status(state)
             return self._replay(state)
 
-    def _status(self, state: dict[str, Any]) -> dict[str, Any]:
+    def _status(self, state: dict[str, Any], operation_id: str | None = None) -> dict[str, Any]:
         workspace = self._workspace(state)
         result = {
             "workspace": self.cloud.workspace(workspace),
             "local_revision": state.get("revision"),
             "recovery_required": state.get("pending") is not None,
+            **project_lean_options(self.root).public(),
         }
         if (self.directory / "apply-recovery.txt").exists():
             result["recovery_required"] = True
             result["apply_recovery"] = str(self.directory / "apply-recovery.txt")
         # Supplemental: status and recover must keep working without it, as with a
         # service from before usage was published.
-        with suppress(LeanWarpCloudError, httpx.TransportError):
+        with suppress(LeanWarpCloudError, LeanWarpTransportError):
             result["history_usage"] = self.cloud.workspace_usage(workspace)
-        if state.get("operation_id"):
+        if operation_id is not None:
+            try:
+                result["operation"] = self._checked_named(
+                    state, operation_id, self.cloud.operation(operation_id)
+                )
+            except LeanWarpCloudError as error:
+                if error.status != 404 or error.code != "not_found":
+                    raise
+                result["operation_expired"] = True
+        elif state.get("operation_id"):
             operation = self._previous_operation(state)
             if operation is None:
                 result["operation_expired"] = True
@@ -938,42 +1036,59 @@ class ProjectSession:
                 result["operation"] = operation
         return result
 
-    def status(self) -> dict[str, Any]:
+    def status(self, *, operation_id: str | None = None) -> dict[str, Any]:
+        """The workspace and an operation: the latest, or the one named."""
         with self._locked() as state:
-            return self._status(state)
+            return self._status(state, operation_id)
 
-    def wait(self, *, timeout: float = 300) -> dict[str, Any]:
+    def _target(self, state: dict[str, Any], operation_id: str | None) -> str:
+        """The operation a command acts on: the one named, or this project's latest."""
+        if operation_id is not None:
+            self._workspace(state)
+            return operation_id
+        self._settle(state)
+        latest = state.get("operation_id")
+        if not isinstance(latest, str):
+            raise SessionError("this project has not submitted an operation")
+        return latest
+
+    def wait(self, *, timeout: float = 300, operation_id: str | None = None) -> dict[str, Any]:
+        """Wait for an operation, the latest unless one is named, to finish."""
         with self._locked() as state:
-            self._ready(state)
-            operation = state.get("operation_id")
-            if not isinstance(operation, str):
-                raise SessionError("this project has not submitted an operation")
+            target = self._target(state, operation_id)
         # Do not hold the project lock while polling; another process may cancel.
         try:
-            latest = self._checked_operation(state, self.cloud.wait(operation, timeout=timeout))
+            latest = self._checked_named(
+                state, operation_id, self.cloud.wait(target, timeout=timeout)
+            )
         except LeanWarpCloudError as error:
-            if error.status_code == 404 and error.code == "not_found":
+            if error.status == 404 and error.code == "not_found":
                 raise SessionError(_OPERATION_EXPIRED) from error
             raise
         self._note_finished(latest)
         return latest
 
-    def cancel(self) -> dict[str, Any]:
+    def cancel(self, *, operation_id: str | None = None) -> dict[str, Any]:
+        """Ask to cancel an operation, the latest unless one is named.
+
+        A named operation is read and bound to this project's workspace before
+        anything is sent, so an operation elsewhere is never cancelled.
+        """
         with self._locked() as state:
-            self._ready(state)
-            if not isinstance(state.get("operation_id"), str):
-                raise SessionError("this project has not submitted an operation")
+            target = self._target(state, operation_id)
             try:
-                return self._checked_operation(state, self.cloud.cancel(state["operation_id"]))
+                if operation_id is not None:
+                    self._checked_named(state, operation_id, self.cloud.operation(target))
+                return self._checked_named(state, operation_id, self.cloud.cancel(target))
             except LeanWarpCloudError as error:
-                if error.status_code == 404 and error.code == "not_found":
+                if error.status == 404 and error.code == "not_found":
                     raise SessionError(_OPERATION_EXPIRED) from error
                 raise
 
     def disconnect(self) -> dict[str, Any]:
         """Forget a stopped connection so this project can connect to another environment."""
         with self._locked() as state:
-            self._ready(state)
+            self._settle(state)
             workspace_id = self._workspace(state)
             if state.get("operation_id"):
                 operation = self._previous_operation(state)
@@ -992,11 +1107,46 @@ class ProjectSession:
                 raise SessionError(
                     "LeanWarp did not confirm the stop; run `leanwarp status` and try again"
                 )
-            for key in ("workspace_id", "revision", "operation_id", "operation_revision"):
-                state.pop(key, None)
-            state["files"] = {}
-            self._save(state)
+            self._forget(state)
             return {"status": "disconnected", "workspace_id": workspace_id}
+
+    def _ephemeral_mark(self) -> dict[str, str] | None:
+        """The ephemeral mark, or None if absent or not one this SDK wrote."""
+        try:
+            fd = os.open(self.ephemeral, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except OSError:
+            return None
+        with os.fdopen(fd, "rb") as stream:
+            raw = stream.read(_MAX_CACHE_BYTES + 1) if stat.S_ISREG(os.fstat(fd).st_mode) else b""
+        try:
+            mark = json.loads(raw)
+        except ValueError:
+            return None
+        if (
+            isinstance(mark, dict)
+            and len(mark) == 1
+            and set(mark) <= {"workspace_id", "create"}
+            and all(isinstance(value, str) and value for value in mark.values())
+        ):
+            return mark
+        return None
+
+    def _mark_ephemeral(self, mark: dict[str, str]) -> None:
+        self._write(self.ephemeral, json.dumps(mark).encode("utf-8"))
+
+    def _ephemeral_matches(self, state: Mapping[str, Any]) -> bool:
+        """Whether the mark names this project's connected workspace."""
+        workspace = state.get("workspace_id")
+        return isinstance(workspace, str) and self._ephemeral_mark() == {"workspace_id": workspace}
+
+    def _forget(self, state: dict[str, Any]) -> None:
+        """Disconnect: forget the workspace, and any request that named it."""
+        for key in ("workspace_id", "revision", "operation_id", "operation_revision"):
+            state.pop(key, None)
+        state["files"] = {}
+        state["pending"] = None
+        self._save(state)
+        self.ephemeral.unlink(missing_ok=True)
 
     def apply(self) -> dict[str, Any]:
         """Write the latest suggest or sorry2lemma result into its file, then upload it.
@@ -1004,10 +1154,11 @@ class ProjectSession:
         The edit applies only to the bytes the operation read: the operation must
         have completed at the revision this project last uploaded, and the file must
         be unchanged since then. Other changed files are uploaded with it, as by sync.
-        If the upload fails after the file is written, running apply again uploads it.
+        If the upload fails after the file is written, running apply again uploads it;
+        after a revision conflict, run reconcile and then sync instead.
         """
         with self._locked() as state:
-            self._ready(state)
+            self._settle(state)
             _check_apply_recovery(self.directory)
             if not isinstance(state.get("operation_id"), str):
                 raise SessionError("this project has not submitted an operation")
@@ -1063,20 +1214,258 @@ class ProjectSession:
                 "revision": uploaded.get("revision"),
             }
 
-    def stop(self) -> dict[str, Any]:
-        """Stop the worker, even while an earlier request awaits `recover`.
+    def prune(self, confirm: str | None = None) -> dict[str, Any]:
+        """Delete the files only the workspace has, once exactly those are approved.
 
-        Stopping changes no source or operation, so an unresolved request stays
-        recorded for recovery instead of keeping compute running. Only a workspace
-        whose creation is unresolved cannot be stopped, since its identity is unknown.
+        Without ``confirm`` this deletes nothing: it lists the files and returns
+        the token that approves that list. The deletion cannot be undone, and the
+        files may be a teammate's, so show the list to whoever owns the decision
+        before passing the token. A token approves one list at one revision; if
+        either changes, it is refused and the new list must be approved instead.
         """
         with self._locked() as state:
-            if not state.get("workspace_id"):
-                self._ready(state)
+            self._settle(state)
+            workspace = self._workspace(state)
+            revision, remote = self._manifest(workspace)
+            local = collect_lean_sources(self.root)
+            remote_only = sorted(set(remote) - set(local) - set(state["files"]))
+            token = hashlib.sha256(json.dumps([revision, remote_only]).encode()).hexdigest()[:16]
+            if confirm is None or not remote_only:
+                return {
+                    "status": "confirmation_required" if remote_only else "nothing_to_prune",
+                    "workspace_id": workspace,
+                    "revision": revision,
+                    "remote_only": remote_only,
+                    **({"confirm": token} if remote_only else {}),
+                }
+            if confirm != token:
+                raise SessionError(
+                    "the workspace changed since that list; run `leanwarp prune` and "
+                    "confirm the new list"
+                )
+            pruned = self._request(
+                state,
+                "sync_files",
+                {
+                    "workspace_id": workspace,
+                    "expected_revision": state["revision"],
+                    "files": {},
+                    "delete_paths": remote_only,
+                },
+                hashes=dict(state["files"]),
+            )
+            return {
+                "status": "pruned",
+                "workspace_id": workspace,
+                "revision": pruned.get("revision"),
+                "deleted": remote_only,
+            }
+
+    def stop(self, *, delete: bool = False) -> dict[str, Any]:
+        """Stop the worker. An unresolved request never blocks this.
+
+        With ``delete``, also delete a workspace made by ``connect(ephemeral=True)``
+        and disconnect, leaving nothing behind; see `_tear_down`.
+
+        Stopping changes no source or operation, so an unresolved request stays
+        recorded instead of keeping compute running; it is not resent, which could
+        start the work this is ending. A workspace whose creation is unresolved has
+        never run anything, so there is nothing to stop.
+        """
+        if delete:
+            return self._tear_down()
+        with self._locked() as state:
+            if not state.get("workspace_id") and state.get("pending") is not None:
+                return {"status": "no_worker", "recovery_required": True}
             result = self.cloud.stop(self._workspace(state))
             if state.get("pending") is not None:
                 result = {**result, "recovery_required": True}
             return result
+
+    def _tear_down(self) -> dict[str, Any]:
+        """Stop and delete this project's ephemeral workspace, whatever state a job left.
+
+        Only the workspace the ephemeral mark names is ever deleted; any other is
+        refused. The worker is stopped first and stopped again if deletion fails, so
+        shutting down never depends on the rest succeeding. A saved request is then
+        resent, so that nothing it started runs unseen, and a running operation is
+        cancelled and waited for, since LeanWarp refuses to delete busy workspaces.
+
+        A saved request that cannot be resent is never discarded here: its effect is
+        unknown, so the workspace is only stopped and the request stays for
+        `recover`. To discard it deliberately, delete the workspace by name.
+        """
+        with self._locked() as state:
+            mark = self._ephemeral_mark()
+            pending = state.get("pending")
+            creating = (
+                not state.get("workspace_id")
+                and isinstance(pending, dict)
+                and pending.get("method") == "create_workspace"
+                and mark is not None
+                and mark.get("create") in {pending.get("idempotency_key"), None}
+            )
+            if not (self._ephemeral_matches(state) or creating):
+                raise SessionError(
+                    "this project's workspace was not created by `connect --ephemeral`, so it "
+                    "is not deleted; run `leanwarp stop`, or delete it with `leanwarp delete`"
+                )
+            errors: list[dict[str, Any]] = []
+
+            def attempt(step: str, action: Callable[[], object]) -> bool:
+                try:
+                    action()
+                except LeanWarpError as error:
+                    errors.append(
+                        {
+                            "step": step,
+                            "code": error.code,
+                            "message": str(error),
+                            "retryable": error.retryable,
+                        }
+                    )
+                    return False
+                return True
+
+            if creating:
+                # An unconfirmed creation has never run anything; learn its identity.
+                if not attempt("resend", lambda: self._settle(state)):
+                    return _teardown_report(None, deleted=False, stopped=True, errors=errors)
+                if not self._ephemeral_matches(state):
+                    raise SessionError("the ephemeral workspace's creation did not confirm it")
+            workspace_id = self._workspace(state)
+            stopped = attempt("stop", lambda: self.cloud.stop(workspace_id))
+            if state.get("pending") is not None and not attempt(
+                "resend", lambda: self._settle(state)
+            ):
+                # The service may have accepted the resend and lost only its response,
+                # starting a worker after the first stop; what is reported is the last.
+                stopped = attempt("stop", lambda: self.cloud.stop(workspace_id))
+                return _teardown_report(workspace_id, deleted=False, stopped=stopped, errors=errors)
+            latest = state.get("operation_id")
+            if isinstance(latest, str):
+                attempt("cancel", lambda: self._cancel_running(state, latest))
+            deleted = attempt("delete", lambda: self._delete_workspace(workspace_id))
+            if deleted:
+                self._forget(state)
+            else:
+                # A resend may have started a worker that the refused deletion left up.
+                stopped = attempt("stop", lambda: self.cloud.stop(workspace_id))
+            return _teardown_report(workspace_id, deleted=deleted, stopped=stopped, errors=errors)
+
+    def _cancel_running(self, state: Mapping[str, Any], operation_id: str) -> None:
+        operation = self._previous_operation(state)
+        if operation is not None and operation.get("state") not in _TERMINAL_STATES:
+            self.cloud.cancel(operation_id)
+            self.cloud.wait(operation_id, timeout=_TEARDOWN_WAIT_SECONDS)
+
+    def _delete_workspace(self, workspace_id: str) -> None:
+        try:
+            self.cloud.delete(workspace_id)
+        except LeanWarpCloudError as error:
+            # Deleted already, by the dashboard or a run whose response was lost.
+            if error.status != 404 or error.code != "not_found":
+                raise
+
+    def check_all(
+        self, *, strict: bool = True, timeout_seconds: int | None = None
+    ) -> dict[str, Any]:
+        """Check every file this project uploads, as one result.
+
+        Files go in sorted order, up to 64 to a ``check_files`` operation, each run
+        to completion before the next, since a workspace runs one operation at a
+        time. The counts (`passed`, `failed`, `timed_out`,
+        `infrastructure_failures`, `not_checked`) count every file once: a file
+        an operation did not report on, because it failed or was cancelled, is
+        `not_checked`. ``status`` is ``ok``, ``failed`` (a file was refused) or
+        ``incomplete``, and ``success`` and ``decided`` follow it as for one
+        ``check_files`` operation. Both are null if an operation outlived its
+        wait (see `block_seconds`); its files and the rest are then
+        ``not_checked``, and ``running`` names it.
+        """
+        files = sorted(collect_lean_sources(self.root))
+        if not files:
+            raise UsageError("this project has no .lean files to check")
+        report: dict[str, Any] = {
+            "success": None,
+            "decided": None,
+            "kind": "check_all",
+            "status": None,
+            "strict": strict,
+            "files": len(files),
+            **dict.fromkeys(_COUNTS, 0),
+            "operations": [],
+            "results": [],
+        }
+        for start in range(0, len(files), MAX_BATCH_FILES):
+            chunk = files[start : start + MAX_BATCH_FILES]
+            operation = self.submit_and_wait(
+                "check_files",
+                {"files": chunk, "strict": strict},
+                wait_seconds=0,
+                timeout_seconds=timeout_seconds,
+            )
+            if not OperationOutcome(operation).terminal:
+                try:
+                    operation = self.wait(
+                        timeout=block_seconds(timeout_seconds),
+                        operation_id=operation["operation_id"],
+                    )
+                except OperationTimeout:
+                    report.update(running=operation["operation_id"])
+                    report["not_checked"] += len(files) - start
+                    report["operations"].append(summary(reported(operation)))
+                    return report
+            outcome = OperationOutcome(operation)
+            report["operations"].append(summary(reported(operation)))
+            result = outcome.result or {}
+            entries = result.get("results")
+            counts = [result.get(name) for name in _COUNTS]
+            valid = [count for count in counts if type(count) is int and count >= 0]
+            if (
+                outcome.operation.get("state") == "completed"
+                and isinstance(entries, list)
+                and len(valid) == len(_COUNTS)
+                and sum(valid) == len(chunk) == len(entries)
+                and all(
+                    isinstance(entry, dict)
+                    and isinstance(entry.get("file"), str)
+                    and isinstance(entry.get("status"), str)
+                    for entry in entries
+                )
+                and sorted(entry["file"] for entry in entries) == sorted(chunk)
+                and all(
+                    result[name] == sum(entry.get("status") in statuses for entry in entries)
+                    for name, statuses in BATCH_COUNTERS.items()
+                )
+                and result.get("status")
+                == (
+                    "failed"
+                    if result["failed"]
+                    else "ok"
+                    if result["passed"] == len(chunk)
+                    else "incomplete"
+                )
+            ):
+                report["results"].extend(entries)
+                for name, count in zip(_COUNTS, counts, strict=True):
+                    report[name] += count
+            else:
+                # A failed or cancelled operation, or one whose counts do not
+                # cover its files, checked nothing it can vouch for.
+                report["not_checked"] += len(chunk)
+        status = (
+            "ok"
+            if report["passed"] == len(files)
+            else "failed"
+            if report["failed"]
+            else "incomplete"
+        )
+        judgement = judge_batch(
+            {"status": status, **{name: report[name] for name in _COUNTS}}, entries=len(files)
+        )
+        report.update(status=status, success=judgement.success, decided=judgement.decided)
+        return report
 
     def feedback(
         self,
@@ -1126,14 +1515,15 @@ class ProjectSession:
         which protects the other client's write. This deliberate step instead
         records the workspace's current files as the baseline, so the next sync
         uploads this project's files over them. It reports which paths that sync
-        will upload or delete; nothing is uploaded here.
+        will upload or delete, and which files only the workspace has, which stay;
+        nothing is uploaded here.
         """
         with self._locked() as state:
-            self._ready(state)
+            self._settle(state)
             workspace = self._workspace(state)
             self._environment(state)
-            revision, files = self._manifest(workspace)
-            changes = self._changes(files)
+            revision, remote = self._manifest(workspace)
+            files, changes = self._baseline(remote, tracked=state["files"])
             previous = state["revision"]
             state["revision"] = revision
             state["files"] = files
@@ -1193,6 +1583,41 @@ def _choice_report(
     return {"compatible": True, "environment": selected.public()}
 
 
+# A batch's counts, which partition its files.
+_COUNTS = tuple(BATCH_COUNTERS)
+
+
+def _teardown_report(
+    workspace_id: str | None, *, deleted: bool, stopped: bool, errors: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """What tearing down did; ``errors`` lists each step that failed, in order."""
+    return {
+        "status": "deleted" if deleted else "stopped" if stopped else "failed",
+        "workspace_id": workspace_id,
+        "deleted": deleted,
+        "disconnected": deleted,
+        "recovery_required": not deleted and any(error["step"] == "resend" for error in errors),
+        "errors": errors,
+    }
+
+
+def block_seconds(timeout_seconds: int | None) -> float:
+    """How long a blocking wait lasts: the execution timeout, plus time to start a worker.
+
+    The service ends an operation at its execution timeout, so a wait this long
+    sees it end unless the service itself is unreachable.
+    """
+    return (timeout_seconds or MAX_EXECUTION_SECONDS) + _BLOCK_GRACE_SECONDS
+
+
+def _same_submission(pending: Mapping[str, Any], body: Mapping[str, Any]) -> bool:
+    """Whether a resent request submitted exactly the operation now being asked for."""
+    return pending["method"] in {"submit", "run"} and all(
+        pending["arguments"].get(field) == body.get(field)
+        for field in ("kind", "payload", "resource_profile", "timeout_seconds")
+    )
+
+
 def _check_cap(workspace: Mapping[str, Any], max_spend_microusd: int | None) -> None:
     if max_spend_microusd is not None and (
         type(workspace.get("max_spend_microusd")) is not int
@@ -1243,7 +1668,8 @@ def _validate_journal(state: dict[str, Any]) -> None:
             method, args, key = pending["method"], pending["arguments"], pending["idempotency_key"]
             valid = (
                 isinstance(method, str)
-                and method in {"create_workspace", "sync_files", "submit", "run"}
+                and method
+                in {"create_workspace", "sync_files", "submit", "run", "reconcile_upload"}
                 and isinstance(args, dict)
                 and isinstance(key, str)
                 and len(key) == 32
@@ -1288,7 +1714,15 @@ def _validate_journal(state: dict[str, Any]) -> None:
                     and all(map(text, args["delete_paths"]))
                     and hashes(pending["hashes"])
                 )
-            if method == "sync_files":
+            if method == "reconcile_upload":
+                valid = (
+                    valid
+                    and set(args) == {"workspace_id", "expected_revision", "delete_paths"}
+                    and isinstance(args["delete_paths"], list)
+                    and all(map(text, args["delete_paths"]))
+                    and hashes(pending["hashes"])
+                )
+            elif method == "sync_files":
                 valid = valid and set(args) == {"workspace_id", "expected_revision", *update}
             else:
                 valid = (

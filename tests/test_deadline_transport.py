@@ -5,7 +5,7 @@ import json
 import httpcore
 import httpx
 import pytest
-from leanwarp_cloud import LeanWarpCloud, OperationTimeout
+from leanwarp_cloud import LeanWarpCloud, LeanWarpTransportError, OperationTimeout
 from leanwarp_cloud import transport as deadline_transport
 from leanwarp_cloud.transport import DeadlineTransport
 
@@ -64,7 +64,7 @@ def test_trickling_headers_stop_at_poll_deadline_and_close_connection(monkeypatc
     assert stream.closed
 
 
-def test_core_body_errors_keep_httpx_contract_and_close(monkeypatch):
+def test_core_body_errors_become_transport_errors_and_close(monkeypatch):
     monkeypatch.setattr(deadline_transport, "getproxies", dict)
 
     class BrokenBody(HeaderStream):
@@ -82,7 +82,7 @@ def test_core_body_errors_keep_httpx_contract_and_close(monkeypatch):
             retries=0,
             transport=DeadlineTransport("http://127.0.0.1", network_backend=Backend(stream)),
         ) as cloud,
-        pytest.raises(httpx.ReadError),
+        pytest.raises(LeanWarpTransportError),
     ):
         cloud.versions()
     assert stream.closed
@@ -197,7 +197,7 @@ def test_cleanup_deadline_bounds_real_transport_headers_and_body(monkeypatch, ac
             retries=1,
             transport=DeadlineTransport("http://127.0.0.1", network_backend=Backend(stream)),
         ) as cloud,
-        pytest.raises(httpx.TimeoutException),
+        pytest.raises(LeanWarpTransportError),
     ):
         if action == "submit":
             cloud.submit(
@@ -213,3 +213,20 @@ def test_cleanup_deadline_bounds_real_transport_headers_and_body(monkeypatch, ac
     assert clock[0] == pytest.approx(1020)
     assert all(start < 1020 for start, _ in stream.reads)
     assert stream.closed
+
+
+@pytest.mark.parametrize(
+    "proxies",
+    [
+        {"https": "ftp://127.0.0.1:80"},
+        {"https": "http://127.0.0.1:99999"},
+        {"https": "http://127.0.0.1:port"},
+    ],
+    ids=["scheme", "port-range", "port-text"],
+)
+def test_a_malformed_proxy_setting_is_a_configuration_error(monkeypatch, proxies):
+    from leanwarp_cloud import ConfigurationError
+
+    monkeypatch.setattr(deadline_transport, "getproxies", lambda: proxies)
+    with pytest.raises(ConfigurationError, match="proxy"):
+        DeadlineTransport("https://api.example")

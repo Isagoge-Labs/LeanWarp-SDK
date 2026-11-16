@@ -12,6 +12,7 @@ import pytest
 from leanwarp_cloud import (
     LeanWarpCloud,
     LeanWarpCloudError,
+    LeanWarpTransportError,
     OperationOutcome,
     OperationTimeout,
     ProjectSession,
@@ -20,6 +21,8 @@ from leanwarp_cloud import (
 from leanwarp_cloud import session as session_module
 from leanwarp_cloud.project import MAX_UPLOAD_BYTES, ProjectError
 from leanwarp_cloud.session import UsageError
+
+REJECTED = {"status": "rejected", "failure": {"kind": "axioms"}, "diagnostics": []}
 
 
 class Service:
@@ -40,7 +43,7 @@ class Service:
         self.fail_operation_reads = 0
         self._completion: dict[str, Any] = {}
         # The result a submitted operation completes with, built from its request.
-        self.result_for: Any = lambda body: {"status": "rejected"}
+        self.result_for: Any = lambda body: dict(REJECTED)
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
@@ -63,6 +66,14 @@ class Service:
                         }
                     ]
                 },
+            )
+        if request.method == "GET" and path.endswith("/files"):
+            digests = {
+                name: hashlib.sha256(text.encode()).hexdigest()
+                for name, text in self.sources.items()
+            }
+            return httpx.Response(
+                200, json={"workspace_id": "w", "revision": self.revision, "files": digests}
             )
         if request.method == "GET":
             if "/operations/" in path and self.fail_operation_reads:
@@ -175,7 +186,7 @@ def test_lost_response_recovers_exact_intent_after_restart(project, kind):
     if kind == "operations":
         session.sync()
     service.lose = "/" + kind
-    with pytest.raises(httpx.ReadTimeout):
+    with pytest.raises(LeanWarpTransportError):
         if kind == "workspaces":
             session.connect()
         elif kind == "files":
@@ -193,8 +204,6 @@ def test_lost_response_recovers_exact_intent_after_restart(project, kind):
     assert journal["pending"] and "secret" not in json.dumps(journal)
     (root / "Main.lean").write_text("theorem candidate : False := by sorry\n")
     resumed = ProjectSession(cloud, root)
-    with pytest.raises(SessionError, match="recover"):
-        resumed.submit("check", {"file": "Main.lean"})
     count = len(service.receipts)
     recovered = resumed.recover()
     assert len(service.receipts) == count
@@ -242,7 +251,7 @@ def test_pending_request_owns_nested_payload_and_recovers_exact_snapshot(project
 
     monkeypatch.setattr(cloud, "submit", mutate_caller_then_submit)
     service.lose = "/operations"
-    with pytest.raises(httpx.ReadTimeout):
+    with pytest.raises(LeanWarpTransportError):
         session.submit("try_tactics", {"file": "Main.lean", "tactics": tactics})
     pending = json.loads((root / ".leanwarp/session.json").read_text())["pending"]
     assert pending["arguments"]["payload"]["tactics"] == ["simp"]
@@ -312,7 +321,13 @@ def test_proof_acceptance_requires_matching_runtime_receipt():
         },
     }
     assert not OperationOutcome(op).verified
+    # Only the checker's current policy is a verification.
     op["result"]["result"]["receipt"] = {"policy": "fixed_target_kernel_check_v1"}
+    assert not OperationOutcome(op).verified
+    op["result"]["result"]["receipt"] = {
+        "policy": "fixed_target_kernel_check_v2",
+        "candidate_declaration": "proof",
+    }
     assert OperationOutcome(op).verified
     op["result"]["revision"] = 1
     assert not OperationOutcome(op).verified
@@ -352,7 +367,13 @@ def test_missing_or_malformed_identity_never_verifies(field, value):
             "operation_id": "op",
             "revision": 2,
             "generation": 1,
-            "result": {"status": "ok", "receipt": {"policy": "fixed_target_kernel_check_v1"}},
+            "result": {
+                "status": "ok",
+                "receipt": {
+                    "policy": "fixed_target_kernel_check_v2",
+                    "candidate_declaration": "proof",
+                },
+            },
         },
     }
     op[field] = value
@@ -373,7 +394,13 @@ def test_boolean_envelope_revision_does_not_match_integer_revision():
             "operation_id": "op",
             "revision": True,
             "generation": 1,
-            "result": {"status": "ok", "receipt": {"policy": "fixed_target_kernel_check_v1"}},
+            "result": {
+                "status": "ok",
+                "receipt": {
+                    "policy": "fixed_target_kernel_check_v2",
+                    "candidate_declaration": "proof",
+                },
+            },
         },
     }
     assert not OperationOutcome(op).verified
@@ -420,7 +447,7 @@ def test_submit_and_wait_returns_the_result_that_completes_within_the_wait(proje
     service.pending_polls = 3
     result = session.submit_and_wait("check", {"file": "Main.lean"}, wait_seconds=30)
     assert result["state"] == "completed"
-    assert OperationOutcome(result).result == {"status": "rejected"}
+    assert OperationOutcome(result).result == REJECTED
     assert service.pending_polls == 0
 
 
@@ -563,7 +590,7 @@ def test_invalid_inline_wait_is_rejected_before_any_submission(project, wait_sec
 def test_wrong_account_cannot_recover_a_pending_create(project):
     root, service, _, session = project
     service.lose = "/workspaces"
-    with pytest.raises(httpx.ReadTimeout):
+    with pytest.raises(LeanWarpTransportError):
         session.connect()
     before = (root / ".leanwarp/session.json").read_bytes()
 
@@ -729,7 +756,7 @@ def test_recovery_preserves_nullable_and_legacy_creation_payloads(project, cap):
     }
     key = "b" * 32
     service.lose = "workspaces"
-    with pytest.raises(httpx.ReadTimeout):
+    with pytest.raises(LeanWarpTransportError):
         cloud._request("POST", "workspaces", body=arguments, idempotency_key=key)
     session.directory.mkdir()
     session.path.write_text(
@@ -772,7 +799,7 @@ def test_new_connection_explicitly_selects_prepaid_policy(project):
 def test_capped_connection_recovers_exact_creation_intent(project, cap):
     root, service, cloud, session = project
     service.lose = "/workspaces"
-    with pytest.raises(httpx.ReadTimeout):
+    with pytest.raises(LeanWarpTransportError):
         session.connect(max_spend_microusd=cap)
     journal = json.loads(session.path.read_text())
     assert journal["pending"]["arguments"]["max_spend_microusd"] == cap
@@ -811,7 +838,7 @@ def test_invalid_cap_starts_no_request_and_creates_no_journal(project, cap):
 def test_recovery_keeps_server_default_selection_omitted(project):
     root, service, _, session = project
     service.lose = "workspaces"
-    with pytest.raises(httpx.ReadTimeout):
+    with pytest.raises(LeanWarpTransportError):
         session.connect()
     assert ProjectSession(session.cloud, root).recover()["workspace_id"] == "w"
     posts = [r for r in service.requests if r.method == "POST"]
@@ -906,7 +933,7 @@ def test_other_operation_read_failures_still_stop_submission(pruned):
     session.submit("check", {"file": "Main.lean"})
     service.fail_operation_reads = 1
     count = len(service.receipts)
-    with pytest.raises(httpx.ConnectError):
+    with pytest.raises(LeanWarpTransportError):
         session.submit("check", {"file": "Main.lean"})
     assert len(service.receipts) == count
 
@@ -916,7 +943,7 @@ def test_recovering_an_expired_submission_never_runs_it_again(pruned):
     session.connect()
     session.sync()
     service.lose = "/operations"
-    with pytest.raises(httpx.ReadTimeout):
+    with pytest.raises(LeanWarpTransportError):
         session.submit("check", {"file": "Main.lean"})
     pending = json.loads((root / ".leanwarp/session.json").read_text())["pending"]
     service.expired_keys.add(pending["idempotency_key"])
@@ -1000,17 +1027,19 @@ def test_stop_does_not_wait_for_an_unresolved_submission(shared):
     assert service.requests[-1].url.path.endswith("/w/stop")
     # The unresolved request stays recorded for recovery.
     assert json.loads((root / ".leanwarp/session.json").read_text())["pending"] == pending
-    with pytest.raises(SessionError, match="recover"):
-        session.submit("check", {"file": "Main.lean"})
+    # The next command resends it; asking for the same work returns what that started.
+    assert session.submit("check", {"file": "Main.lean"})["kind"] == "check"
+    assert json.loads((root / ".leanwarp/session.json").read_text())["pending"] is None
 
 
-def test_stop_without_a_known_workspace_still_needs_recovery(shared):
+def test_stop_with_an_unresolved_creation_has_nothing_to_stop(shared):
     _, service, session = shared
     service.lose = "/workspaces"
-    with pytest.raises(httpx.ReadTimeout):
+    with pytest.raises(LeanWarpTransportError):
         session.connect()
-    with pytest.raises(SessionError, match="recover"):
-        session.stop()
+    before = len(service.requests)
+    assert session.stop() == {"status": "no_worker", "recovery_required": True}
+    assert len(service.requests) == before
 
 
 def test_reconcile_adopts_another_clients_revision_explicitly(shared):
@@ -1036,12 +1065,20 @@ def test_reconcile_adopts_another_clients_revision_explicitly(shared):
         "revision": service.revision,
         "previous_revision": service.revision - 1,
         "upload": ["Helper.lean", "Main.lean"],
-        "delete": ["Other.lean"],
+        "delete": [],
+        "remote_only": ["Other.lean"],
     }
     synced = session.sync()
     assert synced["revision"] == service.revision
-    assert set(service.sources) == {"Main.lean", "Helper.lean"}
+    assert set(service.sources) == {"Main.lean", "Helper.lean", "Other.lean"}
     assert "by trivial" in service.sources["Main.lean"]
+    # A file this project tracked and then removed is still removed.
+    (root / "Helper.lean").unlink()
+    service.sources["Main.lean"] = "theorem candidate : True := True.intro"
+    service.revision += 1
+    assert session.reconcile()["delete"] == ["Helper.lean"]
+    session.sync()
+    assert set(service.sources) == {"Main.lean", "Other.lean"}
 
 
 @pytest.mark.parametrize(
@@ -1074,7 +1111,7 @@ def test_failed_reconcile_preserves_revision_fence(shared, name, content, messag
         session.sync()
     assert conflict.value.code == "revision_conflict"
     assert service.sources["Other.lean"] == "def other := 1"
-    assert session.reconcile()["delete"] == ["Other.lean"]
+    assert session.reconcile()["remote_only"] == ["Other.lean"]
 
 
 class AccountWorkspaces(SharedWorkspace):
@@ -1167,7 +1204,8 @@ def test_connecting_to_an_existing_workspace_uploads_only_the_differences(accoun
     (root / "Helper.lean").write_text("def helper := 2")
     connected = session.connect(workspace_id="w")
     assert connected["connected_existing"] is True
-    assert connected["upload"] == ["Helper.lean"] and connected["delete"] == ["Old.lean"]
+    assert connected["upload"] == ["Helper.lean"] and connected["delete"] == []
+    assert connected["remote_only"] == ["Old.lean"]
     assert service.workspace_count == 0
     # Connecting again to the same workspace changes nothing.
     assert session.connect(workspace_id="w")["workspace_id"] == "w"
@@ -1178,10 +1216,51 @@ def test_connecting_to_an_existing_workspace_uploads_only_the_differences(accoun
     assert json.loads(upload.content) == {
         "expected_revision": 3,
         "files": {"Helper.lean": "def helper := 2"},
-        "delete_paths": ["Old.lean"],
+        "delete_paths": [],
     }
     with pytest.raises(SessionError, match="connected to workspace w"):
         session.connect(workspace_id="x")
+
+
+def test_prune_deletes_only_the_list_that_was_confirmed(account):
+    root, service, session = account
+    session.connect(workspace_id="w")
+    (root / "Local.lean").write_text("def local := 1")
+    before = dict(service.sources)
+    preview = session.prune()
+    assert preview["status"] == "confirmation_required"
+    assert preview["remote_only"] == ["Old.lean"]
+    assert service.sources == before
+    # Without a matching token, nothing is deleted.
+    with pytest.raises(SessionError, match="changed since that list"):
+        session.prune("wrong")
+    assert service.sources == before
+    pruned = session.prune(preview["confirm"])
+    assert pruned["status"] == "pruned" and pruned["deleted"] == ["Old.lean"]
+    assert "Old.lean" not in service.sources and "Local.lean" not in service.sources
+    assert session.prune()["status"] == "nothing_to_prune"
+    # The unsynced local file still uploads on the next sync.
+    session.sync()
+    assert "Local.lean" in service.sources
+
+
+def test_a_prune_token_is_refused_once_the_list_has_changed(account):
+    _, service, session = account
+    session.connect(workspace_id="w")
+    token = session.prune()["confirm"]
+    service.sources["Added.lean"] = "def added := 1"
+    service.revision += 1
+    with pytest.raises(SessionError, match="changed since that list"):
+        session.prune(token)
+    assert "Old.lean" in service.sources
+
+
+def test_prune_never_lists_a_tracked_file_removed_locally(project):
+    root, _, _, session = project
+    session.connect()
+    session.sync()
+    (root / "Main.lean").unlink()
+    assert session.prune()["status"] == "nothing_to_prune"
 
 
 def test_an_existing_workspace_must_match_the_project_or_be_named(account):
@@ -1214,7 +1293,7 @@ def test_failed_attach_does_not_save_an_unpreviewed_baseline(account, name, cont
         session.connect(workspace_id="w")
     assert not session.path.exists()
     invalid.unlink()
-    assert session.connect(workspace_id="w")["delete"] == ["Old.lean"]
+    assert session.connect(workspace_id="w")["remote_only"] == ["Old.lean"]
 
 
 def test_workspaces_mark_this_project_and_history_reads_every_page(account):
@@ -1236,18 +1315,17 @@ def test_workspaces_mark_this_project_and_history_reads_every_page(account):
 def test_deleting_needs_the_workspace_named_and_disconnects_only_its_project(account):
     root, service, session = account
     service.lose = "/workspaces"
-    with pytest.raises(httpx.ReadTimeout):
+    with pytest.raises(LeanWarpTransportError):
         session.connect()
-    # An unresolved create could be the workspace being deleted.
-    with pytest.raises(SessionError, match="recover"):
-        session.delete("w")
-    assert service.deleted == []
-    (root / ".leanwarp/session.json").unlink()
+    # An unresolved create could be the workspace named, so it is resolved first.
+    assert session.delete("w") == {"status": "deleted", "workspace_id": "w", "disconnected": True}
+    assert service.deleted == ["w"]
     session.connect(workspace_id="w")
     assert session.delete("x") == {"status": "deleted", "workspace_id": "x", "disconnected": False}
     assert json.loads((root / ".leanwarp/session.json").read_text())["workspace_id"] == "w"
+    # The fake already deleted w, so this deletion converges on its absence.
     assert session.delete("w") == {"status": "deleted", "workspace_id": "w", "disconnected": True}
-    assert service.deleted == ["x", "w"]
+    assert service.deleted == ["w", "x"]
     journal = json.loads((root / ".leanwarp/session.json").read_text())
     assert "workspace_id" not in journal and journal["files"] == {}
     assert journal["pending"] is None
@@ -1265,7 +1343,7 @@ def test_explicit_delete_recovers_an_already_deleted_connection(account, deleted
     assert json.loads(before)["pending"] is not None
     if deleted_by == "lost_response":
         service.lose = "/delete"
-        with pytest.raises(httpx.ReadTimeout):
+        with pytest.raises(LeanWarpTransportError):
             session.delete("w")
         assert session.path.read_bytes() == before
     else:
@@ -1296,7 +1374,7 @@ def test_delete_keeps_connection_on_unconfirmed_absence(account, workspace, erro
     service.delete_error = error
     with pytest.raises(LeanWarpCloudError) as rejected:
         session.delete(workspace)
-    assert (rejected.value.status_code, rejected.value.code) == error
+    assert (rejected.value.status, rejected.value.code) == error
     assert session.path.read_bytes() == before
 
 
@@ -1447,6 +1525,7 @@ def test_apply_writes_a_sorry2lemma_transformation(project):
         "status": "extracted",
         "file": body["payload"]["file"],
         "source_changed": True,
+        "targets": [],
         "source_sha256": hashlib.sha256(SORRY.encode()).hexdigest(),
         "transformed_source": transformed,
         "transformed_source_sha256": hashlib.sha256(transformed.encode()).hexdigest(),
@@ -1973,17 +2052,107 @@ def test_an_interrupted_settlement_of_a_refused_submission_stays_recoverable(pro
     root, service, cloud, session = project
     session.connect()
     service.reject_submission = True
-    sync = cloud.sync_files
 
-    def interrupted(**arguments):
-        monkeypatch.setattr(cloud, "sync_files", sync)
-        raise httpx.ConnectError("connection reset")
+    def unreadable(_workspace_id):
+        raise LeanWarpTransportError("could not reach LeanWarp")
 
-    monkeypatch.setattr(cloud, "sync_files", interrupted)
+    monkeypatch.setattr(cloud, "workspace_files", unreadable)
     with pytest.raises(LeanWarpCloudError):
         session.submit("check", {"file": "Main.lean"})
     # The committed update is still recorded, not forgotten with the refusal.
-    assert json.loads(session.path.read_text())["pending"]["method"] == "sync_files"
+    assert json.loads(session.path.read_text())["pending"]["method"] == "reconcile_upload"
+    monkeypatch.undo()
     ProjectSession(cloud, root).recover()
     journal = json.loads(session.path.read_text())
     assert journal["pending"] is None and journal["revision"] == service.revision == 1
+
+
+def test_a_committed_upload_is_adopted_beside_files_only_the_workspace_has(account):
+    root, service, session = account
+    session.connect(workspace_id="w")
+    (root / "Helper.lean").write_text("def helper := 2")
+    service.reject_submission = True
+    with pytest.raises(LeanWarpCloudError):
+        session.submit("check", {"file": "Main.lean"})
+    journal = json.loads(session.path.read_text())
+    assert journal["pending"] is None
+    assert journal["revision"] == service.revision
+    assert "Old.lean" in service.sources and "Old.lean" not in journal["files"]
+
+
+def test_a_rejection_that_committed_nothing_writes_nothing(project):
+    _, service, _, session = project
+    session.connect()
+    before = len(service.requests)
+    service.reject = True
+    with pytest.raises(LeanWarpCloudError):
+        session.submit("check", {"file": "Main.lean"})
+    assert [method for method, _ in _sent(service, before) if method == "PUT"] == []
+    journal = json.loads(session.path.read_text())
+    assert journal["pending"] is None
+    assert journal["revision"] == service.revision == 0
+
+
+def test_a_rejection_after_the_commit_adopts_it_without_writing(project):
+    _, service, _, session = project
+    session.connect()
+    before = len(service.requests)
+    service.reject_submission = True
+    with pytest.raises(LeanWarpCloudError):
+        session.submit("check", {"file": "Main.lean"})
+    assert [method for method, _ in _sent(service, before) if method == "PUT"] == []
+    assert json.loads(session.path.read_text())["revision"] == service.revision == 1
+
+
+def test_a_rejection_on_a_removed_workspace_leaves_nothing_to_recover(project, monkeypatch):
+    _, service, cloud, session = project
+    session.connect()
+    service.reject = True
+
+    def removed(_workspace_id):
+        raise LeanWarpCloudError(404, "workspace_not_found", "gone")
+
+    monkeypatch.setattr(cloud, "workspace_files", removed)
+    with pytest.raises(LeanWarpCloudError):
+        session.submit("check", {"file": "Main.lean"})
+    assert json.loads(session.path.read_text())["pending"] is None
+
+
+def test_submissions_carry_the_lakefiles_supported_options(project):
+    root, service, _, session = project
+    (root / "lakefile.toml").write_text(
+        'name = "p"\n[leanOptions]\nmaxSynthPendingDepth = 3\nwarn.sorry = false\n'
+    )
+    session.connect()
+    session.submit("check", {"file": "Main.lean"})
+    body = json.loads(service.requests[-1].content)
+    assert body["payload"] == {"file": "Main.lean", "lean_options": {"maxSynthPendingDepth": 3}}
+
+
+def test_status_names_options_the_service_will_not_apply(project):
+    root, _, _, session = project
+    (root / "lakefile.toml").write_text('name = "p"\n[leanOptions]\nwarn.sorry = false\n')
+    session.connect()
+    status = session.status()
+    assert status["lean_options"] == {}
+    assert status["lean_options_ignored"] == ["warn.sorry"]
+
+
+def test_recovery_after_a_rejection_never_uploads_what_was_rejected(project, monkeypatch):
+    root, service, cloud, session = project
+    session.connect()
+    service.reject = True
+
+    def unreadable(_workspace_id):
+        raise LeanWarpTransportError("could not reach LeanWarp")
+
+    monkeypatch.setattr(cloud, "workspace_files", unreadable)
+    with pytest.raises(LeanWarpCloudError):
+        session.submit("check", {"file": "Main.lean"})
+    monkeypatch.undo()
+    before = len(service.requests)
+    ProjectSession(cloud, root).recover()
+    assert _sent(service, before) == [("GET", "files")]
+    journal = json.loads(session.path.read_text())
+    assert journal["pending"] is None
+    assert journal["revision"] == service.revision == 0

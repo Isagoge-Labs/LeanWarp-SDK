@@ -8,6 +8,8 @@ import json
 import re
 import subprocess
 import sys
+import threading
+import warnings
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from importlib.metadata import PackageNotFoundError, distribution
@@ -18,8 +20,13 @@ from ._version import __version__
 
 UPDATE_COMMAND = "leanwarp update"
 _RELEASE = re.compile(r"[0-9]{1,4}(?:\.[0-9]{1,4}){0,3}")
+# A date in the form the service sends: printable, short, and free of header syntax.
+_SUNSET = re.compile(r"[0-9A-Za-z][0-9A-Za-z :,+-]{0,39}")
 # The newest release any response in this process named.
 _latest: list[str] = []
+# When the service stops accepting this release, once a response has named a date.
+_sunset: list[str] = []
+_sunset_lock = threading.Lock()
 
 
 def release(version: str) -> tuple[tuple[int, ...], bool] | None:
@@ -31,20 +38,43 @@ def release(version: str) -> tuple[tuple[int, ...], bool] | None:
     return numbers + (0,) * (4 - len(numbers)), match.end() == len(version)
 
 
-def record(headers: Mapping[str, str]) -> None:
+def record(headers: Mapping[str, str], *, warn: bool = False) -> None:
+    """Remember what a response says about SDK releases.
+
+    With ``warn`` (the Python library), the first sunset date this process sees
+    raises one DeprecationWarning; the CLI and MCP report it in `update_available`.
+    """
     latest = headers.get("LeanWarp-SDK-Latest", "")
     if release(latest) is not None and len(latest) <= 32:
         _latest[:] = [latest]
+    sunset = headers.get("LeanWarp-SDK-Sunset", "")
+    if _SUNSET.fullmatch(sunset) is None:
+        return
+    with _sunset_lock:
+        first = not _sunset
+        _sunset[:] = [sunset]
+    if first and warn:
+        warnings.warn(
+            f"LeanWarp stops accepting SDK {__version__} on {sunset}; upgrade the leanwarp package",
+            DeprecationWarning,
+            # record -> _request -> public client method -> the caller.
+            stacklevel=4,
+        )
 
 
 def notice() -> dict[str, Any] | None:
-    """What to tell the user when the service names a newer release, else None."""
-    if not _latest:
+    """What to tell the user when this release is outdated or being retired, else None."""
+    current = release(__version__)
+    latest = release(_latest[0]) if _latest else None
+    newer = current is not None and latest is not None and latest > current
+    if not newer and not _sunset:
         return None
-    current, latest = release(__version__), release(_latest[0])
-    if current is None or latest is None or latest <= current:
-        return None
-    return {"current": __version__, "latest": _latest[0], "command": UPDATE_COMMAND}
+    return {
+        "current": __version__,
+        **({"latest": _latest[0]} if _latest else {}),
+        "command": UPDATE_COMMAND,
+        **({"sunset": _sunset[0]} if _sunset else {}),
+    }
 
 
 def noted(result: dict[str, Any]) -> dict[str, Any]:
@@ -116,13 +146,15 @@ def update(*, run: Run = _run) -> dict[str, Any]:
         }
     # The new release's own command refreshes the skills, so they match it.
     leanwarp = str(Path(sys.executable).with_name("leanwarp"))
-    version, skills = "", None
+    version, skills, left = "", None, []
     with suppress(OSError, subprocess.SubprocessError):
         version = run([leanwarp, "--version"]).stdout.strip().removeprefix("leanwarp ")
     with suppress(OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError):
         refreshed = run([leanwarp, "setup", "--refresh"])
         if refreshed.returncode == 0:
-            skills = [entry["skill"] for entry in json.loads(refreshed.stdout)["agents"]]
+            entries = json.loads(refreshed.stdout)["agents"]
+            skills = [entry["skill"] for entry in entries]
+            left = [item for entry in entries for item in entry.get("skill_files_left", [])]
     report: dict[str, Any] = {
         "previous": __version__,
         "version": version or None,
@@ -135,6 +167,17 @@ def update(*, run: Run = _run) -> dict[str, Any]:
             "status": "skills_not_refreshed",
             "message": "leanwarp was upgraded, but its installed skills were not refreshed; "
             "run `leanwarp setup --refresh`, then restart your agent",
+        }
+    if left:
+        # Setup never writes over a file that is not its own, so these keep old text.
+        return {
+            **report,
+            "status": "skills_partly_refreshed",
+            "skills_refreshed": skills,
+            "skill_files_left": left,
+            "message": "leanwarp was upgraded, but some installed skill files were left as "
+            "they are because they are no longer the ones setup wrote; replace or remove "
+            "them, run `leanwarp setup --refresh`, then restart your agent",
         }
     return {
         **report,

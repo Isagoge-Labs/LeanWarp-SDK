@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 from collections.abc import Sequence
@@ -27,6 +28,7 @@ def no_claude(command: Sequence[str], cwd: object = None) -> subprocess.Complete
 
 def test_setup_installs_skills_and_adds_mcp_entries_without_replacing_any(tmp_path):
     (tmp_path / ".claude").mkdir()
+    (tmp_path / ".agents").mkdir()
     (tmp_path / ".codex").mkdir()
     (tmp_path / ".codex" / "config.toml").write_text('model = "o4"\n')
     (tmp_path / ".cursor").mkdir()
@@ -97,8 +99,10 @@ def test_setup_skips_missing_agents_unless_named_and_honours_their_homes(tmp_pat
         "claude-code": "not_found",
         "codex": "not_found",
         "cursor": "not_found",
-        "agents": "ok",
+        # Setup creates no folder for an agent that is not installed, ~/.agents included.
+        "agents": "not_found",
     }
+    assert not (tmp_path / ".agents").exists()
     named = setup(agents=["codex"], home=tmp_path, environ={"CODEX_HOME": str(codex_home)})
     assert named["agents"][0]["skill"] == str(codex_home / "skills" / "leanwarp")
     assert (codex_home / "config.toml").read_text().startswith("[mcp_servers.leanwarp]")
@@ -106,9 +110,14 @@ def test_setup_skips_missing_agents_unless_named_and_honours_their_homes(tmp_pat
 
 def test_refresh_replaces_installed_skills_only_and_leaves_mcp_alone(tmp_path):
     (tmp_path / ".cursor").mkdir()
+    setup(agents=["agents"], home=tmp_path, environ={}, run=no_claude)
     stale = tmp_path / ".agents" / "skills" / "leanwarp" / "SKILL.md"
-    stale.parent.mkdir(parents=True)
+    # The guide an earlier release installed, as its record says.
     stale.write_text("old guide")
+    record = tmp_path / ".config" / "leanwarp" / "setup.json"
+    document = json.loads(record.read_text())
+    document["items"][str(stale)]["sha256"] = hashlib.sha256(b"old guide").hexdigest()
+    record.write_text(json.dumps(document))
     report = setup(refresh=True, home=tmp_path, environ={}, run=no_claude)
     assert [entry["agent"] for entry in report["agents"]] == ["agents"]
     assert stale.read_text() != "old guide"
@@ -250,7 +259,7 @@ def test_setup_needs_no_key_and_says_what_is_next(monkeypatch, capsys):
     ],
 )
 def test_codex_config_is_read_as_toml_and_never_left_unreadable(tmp_path, existing, status):
-    import tomllib
+    from leanwarp_cloud import _toml
 
     config = tmp_path / ".codex" / "config.toml"
     config.parent.mkdir()
@@ -259,7 +268,7 @@ def test_codex_config_is_read_as_toml_and_never_left_unreadable(tmp_path, existi
     assert report["agents"][0]["mcp"] == status
     assert config.read_text() == existing
     if status == "already_configured":
-        tomllib.loads(config.read_text())
+        _toml.loads(config.read_text())
 
 
 def test_setup_exits_nonzero_when_a_config_could_not_be_read(monkeypatch, capsys):
@@ -296,4 +305,24 @@ def test_update_says_when_installed_skills_were_not_refreshed(monkeypatch):
 
     report = updates.update(run=run)
     assert report["status"] == "skills_not_refreshed" and report["version"] == "9.9.9"
+    assert "leanwarp setup --refresh" in report["message"]
+
+
+def test_update_says_which_skill_files_it_left_as_they_were(monkeypatch):
+    monkeypatch.setattr(
+        updates, "upgrade_command", lambda *_a, **_k: ["uv", "tool", "upgrade", "leanwarp"]
+    )
+    left = {"path": "/home/u/.claude/skills/leanwarp/SKILL.md", "state": "user_file"}
+    refreshed = {"agents": [{"agent": "claude-code", "skill": "/s", "skill_files_left": [left]}]}
+
+    def run(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if command[-1] == "--version":
+            return completed(stdout="leanwarp 9.9.9\n")
+        if command[-1] == "--refresh":
+            return completed(stdout=json.dumps(refreshed))
+        return completed()
+
+    report = updates.update(run=run)
+    assert report["status"] == "skills_partly_refreshed"
+    assert report["skill_files_left"] == [left] and report["skills_refreshed"] == ["/s"]
     assert "leanwarp setup --refresh" in report["message"]

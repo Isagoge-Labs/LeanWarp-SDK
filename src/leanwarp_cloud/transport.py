@@ -14,6 +14,8 @@ from urllib.request import getproxies
 import httpcore
 import httpx
 
+from .errors import ConfigurationError
+
 _deadline: ContextVar[float | None] = ContextVar("leanwarp_deadline", default=None)
 
 
@@ -174,7 +176,6 @@ class DeadlineTransport(httpx.BaseTransport):
         self, origin: str, *, network_backend: httpcore.NetworkBackend | None = None
     ) -> None:
         url = httpx.URL(origin)
-        proxy_url = _environment_proxy(url)
         options: dict[str, Any] = {
             "ssl_context": httpx.create_ssl_context(),
             "max_connections": 100,
@@ -183,14 +184,22 @@ class DeadlineTransport(httpx.BaseTransport):
             "network_backend": _Backend(network_backend or httpcore.SyncBackend()),
         }
         self.pool: httpcore.ConnectionPool
-        if proxy_url:
-            proxy = httpx.Proxy(proxy_url)
-            if proxy.url.scheme not in {"http", "https"}:
-                raise ValueError("LeanWarp deadline transport requires an HTTP or HTTPS proxy")
-            self.pool = httpcore.HTTPProxy(
-                proxy_url=str(proxy.url), proxy_auth=proxy.raw_auth, **options
-            )
-        else:
+        # Every proxy setting is parsed here, so a malformed one is a configuration
+        # error that names no value, not an exception from the HTTP library.
+        try:
+            proxy_url = _environment_proxy(url)
+            proxy = httpx.Proxy(proxy_url) if proxy_url else None
+            if proxy is not None:
+                if proxy.url.scheme not in {"http", "https"}:
+                    raise ValueError("not an HTTP or HTTPS proxy")
+                self.pool = httpcore.HTTPProxy(
+                    proxy_url=str(proxy.url), proxy_auth=proxy.raw_auth, **options
+                )
+        except (ValueError, httpx.InvalidURL) as error:
+            raise ConfigurationError(
+                "the proxy settings in the environment are not a valid HTTP or HTTPS proxy URL"
+            ) from error
+        if proxy is None:
             self.pool = httpcore.ConnectionPool(**options)
 
     def handle_request(self, request: httpx.Request) -> httpx.Response:

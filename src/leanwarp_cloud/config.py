@@ -10,7 +10,7 @@ from pathlib import Path
 
 from .client import Interface, LeanWarpCloud
 from .endpoints import api_origin
-from .session import SessionError
+from .errors import SessionError
 
 
 def credentials_path() -> Path:
@@ -54,6 +54,11 @@ def load_client(*, interface: Interface = "python") -> LeanWarpCloud:
             f"{path} is not a valid credential file; run `leanwarp auth login` to replace it"
         ) from error
     return LeanWarpCloud(key, interface=interface)
+
+
+def feedback_enabled() -> bool:
+    """Whether the feedback command and tool are on; ``LEANWARP_FEEDBACK=off`` turns them off."""
+    return os.environ.get("LEANWARP_FEEDBACK", "").strip().lower() != "off"
 
 
 def signed_in() -> bool:

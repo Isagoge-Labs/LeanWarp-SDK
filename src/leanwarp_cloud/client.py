@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import email.utils
 import hashlib
 import hmac
+import itertools
 import json
+import logging
+import random
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, get_args
 from urllib.parse import quote, urlencode, urlparse
@@ -17,10 +22,12 @@ import httpx
 from ._version import __version__
 from .amounts import validate_spending_cap
 from .endpoints import api_origin, public_origin
+from .errors import LeanWarpCloudError, LeanWarpTransportError, OperationTimeout, UsageError
 from .project import choose_environment, project_identity, validate_selection
 from .transport import DeadlineTransport
 from .updates import record as record_releases
 
+_LOG = logging.getLogger("leanwarp")
 _MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 #: Which SDK surface sends requests; the service reads it from the User-Agent.
 Interface = Literal["python", "cli", "mcp"]
@@ -29,6 +36,8 @@ _INTERFACES = frozenset(get_args(Interface))
 MAX_SERVER_WAIT_SECONDS = 20.0
 #: The most operations one history page holds.
 MAX_OPERATION_PAGE = 25
+#: The most operations one ``wait_operations`` names.
+MAX_WAITED_OPERATIONS = 100
 #: Every operation the service runs; mirrors the service's runtime contract.
 OperationKind = Literal[
     "check",
@@ -58,23 +67,12 @@ MAX_FEEDBACK_SUMMARY = 200
 MAX_FEEDBACK_DETAILS = 4000
 # Time allowed for a held response to arrive after the server stops waiting.
 _RESPONSE_MARGIN = 2.0
-
-
-class LeanWarpCloudError(RuntimeError):
-    def __init__(self, status_code: int, code: str, message: str) -> None:
-        self.status_code = status_code
-        self.code = code
-        super().__init__(message)
-
-
-class OperationTimeout(TimeoutError):
-    """Polling expired; the operation remains addressable and may still be running."""
-
-    def __init__(self, operation_id: str, operation: dict[str, Any] | None = None) -> None:
-        self.operation_id = operation_id
-        # The last non-terminal observation, when polling read one.
-        self.operation = operation
-        super().__init__(f"operation {operation_id} is still pending; poll again or cancel it")
+# How long a transient failure keeps being retried when the caller set no deadline.
+# An MCP tool call must finish inside the client's own limit, about a minute.
+_RETRY_WINDOW_SECONDS = 60.0
+_MCP_RETRY_WINDOW_SECONDS = 15.0
+_BACKOFF_BASE_SECONDS = 0.25
+_BACKOFF_CAP_SECONDS = 5.0
 
 
 class LeanWarpCloud:
@@ -84,18 +82,24 @@ class LeanWarpCloud:
         *,
         base_url: str | None = None,
         timeout: float = 30.0,
-        retries: int = 2,
+        retries: int | None = None,
         transport: httpx.BaseTransport | None = None,
         interface: Interface = "python",
     ) -> None:
         """Without a key, only ``versions`` works: the production catalog is public,
-        so a project can be checked before signing up."""
+        so a project can be checked before signing up.
+
+        Reads, ``stop``, ``cancel``, ``delete`` and writes with an idempotency key are
+        resent after 429, 502, 503, 504 or a transport failure until the caller's
+        deadline, or a minute without one. ``retries`` further limits how many times;
+        0 sends each request once.
+        """
         if base_url is None:
             base_url = public_origin() if api_key is None else api_origin(api_key)
         parsed = urlparse(base_url)
         local = parsed.hostname in {"localhost", "127.0.0.1", "::1"}
         if parsed.scheme != "https" and not (parsed.scheme == "http" and local):
-            raise ValueError("base_url must use HTTPS (HTTP is supported only on localhost)")
+            raise UsageError("base_url must use HTTPS (HTTP is supported only on localhost)")
         if (
             not parsed.hostname
             or parsed.path not in {"", "/"}
@@ -104,17 +108,17 @@ class LeanWarpCloud:
             or parsed.query
             or parsed.fragment
         ):
-            raise ValueError(
+            raise UsageError(
                 "base_url must be an origin without a path, credentials, query or fragment"
             )
         if api_key is not None and (
             not api_key or api_key.strip() != api_key or "\n" in api_key or "\r" in api_key
         ):
-            raise ValueError("api_key must be a nonempty token")
-        if timeout <= 0 or not 0 <= retries <= 5:
-            raise ValueError("timeout must be positive and retries must be between zero and five")
+            raise UsageError("api_key must be a nonempty token")
+        if timeout <= 0 or (retries is not None and not 0 <= retries <= 5):
+            raise UsageError("timeout must be positive and retries must be between zero and five")
         if interface not in _INTERFACES:
-            raise ValueError("interface must be python, cli or mcp")
+            raise UsageError("interface must be python, cli or mcp")
         self._client = httpx.Client(
             base_url=base_url.rstrip("/") + "/",
             headers={
@@ -129,6 +133,10 @@ class LeanWarpCloud:
         )
         self._retries = retries
         self._timeout = timeout
+        self._interface = interface
+        self._retry_window = (
+            _MCP_RETRY_WINDOW_SECONDS if interface == "mcp" else _RETRY_WINDOW_SECONDS
+        )
         self.base_url = base_url.rstrip("/")
         self._owner: str | None = None
         # Proves an account binding was made with this key at this service, so a
@@ -257,7 +265,7 @@ class LeanWarpCloud:
         after the last one. A page may hold fewer than ``limit`` operations.
         """
         if isinstance(limit, bool) or not 1 <= limit <= MAX_OPERATION_PAGE:
-            raise ValueError(f"limit must be between 1 and {MAX_OPERATION_PAGE}")
+            raise UsageError(f"limit must be between 1 and {MAX_OPERATION_PAGE}")
         query = {"limit": limit} | ({"cursor": cursor} if cursor is not None else {})
         path = f"workspaces/{_segment(workspace_id)}/operations?{urlencode(query)}"
         return self._request("GET", path)
@@ -307,7 +315,7 @@ class LeanWarpCloud:
             body["resource_profile"] = resource_profile
         if timeout_seconds is not None:
             if type(timeout_seconds) is not int or not 1 <= timeout_seconds <= 600:
-                raise ValueError("timeout_seconds must be an integer between 1 and 600")
+                raise UsageError("timeout_seconds must be an integer between 1 and 600")
             body["timeout_seconds"] = timeout_seconds
         return self._request(
             "POST",
@@ -339,7 +347,7 @@ class LeanWarpCloud:
         20), the server holds it until the operation ends, as ``operation`` does.
         """
         if not 0 <= wait_seconds <= MAX_SERVER_WAIT_SECONDS:
-            raise ValueError(f"wait_seconds must be between 0 and {MAX_SERVER_WAIT_SECONDS:g}")
+            raise UsageError(f"wait_seconds must be between 0 and {MAX_SERVER_WAIT_SECONDS:g}")
         body: dict[str, Any] = {
             "kind": kind,
             "expected_revision": expected_revision,
@@ -351,7 +359,7 @@ class LeanWarpCloud:
             body["resource_profile"] = resource_profile
         if timeout_seconds is not None:
             if type(timeout_seconds) is not int or not 1 <= timeout_seconds <= 600:
-                raise ValueError("timeout_seconds must be an integer between 1 and 600")
+                raise UsageError("timeout_seconds must be an integer between 1 and 600")
             body["timeout_seconds"] = timeout_seconds
         path = f"workspaces/{_segment(workspace_id)}/run"
         if wait_seconds > 0:
@@ -374,13 +382,55 @@ class LeanWarpCloud:
         operation ends or that many seconds pass, instead of answering at once.
         """
         if not 0 <= wait_seconds <= MAX_SERVER_WAIT_SECONDS:
-            raise ValueError(f"wait_seconds must be between 0 and {MAX_SERVER_WAIT_SECONDS:g}")
+            raise UsageError(f"wait_seconds must be between 0 and {MAX_SERVER_WAIT_SECONDS:g}")
+        return self._read_operation(operation_id, deadline, wait_seconds)
+
+    def _read_operation(
+        self,
+        operation_id: str,
+        deadline: float | None,
+        wait_seconds: float,
+        *,
+        retry: bool | None = None,
+    ) -> dict[str, Any]:
         path = f"operations/{_segment(operation_id)}"
         if wait_seconds > 0:
             path += f"?wait_seconds={wait_seconds:.3f}"
-        result = self._request("GET", path, deadline=deadline, hold_seconds=wait_seconds)
+        result = self._request(
+            "GET", path, deadline=deadline, hold_seconds=wait_seconds, retry=retry
+        )
         if result.get("operation_id") != operation_id:
             raise LeanWarpCloudError(502, "invalid_response", "operation identity does not match")
+        return result
+
+    def wait_operations(
+        self,
+        operation_ids: Sequence[str],
+        *,
+        wait_seconds: float = 0,
+        deadline: float | None = None,
+    ) -> dict[str, Any]:
+        """Read up to 100 operations in one request.
+
+        With ``wait_seconds`` (at most 20), the server answers as soon as any of them
+        ends. The response is ``{"operations": [...], "unread": [...]}``: pending ones
+        without results, finished ones in full, and in ``unread`` the IDs of finished
+        ones left out to keep the response small; read each with ``operation``.
+        """
+        if not 1 <= len(operation_ids) <= MAX_WAITED_OPERATIONS or any(
+            not isinstance(item, str) or "," in item for item in operation_ids
+        ):
+            raise UsageError(f"name 1 to {MAX_WAITED_OPERATIONS} operation IDs")
+        if not 0 <= wait_seconds <= MAX_SERVER_WAIT_SECONDS:
+            raise UsageError(f"wait_seconds must be between 0 and {MAX_SERVER_WAIT_SECONDS:g}")
+        path = "operations?ids=" + ",".join(_segment(item) for item in operation_ids)
+        if wait_seconds > 0:
+            path += f"&wait_seconds={wait_seconds:.3f}"
+        result = self._request("GET", path, deadline=deadline, hold_seconds=wait_seconds)
+        if not isinstance(result.get("operations"), list) or not isinstance(
+            result.get("unread"), list
+        ):
+            raise LeanWarpCloudError(502, "invalid_response", "expected operations and unread")
         return result
 
     def check(
@@ -580,9 +630,13 @@ class LeanWarpCloud:
         timeout_seconds: int | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
-        """Check up to 64 files in one operation; timeout bounds each file in seconds."""
+        """Check up to 64 files in one operation; timeout bounds each file in seconds.
+
+        Without timeout each file has 60 seconds. A timeout must fit the
+        operation's budget for its files (timeout_seconds less 40, at most 210).
+        """
         if not 1 <= len(files) <= MAX_BATCH_FILES:
-            raise ValueError(f"check_files takes 1 to {MAX_BATCH_FILES} files")
+            raise UsageError(f"check_files takes 1 to {MAX_BATCH_FILES} files")
         payload: dict[str, Any] = {"files": list(files), "strict": strict}
         if timeout is not None:
             payload["timeout"] = timeout
@@ -598,7 +652,7 @@ class LeanWarpCloud:
     def verify_batch(
         self,
         workspace_id: str,
-        codes: list[dict[str, str]],
+        codes: list[dict[str, Any]],
         *,
         expected_revision: int,
         strict: bool = True,
@@ -610,12 +664,27 @@ class LeanWarpCloud:
 
         Each code is ``{"custom_id": ..., "proof": ...}`` with a unique custom_id.
         Proofs may import the environment's packages, such as Mathlib, but not the
-        workspace's own modules. timeout bounds each proof in seconds.
+        workspace's own modules. timeout bounds each proof in seconds: 60 without
+        one, and at most the operation's budget for its proofs (timeout_seconds
+        less 40, at most 210).
+
+        A code may add ``"target": {"context": ..., "statement": ..., "declaration":
+        ...}``: the proof must then prove that statement, checked by the checker,
+        and an accepted entry carries its ``receipt`` (strict only). Without one,
+        ``ok`` means the source compiles, its declarations pass the kernel and it
+        uses no extra axioms, not that it proves what you meant.
         """
         if not 1 <= len(codes) <= MAX_BATCH_PROOFS:
-            raise ValueError(f"verify_batch takes 1 to {MAX_BATCH_PROOFS} proofs")
+            raise UsageError(f"verify_batch takes 1 to {MAX_BATCH_PROOFS} proofs")
         payload: dict[str, Any] = {
-            "codes": [{"custom_id": code["custom_id"], "proof": code["proof"]} for code in codes],
+            "codes": [
+                {
+                    "custom_id": code["custom_id"],
+                    "proof": code["proof"],
+                    **({"target": code["target"]} if "target" in code else {}),
+                }
+                for code in codes
+            ],
             "strict": strict,
         }
         if timeout is not None:
@@ -634,17 +703,23 @@ class LeanWarpCloud:
     ) -> dict[str, Any]:
         """Wait until the operation is terminal or ``timeout`` seconds pass.
 
+        Returns only a terminal operation. Raises ``OperationTimeout`` only once
+        ``timeout`` has passed, or a definitive error such as not found or
+        unauthorized. Anything transient is a missed poll: the operation keeps
+        running on the service whether or not this client can read it.
+
         Each read asks the server to hold it until the operation ends, so a
         result arrives as soon as it exists. An API that answers at once is
-        polled every ``poll_interval`` seconds instead. Every read, retry and
-        network wait shares the same deadline. Platform DNS and caller-injected
+        polled every ``poll_interval`` seconds instead. Every read and network
+        wait shares the same deadline. Platform DNS and caller-injected
         transports retain their own timeout behavior (see ``_request``).
         """
         if timeout <= 0 or poll_interval <= 0:
-            raise ValueError("timeout and poll_interval must be positive")
+            raise UsageError("timeout and poll_interval must be positive")
         deadline = time.monotonic() + timeout
         operation: dict[str, Any] | None = None
         use_held_reads = True
+        missed = 0
         while True:
             started = time.monotonic()
             # Hold at most half the remaining time, so a stalled connection
@@ -655,34 +730,32 @@ class LeanWarpCloud:
             if not use_held_reads:
                 hold = 0
             held = False
+            delay = poll_interval
             try:
-                operation = self.operation(operation_id, deadline=deadline, wait_seconds=hold)
-            except httpx.TimeoutException:
-                # Some proxies terminate held reads before the API does. Fall
-                # back to ordinary polling for the remainder of this wait.
-                use_held_reads = False
-                # A slow read before the deadline is just a missed poll.
-                if time.monotonic() >= deadline:
-                    raise OperationTimeout(operation_id, operation) from None
+                operation = self._read_operation(operation_id, deadline, hold, retry=False)
+            except LeanWarpTransportError as failure:
+                # Some proxies end held reads before the API does; poll from then on.
+                use_held_reads = use_held_reads and not failure.timed_out
+                missed += 1
+                delay = max(poll_interval, _retry_delay(None, missed - 1))
             except LeanWarpCloudError as error:
-                if (
-                    hold <= 0
-                    or error.status_code not in {502, 503, 504}
-                    or error.code in {"invalid_response", "invalid_encoding", "response_too_large"}
-                ):
+                if not (error.retryable or error.status == 500):
                     raise
-                use_held_reads = False
+                # A gateway that cannot hold reads answers 502 or 504; a busy
+                # service answers 429 or 503 and polling faster would only add load.
+                use_held_reads = use_held_reads and error.status not in {502, 504}
+                missed += 1
+                delay = max(poll_interval, _retry_delay(error.retry_after, missed - 1))
             else:
                 if operation.get("state") in {"completed", "failed", "cancelled"}:
                     return operation
+                missed = 0
                 held = hold > 0 and time.monotonic() - started >= min(hold, poll_interval)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise OperationTimeout(operation_id, operation)
             if not held:
-                # A failed read, or an API that answers without holding it,
-                # is retried at the polling pace.
-                time.sleep(min(poll_interval, remaining))
+                time.sleep(min(delay, remaining))
 
     def feedback(
         self,
@@ -703,7 +776,7 @@ class LeanWarpCloud:
         failed report is not retried, so it never delays the caller's work.
         """
         if kind not in FEEDBACK_KINDS or severity not in FEEDBACK_SEVERITIES:
-            raise ValueError("unknown feedback kind or severity")
+            raise UsageError("unknown feedback kind or severity")
         return self._request(
             "POST",
             "feedback",
@@ -721,15 +794,34 @@ class LeanWarpCloud:
         )
 
     def cancel(self, operation_id: str, *, deadline: float | None = None) -> dict[str, Any]:
+        """Ask to cancel. Asking again changes nothing, so a failed attempt is resent."""
         return self._request(
-            "POST", f"operations/{_segment(operation_id)}/cancel", deadline=deadline
+            "POST", f"operations/{_segment(operation_id)}/cancel", deadline=deadline, retry=True
         )
 
     def stop(self, workspace_id: str, *, deadline: float | None = None) -> dict[str, Any]:
-        return self._request("POST", f"workspaces/{_segment(workspace_id)}/stop", deadline=deadline)
+        """Stop the worker. Stopping twice changes nothing, so a failed attempt is resent."""
+        return self._request(
+            "POST", f"workspaces/{_segment(workspace_id)}/stop", deadline=deadline, retry=True
+        )
+
+    def delete_operation(self, operation_id: str, *, deadline: float | None = None) -> None:
+        """Delete a finished operation's stored request and result now, to free the
+        account's storage. Deleting again succeeds, so a failed attempt is resent.
+        Resubmitting the request afterwards answers ``operation_expired``."""
+        self._request(
+            "DELETE", f"operations/{_segment(operation_id)}", deadline=deadline, retry=True
+        )
 
     def delete(self, workspace_id: str, *, deadline: float | None = None) -> None:
-        self._request("DELETE", f"workspaces/{_segment(workspace_id)}", deadline=deadline)
+        """Delete a workspace. A failed attempt is resent; finding it gone then is success."""
+        self._request(
+            "DELETE",
+            f"workspaces/{_segment(workspace_id)}",
+            deadline=deadline,
+            retry=True,
+            gone_is_done=True,
+        )
 
     def _request(
         self,
@@ -740,71 +832,79 @@ class LeanWarpCloud:
         idempotency_key: str | None = None,
         deadline: float | None = None,
         hold_seconds: float = 0,
-        retry: bool = True,
+        retry: bool | None = None,
+        gone_is_done: bool = False,
     ) -> dict[str, Any]:
-        """Send with bounded retries, unless ``retry`` is false.
+        """Send one request, resending it after a transient failure when that is safe.
 
-        With a ``deadline`` (``time.monotonic()``), no attempt or backoff starts
-        after it, and each attempt splits its remaining budget across connect,
-        response and body reads (see ``_attempt_timeout``). Expiry raises
-        ``httpx.TimeoutException``. ``hold_seconds`` is how long the server may
-        deliberately delay its response; the read timeout allows for it.
+        By default a read or a write with an idempotency key is resent; ``retry``
+        overrides that for writes that are naturally idempotent or must go once.
+        Every attempt sends the same bytes and key. With a ``deadline``
+        (``time.monotonic()``), no attempt or backoff starts after it; without one,
+        no resend starts after the retry window. Each attempt splits its remaining
+        budget across connect, response and body reads (see ``_attempt_timeout``).
+        ``hold_seconds`` is how long the server may deliberately delay its
+        response; the read timeout allows for it. With ``gone_is_done``, a 404 on
+        a resend means an earlier attempt took effect and its response was lost.
         """
         headers = {"Idempotency-Key": idempotency_key} if idempotency_key else {}
         # One request identity always replays the same bytes, even if the caller
         # mutates a nested payload while a response is lost or a retry backs off.
         content = None
         if body is not None:
-            content = json.dumps(
-                body, ensure_ascii=False, allow_nan=False, separators=(",", ":")
-            ).encode("utf-8")
-            headers["Content-Type"] = "application/json"
-        retryable = retry and (method == "GET" or idempotency_key is not None)
-        attempts = self._retries + 1 if retryable else 1
-        for attempt in range(attempts):
-            timeout = _attempt_timeout(deadline, hold_seconds, default=self._timeout)
             try:
-                response = self._send(method, path, content, headers, timeout, deadline)
-                record_releases(response.headers)
-            except httpx.TransportError as transport_error:
-                # wait() retries an expired held read without the hold. Other
-                # transport failures keep the usual bounded retry policy.
-                if hold_seconds > 0 and isinstance(transport_error, httpx.TimeoutException):
-                    raise
-                if attempt + 1 == attempts or not _backoff(min(0.25 * 2**attempt, 2), deadline):
-                    raise
-                continue
-            if (
-                response.status_code in {429, 502, 503, 504}
-                and attempt + 1 < attempts
-                and not (hold_seconds > 0 and response.status_code in {502, 503, 504})
-            ):
-                retry_after = response.headers.get("Retry-After", "")
-                delay = min(float(retry_after), 5) if retry_after.isdigit() else 0.25 * 2**attempt
-                if _backoff(delay, deadline):
-                    continue
-            if not response.is_success:
-                try:
-                    error = response.json().get("error", {})
-                except (ValueError, AttributeError):
-                    error = {}
-                if not isinstance(error, dict):
-                    error = {}
-                raise LeanWarpCloudError(
-                    response.status_code,
-                    str(error.get("code", "request_failed")),
-                    str(error.get("message", f"request failed with HTTP {response.status_code}")),
+                encoded = json.dumps(
+                    body, ensure_ascii=False, allow_nan=False, separators=(",", ":")
                 )
-            if response.status_code == 204:
-                return {}
-            try:
-                result = response.json()
             except ValueError as error:
-                raise LeanWarpCloudError(502, "invalid_response", "expected valid JSON") from error
-            if not isinstance(result, dict):
-                raise LeanWarpCloudError(502, "invalid_response", "expected a JSON object")
-            return result
-        raise AssertionError("request attempts exhausted without a result")
+                raise UsageError(
+                    "a request holds NaN or infinity, which JSON cannot carry"
+                ) from error
+            content = encoded.encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        may_retry = (method == "GET" or idempotency_key is not None) if retry is None else retry
+        retry_until = deadline if deadline is not None else time.monotonic() + self._retry_window
+        # A query can hold a page cursor; the log needs only the resource.
+        resource = path.partition("?")[0]
+        for attempt in itertools.count():
+            started = time.monotonic()
+            failure: LeanWarpCloudError | LeanWarpTransportError
+            try:
+                timeout = _attempt_timeout(deadline, hold_seconds, default=self._timeout)
+                response = self._send(method, path, content, headers, timeout, deadline)
+            except httpx.TransportError as transport_error:
+                _log_attempt(method, resource, "transport_error", attempt, started)
+                failure = LeanWarpTransportError(
+                    "the request timed out"
+                    if isinstance(transport_error, httpx.TimeoutException)
+                    else "could not reach LeanWarp",
+                    timed_out=isinstance(transport_error, httpx.TimeoutException),
+                    idempotency_key=idempotency_key,
+                )
+                failure.__cause__ = transport_error
+                retry_after = None
+            except LeanWarpCloudError as error:
+                _log_attempt(method, resource, error.code, attempt, started)
+                error.idempotency_key = idempotency_key
+                raise
+            else:
+                record_releases(response.headers, warn=self._interface == "python")
+                _log_attempt(method, resource, response.status_code, attempt, started)
+                if response.is_success:
+                    return _decoded(response, idempotency_key)
+                failure = _refusal(response, idempotency_key)
+                if gone_is_done and attempt > 0 and failure.code == "not_found":
+                    return {}
+                if not failure.retryable:
+                    raise failure
+                retry_after = failure.retry_after
+            if (
+                not may_retry
+                or (self._retries is not None and attempt >= self._retries)
+                or not _pause(_retry_delay(retry_after, attempt), retry_until)
+            ):
+                raise failure
+        raise AssertionError("unreachable: the attempts above never end")
 
     def _send(
         self,
@@ -870,15 +970,91 @@ def _attempt_timeout(
     return httpx.Timeout(remaining / 3, read=min(remaining, hold_seconds + _RESPONSE_MARGIN))
 
 
-def _backoff(delay: float, deadline: float | None) -> bool:
+def _retry_delay(retry_after: float | None, attempt: int) -> float:
+    """Seconds before the next attempt: the service's ``Retry-After``, or exponential backoff.
+
+    Both are jittered, so processes that failed together do not retry together. A
+    service's value is a floor and is never shortened.
+    """
+    if retry_after:
+        return retry_after + random.uniform(0, min(1.0, retry_after / 4))  # noqa: S311
+    # Saturate the exponent first: 2**attempt overflows a float long before a
+    # long wait runs out, and every exponent past this one gives the cap anyway.
+    ceiling = min(_BACKOFF_CAP_SECONDS, _BACKOFF_BASE_SECONDS * 2 ** min(attempt, 16))
+    return random.uniform(ceiling / 2, ceiling)  # noqa: S311
+
+
+def _pause(delay: float, until: float) -> bool:
     """Sleep before a retry, or return False when the retry cannot start in time."""
-    if deadline is not None and time.monotonic() + delay >= deadline:
+    if time.monotonic() + delay >= until:
         return False
     time.sleep(delay)
     return True
 
 
+def _log_attempt(
+    method: str, resource: str, outcome: int | str, attempt: int, started: float
+) -> None:
+    """One debug line per attempt. Never a key, token, source or proof."""
+    _LOG.debug(
+        "%s %s status=%s attempt=%d latency_ms=%d",
+        method,
+        resource,
+        outcome,
+        attempt + 1,
+        (time.monotonic() - started) * 1000,
+    )
+
+
+def _refusal(response: httpx.Response, idempotency_key: str | None) -> LeanWarpCloudError:
+    try:
+        error = response.json().get("error", {})
+    except (ValueError, AttributeError):
+        error = {}
+    if not isinstance(error, dict):
+        error = {}
+    return LeanWarpCloudError(
+        response.status_code,
+        str(error.get("code", "request_failed")),
+        str(error.get("message", f"request failed with HTTP {response.status_code}")),
+        retry_after=_retry_after(response.headers.get("Retry-After", "")),
+        idempotency_key=idempotency_key,
+    )
+
+
+def _retry_after(value: str) -> float | None:
+    """Seconds a ``Retry-After`` asks for: a number of seconds, or an HTTP date from now."""
+    if value.isdigit():
+        return float(value)
+    try:
+        when = email.utils.parsedate_to_datetime(value)
+    except (TypeError, ValueError, OverflowError):
+        # Unparsable, such as a zone offset too large to represent: as if absent.
+        return None
+    # An HTTP date is always in GMT; a date without a zone is not one.
+    if when.tzinfo is None:
+        return None
+    # datetime.UTC needs Python 3.11; the SDK supports 3.10.
+    return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())  # noqa: UP017
+
+
+def _decoded(response: httpx.Response, idempotency_key: str | None) -> dict[str, Any]:
+    if response.status_code == 204:
+        return {}
+    try:
+        result = response.json()
+    except ValueError as error:
+        raise LeanWarpCloudError(
+            502, "invalid_response", "expected valid JSON", idempotency_key=idempotency_key
+        ) from error
+    if not isinstance(result, dict):
+        raise LeanWarpCloudError(
+            502, "invalid_response", "expected a JSON object", idempotency_key=idempotency_key
+        )
+    return result
+
+
 def _segment(value: str) -> str:
     if not value or value in {".", ".."} or "/" in value or "\\" in value:
-        raise ValueError("identifier must be a nonempty path segment")
+        raise UsageError("identifier must be a nonempty path segment")
     return quote(value, safe="")

@@ -35,8 +35,10 @@ the new `revision` and the `operation`. Add `?wait_seconds=20` to hold it until
 the operation ends. One `Idempotency-Key` covers the upload and the operation;
 resending replays whichever already happened. Use a new key for each different
 request: the upload commits first, so files sent under a key already used for
-another operation are committed before that conflict is reported. Uploading
-needs write permission as well as execute. Without files it only submits.
+another operation are committed before that conflict is reported. After a
+rejected request, `GET /workspaces/{workspace_id}/files` shows whether the upload
+was committed. Uploading needs write permission as well as execute. Without files
+it only submits.
 
 ```sh
 curl -s https://api.isagoge.in/v1/leanwarp/workspaces/$WORKSPACE/operations \
@@ -46,13 +48,16 @@ curl -s https://api.isagoge.in/v1/leanwarp/workspaces/$WORKSPACE/operations \
   -d '{"kind": "check", "expected_revision": 1, "payload": {"file": "Main.lean"}}'
 ```
 
+That is a strict check: it passes only without `sorry`, Lean errors or extra
+axioms. Send `"strict": false` for a faster draft check while editing.
+
 ## Endpoints
 
 | Method | Path | Permission | Purpose |
 | --- | --- | --- | --- |
 | `GET` | `/versions` | none | Served environments, one current build each. A key is optional, but one you send must be valid. |
 | `GET` | `/resources` | read | Published worker resources and billing metadata. |
-| `GET` | `/account` | read | Balance, reserved and available credit, in microdollars. |
+| `GET` | `/account` | read | Balance, reserved and available credit, and credit returned after LeanWarp's own failures, in microdollars. |
 | `POST` | `/workspaces` | write | Create a workspace. |
 | `GET` | `/workspaces` | read | List the workspaces your key can see. |
 | `GET` | `/workspaces/{workspace_id}` | read | A workspace's state and current revision. |
@@ -63,12 +68,22 @@ curl -s https://api.isagoge.in/v1/leanwarp/workspaces/$WORKSPACE/operations \
 | `GET` | `/workspaces/{workspace_id}/operations` | read | Stored operations with results, newest first. See below. |
 | `GET` | `/workspaces/{workspace_id}/usage` | read | Each history limit's `used` and the account's `limit`. |
 | `GET` | `/operations/{operation_id}` | read | An operation's state and result. `?wait_seconds=N` waits up to 20 seconds for it to end. |
+| `GET` | `/operations?ids=A,B,…` | read | Up to 100 operations at once. `&wait_seconds=N` returns as soon as any of them ends, waiting up to 20 seconds. See [Waiting on many operations](#waiting-on-many-operations). |
 | `POST` | `/operations/{operation_id}/cancel` | execute | Ask to cancel, then poll until it ends. |
+| `DELETE` | `/operations/{operation_id}` | write or execute | Delete a finished operation's stored request and result. See [Releasing results](#releasing-results). |
 | `POST` | `/workspaces/{workspace_id}/stop` | write or execute | Stop the worker. Files are kept. |
 | `DELETE` | `/workspaces/{workspace_id}` | write | Delete a workspace. |
 | `POST` | `/feedback` | any | Report a problem with LeanWarp itself. See [Feedback](#feedback). |
 
-A key can be limited to one workspace. It then sees only that workspace.
+A key can be limited to one workspace. It then sees only that workspace: another
+workspace's operations answer `not_found` to it.
+
+Each operation records which key submitted it. In the dashboard, the account's key
+list shows each key's `last_used_at`, recorded to the hour, and
+`GET /account/key-usage?hours=N` (signed-in account, 1 to 2,160 hours, default 24)
+returns each key's `operations` submitted and the `worker_seconds` they held a
+worker over the last `N` hours. Per-key use is kept for 90 days, even after the
+operations themselves are deleted.
 
 The operation list takes `limit` (1 to 25, default 25) and `cursor`. It returns
 `{"operations": […], "next_cursor": …}`. To read the next, older page, pass
@@ -82,20 +97,24 @@ LeanWarp keeps only a window of finished history, so export results you need.
 
 Each operation reads the revision named by `expected_revision` and never changes
 its files. `file` is a `.lean` path relative to the project. Lines and columns
-start at 1.
+start at 1, and columns count characters (Unicode code points).
 
 | `kind` | `payload` |
 | --- | --- |
-| `check` | `file`, `strict` (default `false` over HTTP; the SDK defaults to strict). |
+| `check` | `file`, `strict` (default `true`; `false` is a draft check, in which `sorry` is only a warning). |
 | `inspect` | `file`, `line`, `column`. |
 | `try_tactics` | `file`, `line`, `column`, `tactics` (1 to 32), `timeout_ms` per tactic (default 30000). |
-| `verify_target` | `file`, `candidate_declaration`, `target_statement`, `target_context`, `execution_mode` (`reusable` or `fresh`), `timeout` seconds. |
+| `verify_target` | `file`, `candidate_declaration`, `target_statement`, `target_context` (it may import only the environment's packages, never the workspace's modules), `execution_mode` (`reusable` or `fresh`), `timeout` seconds. |
 | `holes` | `file`, `goals` (default `true`: bounded goals for the first 16 unfinished or unknown placeholders). |
 | `suggest` | `file`, `line`, `column`. Optional `tactics` (1 to 32) to use instead of LeanWarp's portfolio, and `timeout_ms` per tactic (learned budgets by default). |
 | `extract_decls` | `file`. |
 | `sorry2lemma` | `file`, `max_extractions` (1 to 256, default 64), optional `name_prefix`, `strict_final_check` (default `false`). |
-| `check_files` | `files` (1 to 64 distinct paths), `strict` (default `true`), optional `timeout` seconds per file (1 to 300), which starts once the file's imports have loaded, except in a file using `native_decide`. |
-| `verify_batch` | `codes`: 1 to 64 objects `{"custom_id", "proof"}`. Each `custom_id` is unique and 1 to 128 characters, without control characters. Proofs must not be blank. The payload is at most 256 KiB of UTF-8. Also `strict` (default `true`) and optional `timeout` seconds per proof (1 to 300), which starts once the proof's imports have loaded, except in a proof using `native_decide`. The proofs run in the workspace's environment. They may import its packages, such as Mathlib, but not the workspace's own modules. Such a proof is refused with `error.code` `unsupported_import`. |
+| `check_files` | `files` (1 to 64 distinct paths), `strict` (default `true`), optional `timeout` seconds per file (default 60), which starts once the file's imports have loaded, except in a file using `native_decide`. It must fit the operation's budget for its entries (see below). |
+| `verify_batch` | `codes`: 1 to 64 objects `{"custom_id", "proof"}`. Each `custom_id` is unique and 1 to 128 characters, without control characters. Proofs must not be blank. The payload is at most 256 KiB of UTF-8. Also `strict` (default `true`) and optional `timeout` seconds per proof (default 60), which starts once the proof's imports have loaded, except in a proof using `native_decide`. It must fit the operation's budget for its entries (see below). The proofs run in the workspace's environment. They may import its packages, such as Mathlib, but not the workspace's own modules. Such a proof is refused without running: `status` `rejected`, `failure.kind` `policy`, `error.code` `unsupported_import`. A code may add `target`: `{"context", "statement", "declaration"}` (see below). |
+
+Any `payload` may also carry `lean_options`, an object of Lean options applied as
+a lakefile's `leanOptions` would be, such as `{"maxSynthPendingDepth": 3}`. Options
+that could weaken checking are refused.
 
 `suggest`, `check_files` and `verify_batch` stop starting new work after four
 minutes. Their default `timeout_seconds` is 600, enough for the work still in
@@ -104,8 +123,69 @@ before it expires, or halfway through a limit under 20 seconds, so finished
 results still return. With a limit of one or two seconds, `check_files` and
 `verify_batch` run at most one source. Any they do not reach are `not_checked`.
 
+Sources that share the same imports run together on one worker, so results keep
+your order but the order they ran in may differ. Cancelling either operation keeps
+the entries that finished: `state` is `cancelled`, `result` holds them, and the
+rest are `not_checked`. A batch still running when its `timeout_seconds` expires
+keeps them the same way, with `state` `completed`.
+
 `native_decide` runs in its own fresh Lean process, so a source that uses it
 loads its imports again within its `timeout`. Allow for that when setting one.
+
+Each entry is promised its `timeout`, or 60 seconds without one. A `timeout`
+larger than the operation's budget for its entries (`timeout_seconds` less 40
+seconds, and at most 210) is refused at submission, so with the default
+`timeout_seconds` of 600 an entry can have up to 210 seconds. An entry that had
+its whole budget and did not finish is `timeout`. One that started with less, because the
+batch's time ran short, and did not finish is `not_checked`, not `timeout`:
+retry it on its own. An entry on the default 60 seconds under a shorter
+`timeout_seconds` can come back `not_checked` this way.
+
+### Binding a proof to its statement
+
+Without a `target`, a `verify_batch` entry's `ok` means this source compiles, its
+declarations pass Lean's kernel, and it uses no axiom beyond `propext`,
+`Classical.choice` and `Quot.sound`. It does not mean the source proves what you
+meant: `theorem x : True := trivial` is `ok`. To fix the statement, add
+`target`: `context` (the imports and definitions the statement needs, such as
+`import Mathlib`; only the environment's packages), `statement` (a closed Lean
+`Prop`) and `declaration` (the theorem the proof introduces). The entry is then
+checked as `verify_target` would check it, and an accepted entry carries the
+checker's `receipt`. A refused one is `rejected` with `failure.kind`
+`target_mismatch`, `declaration_missing`, and so on. `target` requires
+`"strict": true`; a draft batch with one is refused at submission. The context
+and statement count toward the 256 KiB payload.
+
+```json
+{"custom_id": "p1", "proof": "theorem t (n : Nat) : n + 0 = n := rfl",
+ "target": {"context": "", "statement": "∀ n : Nat, n + 0 = n", "declaration": "t"}}
+```
+
+### Releasing results
+
+Stored results count against the account's storage limit until history makes
+room for them, an hour after they finish. A client that keeps its own copy can
+release them sooner: read the result, then `DELETE /operations/{operation_id}`.
+That deletes the finished operation's request and result at once and answers
+`204`; repeating it also answers `204`. A queued or running operation is refused
+with `operation_active`; cancel it or wait. Reading an operation never deletes it.
+
+Resubmitting a deleted request with the same `Idempotency-Key` answers
+`operation_expired` and does not run it again.
+
+### Waiting on many operations
+
+`GET /operations?ids=A,B,…&wait_seconds=N` names up to 100 operations and holds the
+request until any of them ends, or `N` seconds pass. The reply is
+`{"operations": […], "unread": […]}`, in the order you listed them. A pending
+operation appears without its result; a finished one in full, as
+`GET /operations/{operation_id}` returns it. To keep the response near 1 MiB,
+finished operations that do not fit are listed by ID in `unread` instead: read
+each with its own `GET`; so are finished operations not yet read when the wait's
+`N` seconds are up, as the wait never holds the request longer. If storage cannot
+answer even the first read in time, the reply is `503`
+`persistence_request_unavailable`; retry it. An operation your
+key cannot see, or whose result was already deleted, is left out.
 
 ### Applying an edit
 
@@ -138,15 +218,14 @@ zero to 1,000,000,000,000 microdollars, or `null` for no workspace cap.
 
 The CLI and MCP `resources` command reports one `worker`: its
 `starting_minute_microusd`, `usage_based`, `hold_microusd` and resource limits,
-plus `idle_seconds`. CPU values are physical cores (one physical core is two
-vCPUs). Charges are billed by the second. One dollar is 1,000,000 microdollars.
+plus `idle_seconds`. CPU and memory values describe the worker’s allocated resources
+and limits. Charges are billed by the second. One dollar is 1,000,000 microdollars.
 
 When `usage_based` is true, CPU and RAM charges rise independently above their
 reserved baselines. The starting rate remains a paid minimum while the worker
 runs, including idle time. Bursting depends on available host capacity. When
 `usage_based` is false, the starting minute quote is the fixed rate for the time
-the worker runs. The raw HTTP catalog keeps the compatibility fields described
-below.
+the worker runs.
 
 Stop the worker yourself when you finish. Disconnecting HTTP does not stop
 billing. Stopping discards in-memory state but keeps uploaded files and
@@ -205,6 +284,14 @@ A replay within an hour of the original always returns its result. Later, a
 submission whose operation was removed returns `operation_expired` for at least
 7 days, and is not run again. Reading that operation returns `not_found`.
 
+Creating a workspace replays this way until 7 days after the workspace is
+deleted; after that, the same key creates a new workspace.
+
+Stopping a worker, cancelling an operation and deleting a workspace or a result
+need no key: repeating them changes nothing. A repeated workspace delete answers
+`not_found`, so after a lost response treat that as deleted. A repeated result
+delete answers `204`.
+
 Uploads and submissions also carry `expected_revision`, the revision you last
 saw. If someone else changed the workspace since then, the request fails with
 `revision_conflict` instead of overwriting their work.
@@ -231,9 +318,19 @@ do next. It may change. Common codes:
 | `workspace_busy` | 409 | Another operation is running in the workspace. |
 | `idempotency_conflict` | 409 | The `Idempotency-Key` was used for a different request. |
 | `operation_expired` | 409 | The request already ran and its result is no longer stored. It was not run again. |
-| `operation_limit_exceeded` | 422 | The workspace reached the account's operation limit (1,000 by default) within the last hour. |
-| `operation_storage_limit_exceeded` | 422 | Running operations and stored results reached the account's limit (64 MiB by default). |
-| `source_history_limit_exceeded` | 422 | The workspace reached the account's sync limit (1,000 by default) within the last hour, or stored source reached the account's limit (64 MiB by default). |
+| `operation_active` | 409 | The operation has not finished, so its result cannot be deleted yet. |
+| `operation_limit_exceeded` | 429 | The workspace holds the account's limit of operations from the last hour (1,000 by default). |
+| `operation_storage_limit_exceeded` | 429 | Stored results, and the space held for queued and running operations, reached the account's limit (512 MiB by default). |
+| `source_history_limit_exceeded` | 429 | The workspace reached the account's sync limit (1,000 by default) within the last hour, or stored source reached the account's limit (64 MiB by default). |
+| `workspace_creation_limit_exceeded` | 429 | The account created its limit of workspaces within the last hour (300 by default). |
+
+The four limits above free with time, so they answer `429` with `Retry-After`:
+the seconds until the oldest record that counts leaves the hour-long window (or
+the whole window when nothing is waiting to leave it; for storage held only by
+running operations, 30 seconds). Deleting results you have read frees operation
+history and storage at once. Stored source frees only when you delete files or
+workspaces, so waiting does not help that case. An account's limits can be
+raised; email contact@isagoge.in.
 
 ## Results and failed operations
 
@@ -247,12 +344,57 @@ An accepted operation runs after the request returns. When it ends in state
 A denied elastic renewal can stop an operation that is already running. The
 failure keeps the financial reason.
 
-A `completed` operation can still report a failed check or a rejected proof, so
-read `result.result.status`. A verification passed only when its status is `ok`
-and its receipt's `policy` is `fixed_target_kernel_check_v1`.
+Worker time lost to a failure LeanWarp's own systems raise (its storage being
+unavailable, no capacity to start a worker, or a LeanWarp update stopping the
+worker) is credited back automatically, once the worker's billing settles: the
+time at that worker's average charged rate (its charge divided by its charged
+time), never more than the worker charged, and up to $20 per operation. Other
+failures, such as a worker that exits, stops responding or stops because its
+lease ran out, are not credited automatically; contact LeanWarp to have one
+reviewed. After an incident on LeanWarp's side, LeanWarp credits the affected
+accounts itself. `GET /account` reports the automatic
+credits as `infrastructure_credit_microusd`. Time a worker spends starting is
+never charged; charging starts when it is ready.
 
-`result` holds the receipt's `operation_id`, `revision` and `generation`. The
-operation's own fields are under `result.result`, and the
+A `completed` operation can still report a failed check or a rejected proof, so
+read `result.result.status`. Every verification result (a `check`, each
+`check_files` and `verify_batch` entry, a `verify_target`) has one of six:
+
+| `status` | Verdict? | Meaning |
+| --- | --- | --- |
+| `ok` | yes | Accepted. Strict: by the checker, which re-checks every declaration with Lean's kernel. Draft: Lean elaborated it. |
+| `error` | yes | Lean reported errors; `diagnostics` are Lean's. |
+| `rejected` | yes | Elaborated but refused; `failure.kind` says why. |
+| `timeout` | no | It had its whole requested time and did not finish. |
+| `infrastructure_failure` | no | LeanWarp could not complete the check. |
+| `not_checked` | no | Never started, or started with less than its requested time and did not finish. |
+
+`rejected`, `timeout` and `infrastructure_failure` carry `failure: {kind,
+retryable, message}`. Rejection kinds: `axioms`, `kernel`, `policy`,
+`target_mismatch`, `declaration_missing`, `target_elaboration`,
+`candidate_elaboration`. Non-verdict kinds: `timeout`, `memory_limit`,
+`resource_limit` and `internal`. A non-verdict says nothing about the proof:
+retry it when `retryable` is true; do not change the proof because of it.
+Lean's own limits are verdicts, since the same source always gives the same
+answer: exceeding `maxHeartbeats` or `maxRecDepth` is `error` for a proof and
+`rejected` with `target_elaboration` for a target. Only wall-clock time, memory,
+native stack depth and a lost process are non-verdicts.
+
+A batch's `status` is `ok` when every entry is, `failed` when at least one was
+refused (`error` or `rejected`), and otherwise `incomplete`. `passed`, `failed`
+(`error` and `rejected` only), `timed_out`, `infrastructure_failures` and
+`not_checked` count every entry exactly once.
+
+A verification passed only when its status is `ok` and its receipt's `policy`
+is `fixed_target_kernel_check_v2`.
+
+`result` holds the receipt's `operation_id`, `revision` and `generation`, and
+`build`: the `bundle_id`, `engine_commit` and `environment_id` of the build that
+produced it. The operation's `build` field names the same build as soon as the
+operation is dispatched to a worker, while it runs, and is `null` until then. An
+operation that was interrupted and rerun names the worker that reran it. A workspace's `bundle_id`
+is the build its next worker starts on; a running worker keeps its own build
+until it stops. The operation's own fields are under `result.result`, and the
 [reference](../src/leanwarp_cloud/skills/leanwarp/references/usage.md#results)
 lists them. Completed operations also have `execution`, which says which worker
 ran them and what was reused, and `timing`, with `queued_ms`, `worker_ms`,
@@ -262,9 +404,22 @@ ran them and what was reused, and `timing`, with `queued_ms`, `worker_ms`,
 tactics). After dispatch recovery, `queued_ms` is absent rather than an estimate
 of earlier attempts. Clients should tolerate absent timing.
 
+A service update can interrupt an operation that is running. Most finish during
+the update. Others continue or restart on a new worker automatically, so a result
+can take several minutes longer; after repeated interruptions the operation fails
+with `recovery_limit_exceeded` and you can retry it. A warm worker keeps running
+through an update. A completed operation that was interrupted has
+`execution.restarted`: `count`, and `reason` `release` (an update moved it) or
+`worker_lost` (its worker or server stopped responding).
+
 A failure to prepare dependencies is also a completed receipt, for any operation
-kind. It has `status: error`, `diagnostics` explaining the failure, and
-`diagnostics_complete: false`. It contains no successful tactic trials.
+kind, with `diagnostics_complete: false`. A local import that fails to build is
+`status: error` with Lean's errors. One that stopped without them (a time
+limit, the memory limit, a cancellation) is, for `check`, `verify_target` and
+each `check_files` entry, the non-verdict it was (`timeout` or
+`infrastructure_failure`), except that a `check_files` entry whose imports ran
+out of time is `not_checked`; other kinds report `status: error` with its
+`error.code`. It contains no successful tactic trials.
 
 Held operation reads count against the API's per-account and overall request
 limits. A busy service returns HTTP 503 with `Retry-After`. If a proxy cannot
@@ -275,41 +430,14 @@ wait deadline.
 
 Every response under `/v1/leanwarp` carries `LeanWarp-SDK-Latest` and
 `LeanWarp-SDK-Minimum`: the newest SDK release, and the oldest one the service
-accepts. A request is refused with `426` and `sdk_upgrade_required` when its
+accepts. A request that would start work (creating a workspace, uploading or
+submitting) is refused with `426` and `sdk_upgrade_required` when its
 `User-Agent` is the SDK's (`leanwarp-sdk/VERSION (cli|mcp|python)`) and older
-than the minimum. Other clients are never refused for their version.
+than the minimum. Reads, cancelling, stopping and deleting are always served, so
+an outdated SDK can still collect results and stop billing. Other clients are
+never refused for their version.
 
-## Historical wire compatibility
-
-`LeanWarpCloud.resources()` and raw `GET /resources` still return the release
-billing catalog under `resources`, with `default_resource_profile` and
-`idle_seconds`. Ordinary CLI and MCP commands show only that published default.
-Older APIs without the default field use the retained `standard` row. Clients
-must not pick an arbitrary catalog entry. Catalog names remain identifiers for
-stored requests and billing snapshots, not customer choices.
-
-For existing integrations and automation, workspace creation still accepts
-`resource_profile` and `max_resource_profile`:
-
-- Omitting the selection uses the published default.
-- Omitting the maximum uses the selected worker's resources.
-- If an explicit maximum cannot fit the default, creation selects that maximum.
-- An explicit selection must fit its maximum.
-
-Resource limits use CPU and RAM ceilings for elastic workers. They do not change
-billing policy. On recovery, resend the exact original body and idempotency key,
-including these fields when the original request used them.
-
-Fixed billing rows keep `minute_microusd` and `hourly_microusd`.
-`elastic_consumption_v1` rows keep `minimum_minute_microusd`,
-`maximum_minute_microusd`, `minimum_hourly_microusd`, `maximum_hourly_microusd`
-and `hold_microusd`. Historical fixed snapshots keep their original accounting
-rules.
-
-Deprecated CLI `--profile` and `--max-profile` flags still parse, for existing
-automation. An operation override for `check`, `inspect` or `try_tactics`
-replaces the warm worker and its in-memory state. Uploaded files and completed
-results remain. The replacement stays warm until stopped. For `verify_target`,
-an override uses a temporary worker that stops afterwards. These replacement
-rules predate elastic billing. New clients should let LeanWarp select the worker
-and set a spending cap instead.
+When a rise in the minimum is scheduled, every response to an SDK older than the
+latest release also carries `LeanWarp-SDK-Sunset`: the date it takes effect, such
+as `2026-12-01`. The Python library warns once with a `DeprecationWarning`, and the
+CLI and MCP report it as `update_available.sunset`.

@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 from leanwarp_cloud import collect_lean_sources, plan_upload
-from leanwarp_cloud.project import ProjectError
+from leanwarp_cloud.project import ProjectError, ProjectLeanOptions, project_lean_options
 
 # What Lake 4.26 wrote for a Mathlib project (manifest format 1.1.0).
 LAKE_1_1_MANIFEST = Path(__file__).parent / "fixtures/lake-manifest-1.1.0.json"
@@ -448,3 +448,239 @@ def test_repeated_imports_produce_one_actionable_problem_per_file(tmp_path):
     (tmp_path / ".leanwarpignore").write_text("Aux.lean\n")
     (tmp_path / "Main.lean").write_text("import Aux\n" * 1000)
     assert len(plan_upload(tmp_path).problems) == 1
+
+
+def _options(root: Path, name: str, text: str) -> ProjectLeanOptions:
+    (root / name).write_text(text)
+    return project_lean_options(root)
+
+
+def test_reads_a_toml_lakefiles_options_as_lake_does(tmp_path):
+    options = _options(
+        tmp_path,
+        "lakefile.toml",
+        'name = "FLT"\n[leanOptions]\npp.unicode.fun = true\nautoImplicit = false\n'
+        "maxSynthPendingDepth = 3\nweak.linter.flexible = true\nwarn.sorry = false\n"
+        '[[lean_lib]]\nname = "FLT"\n',
+    )
+    assert options.applied == {
+        "pp.unicode.fun": True,
+        "autoImplicit": False,
+        "maxSynthPendingDepth": 3,
+        "weak.linter.flexible": True,
+    }
+    assert options.ignored == ("warn.sorry",)
+
+
+def test_reads_literal_options_from_a_lean_lakefile(tmp_path):
+    options = _options(
+        tmp_path,
+        "lakefile.lean",
+        "abbrev opts := #[\n  ⟨`pp.unicode.fun, true⟩,\n  ⟨`autoImplicit, false⟩,\n"
+        "  ⟨`maxSynthPendingDepth, .ofNat 3⟩,\n  ⟨`debug.skipKernelTC, true⟩]\n"
+        "package p where\n  leanOptions := opts\n",
+    )
+    assert options.applied == {
+        "pp.unicode.fun": True,
+        "autoImplicit": False,
+        "maxSynthPendingDepth": 3,
+    }
+    assert options.ignored == ("debug.skipKernelTC",)
+
+
+def test_reports_lean_options_it_cannot_read(tmp_path):
+    options = _options(tmp_path, "lakefile.lean", "package p where\n  leanOptions := computed\n")
+    assert options.applied == {} and options.ignored == ("leanOptions",)
+
+
+def test_an_option_two_libraries_disagree_on_is_reported(tmp_path):
+    options = _options(
+        tmp_path,
+        "lakefile.toml",
+        'name = "p"\n[[lean_lib]]\nname = "A"\n'
+        "leanOptions = { autoImplicit = false, maxRecDepth = 9 }\n"
+        '[[lean_lib]]\nname = "B"\nleanOptions = { autoImplicit = true }\n',
+    )
+    assert options.applied == {}
+    assert options.ignored == ("autoImplicit", "maxRecDepth")
+
+
+def test_one_librarys_option_never_reaches_another(tmp_path):
+    options = _options(
+        tmp_path,
+        "lakefile.toml",
+        'name = "p"\nleanOptions = { maxRecDepth = 9 }\n'
+        '[[lean_lib]]\nname = "A"\nleanOptions = { autoImplicit = false }\n'
+        '[[lean_lib]]\nname = "B"\n',
+    )
+    assert options.applied == {"maxRecDepth": 9} and options.ignored == ("autoImplicit",)
+
+
+@pytest.mark.parametrize(
+    ("name", "text"),
+    [
+        (
+            "lakefile.toml",
+            'name = "p"\n[[lean_lib]]\nname = "A"\nleanOptions = { autoImplicit = false }\n'
+            '[[lean_exe]]\nname = "b"\nroot = "B"\n',
+        ),
+        (
+            "lakefile.lean",
+            "lean_lib A where\n  leanOptions := #[⟨`autoImplicit, false⟩]\n"
+            "lean_exe b where\n  root := `B\n",
+        ),
+    ],
+    ids=["toml", "lean"],
+)
+def test_an_executable_builds_with_its_own_options(tmp_path, name, text):
+    options = _options(tmp_path, name, text)
+    assert options.applied == {} and options.ignored == ("autoImplicit",)
+
+
+def test_a_library_overrides_the_packages_option_as_lake_does(tmp_path):
+    options = _options(
+        tmp_path,
+        "lakefile.toml",
+        'name = "p"\nleanOptions = { autoImplicit = true }\n'
+        '[[lean_lib]]\nname = "A"\nleanOptions = { autoImplicit = false }\n',
+    )
+    assert options.applied == {"autoImplicit": False} and options.ignored == ()
+
+
+def test_a_project_without_a_lakefile_sets_no_options(tmp_path):
+    assert project_lean_options(tmp_path) == ProjectLeanOptions({}, ())
+
+
+@pytest.mark.parametrize(
+    "form",
+    ['[["maxRecDepth", 9]]', '[{ name = "maxRecDepth", value = 9 }]'],
+)
+def test_reads_the_array_forms_lake_accepts(tmp_path, form):
+    options = _options(tmp_path, "lakefile.toml", f'name = "p"\nleanOptions = {form}\n')
+    assert options.applied == {"maxRecDepth": 9} and options.ignored == ()
+
+
+def test_a_lean_lakefile_reads_only_the_options_its_targets_set(tmp_path):
+    options = _options(
+        tmp_path,
+        "lakefile.lean",
+        "-- ⟨`autoImplicit, true⟩ is how Lean defaults\n"
+        "/- An older setting: #[⟨`maxRecDepth, 1⟩] /- nested -/ -/\n"
+        "abbrev unused : Array LeanOption := #[⟨`pp.all, true⟩]\n"
+        "abbrev shared := #[⟨`autoImplicit, false⟩, -- trailing note\n"
+        "  ⟨`maxSynthPendingDepth, (.ofNat 3)⟩]\n"
+        "package p where\n  leanOptions := shared\n"
+        "@[default_target]\nlean_lib P where\n  roots := #[`P]\n",
+    )
+    assert options.applied == {"autoImplicit": False, "maxSynthPendingDepth": 3}
+    assert options.ignored == ()
+
+
+def test_a_lean_lakefile_reports_options_it_must_run_code_to_read(tmp_path):
+    options = _options(
+        tmp_path,
+        "lakefile.lean",
+        "abbrev linters := #[⟨`linter.style.header, true⟩]\n"
+        "abbrev opts := #[⟨`autoImplicit, false⟩] ++\n"
+        "  linters.map fun s ↦ { s with name := `weak ++ s.name }\n"
+        "package p\nlean_lib P where\n  leanOptions := opts\n",
+    )
+    assert options.applied == {} and options.ignored == ("leanOptions",)
+
+
+def test_a_multiline_option_list_closing_at_the_fields_indent_is_read(tmp_path):
+    options = _options(
+        tmp_path,
+        "lakefile.lean",
+        "package p where\n  leanOptions := #[\n    ⟨`autoImplicit, false⟩,\n"
+        "    ⟨`pp.unicode.fun, true⟩\n  ]\n  moreLinkArgs := #[]\n",
+    )
+    assert options.applied == {"autoImplicit": False, "pp.unicode.fun": True}
+    assert options.ignored == ()
+
+
+UNREADABLE_LAKEFILES = {
+    "inline field": (
+        "package p where\n  leanOptions := #[⟨`autoImplicit, false⟩]\n"
+        "lean_lib P where leanOptions := #[⟨`autoImplicit, true⟩]\n"
+    ),
+    "computed library list": (
+        "package p where\n  leanOptions := #[⟨`autoImplicit, false⟩]\n"
+        "lean_lib P where\n  leanOptions := (#[⟨`autoImplicit, true⟩] : Array LeanOption).map id\n"
+    ),
+    "namespaced definitions": (
+        "abbrev opts := #[⟨`autoImplicit, false⟩]\n"
+        "namespace Internal\nabbrev opts := #[⟨`autoImplicit, true⟩]\nend Internal\n"
+        "package p where\n  leanOptions := opts\n"
+    ),
+    "a -D argument": (
+        "package p where\n  leanOptions := #[⟨`autoImplicit, false⟩]\n"
+        '  moreLeanArgs := #["-DautoImplicit=true"]\n'
+    ),
+    "a computed argument": (
+        "package p where\n  leanOptions := #[⟨`autoImplicit, false⟩]\n"
+        '  moreLeanArgs := #["-" ++ "DautoImplicit=true"]\n'
+    ),
+    "an indented library": (
+        "lean_lib A where\n  leanOptions := #[⟨`autoImplicit, false⟩]\n  lean_lib B\n"
+    ),
+    "a clustered -D argument": (
+        "package p where\n  leanOptions := #[⟨`autoImplicit, false⟩]\n"
+        '  moreLeanArgs := #["-qDautoImplicit=true"]\n'
+    ),
+}
+
+
+def test_a_comment_separates_a_target_from_its_name(tmp_path):
+    options = _options(
+        tmp_path,
+        "lakefile.lean",
+        "lean_lib A where\n  leanOptions := #[⟨`autoImplicit, false⟩]\nlean_lib/- gap -/B\n",
+    )
+    assert options.applied == {} and options.ignored == ("autoImplicit",)
+
+
+def test_literal_lean_arguments_without_options_keep_the_options(tmp_path):
+    options = _options(
+        tmp_path,
+        "lakefile.lean",
+        "package p where\n  leanOptions := #[⟨`autoImplicit, false⟩]\n"
+        '  moreLeanArgs := #["--tstack=100000"]\n',
+    )
+    assert options.applied == {"autoImplicit": False} and options.ignored == ()
+
+
+@pytest.mark.parametrize("text", UNREADABLE_LAKEFILES.values(), ids=UNREADABLE_LAKEFILES)
+def test_an_option_that_cannot_be_read_withholds_every_option(tmp_path, text):
+    options = _options(tmp_path, "lakefile.lean", text)
+    assert options.applied == {} and "leanOptions" in options.ignored
+
+
+def test_configuration_inside_a_string_is_not_read(tmp_path):
+    options = _options(
+        tmp_path,
+        "lakefile.lean",
+        'def note := "\npackage fake where\n  leanOptions := #[⟨`autoImplicit, true⟩]\n"\n'
+        "package p where\n  leanOptions := #[⟨`autoImplicit, false⟩]\n",
+    )
+    assert options.applied == {"autoImplicit": False} and options.ignored == ()
+
+
+def test_a_toml_lakefile_with_a_d_argument_applies_nothing(tmp_path):
+    options = _options(
+        tmp_path,
+        "lakefile.toml",
+        'name = "p"\nleanOptions = { autoImplicit = false }\n'
+        '[[lean_lib]]\nname = "P"\nmoreLeanArgs = ["-DautoImplicit=true"]\n',
+    )
+    assert options.applied == {} and options.ignored == ("autoImplicit", "leanOptions")
+
+
+def test_a_lean_lakefiles_conflicting_literals_are_reported(tmp_path):
+    options = _options(
+        tmp_path,
+        "lakefile.lean",
+        "lean_lib A where\n  leanOptions := #[⟨`autoImplicit, false⟩]\n"
+        "lean_lib B where\n  leanOptions := #[⟨`autoImplicit, true⟩]\n",
+    )
+    assert options.applied == {} and options.ignored == ("autoImplicit",)

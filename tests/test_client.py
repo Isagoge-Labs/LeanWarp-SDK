@@ -8,7 +8,12 @@ from unittest.mock import patch
 
 import httpx
 import pytest
-from leanwarp_cloud import LeanWarpCloud, LeanWarpCloudError, OperationTimeout
+from leanwarp_cloud import (
+    LeanWarpCloud,
+    LeanWarpCloudError,
+    LeanWarpTransportError,
+    OperationTimeout,
+)
 
 
 def test_workspace_default_belongs_to_service_and_explicit_profiles_are_preserved() -> None:
@@ -639,7 +644,8 @@ def test_held_reads_preserve_rate_limit_backoff(monkeypatch, held):
     ) as api:
         result = api.wait("op-1") if held else api.operation("op-1")
     assert result["state"] == "completed"
-    assert len(calls) == 2 and clock.sleeps == [1]
+    # The service's value is a floor; jitter spreads out processes it refused together.
+    assert len(calls) == 2 and 1 <= clock.sleeps[0] <= 1.25
 
 
 @pytest.mark.parametrize("action", ["cancel", "stop", "delete", "submit"])
@@ -674,7 +680,7 @@ def test_cleanup_requests_bound_trickling_body_with_the_shared_deadline(monkeypa
             retries=1,
             transport=httpx.MockTransport(handle),
         ) as cloud,
-        pytest.raises(httpx.TimeoutException),
+        pytest.raises(LeanWarpTransportError),
     ):
         if action == "submit":
             cloud.submit(
@@ -703,7 +709,7 @@ def test_cleanup_expired_deadline_never_starts_an_attempt(monkeypatch, action):
             base_url="https://cloud.example",
             transport=httpx.MockTransport(requests.append),
         ) as cloud,
-        pytest.raises(httpx.TimeoutException),
+        pytest.raises(LeanWarpTransportError),
     ):
         if action == "submit":
             cloud.submit(
@@ -720,7 +726,7 @@ def test_cleanup_expired_deadline_never_starts_an_attempt(monkeypatch, action):
 
 
 @pytest.mark.parametrize(
-    "status,method,attempts", [(503, "GET", 3), (503, "POST", 1), (500, "GET", 1)]
+    "status,method,attempts", [(503, "GET", 3), (503, "POST", 3), (500, "GET", 1)]
 )
 def test_transient_persistence_retries_remain_bounded_and_safe(status, method, attempts):
     requests = []
@@ -742,7 +748,7 @@ def test_transient_persistence_retries_remain_bounded_and_safe(status, method, a
         if method == "GET":
             api.workspace("w")
         else:
-            api.stop("w")  # No idempotency key: never replay this POST.
-    assert raised.value.status_code == status
+            api.stop("w")  # Stopping twice changes nothing; it needs no idempotency key.
+    assert raised.value.status == status
     assert len(requests) == attempts
     assert all("Idempotency-Key" not in request.headers for request in requests)

@@ -423,60 +423,21 @@ def test_cli_reports_argument_mistakes_as_json(capsys):
     assert "--column" in error["message"]
 
 
-def test_cli_keeps_legacy_profile_flags_out_of_customer_help():
-    from leanwarp_cloud.cli import parser
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["connect", "--profile", "standard"],
+        ["connect", "--max-profile", "large"],
+        ["check", "Main.lean", "--profile", "large"],
+    ],
+)
+def test_cli_has_no_worker_size_flags(arguments, capsys):
+    from leanwarp_cloud.cli import main
 
-    root = parser()
-    commands = next(a for a in root._actions if isinstance(a, argparse._SubParsersAction))
-    for name in ("connect", "check", "inspect", "try-tactics", "verify"):
-        assert "--profile" not in commands.choices[name].format_help()
-        assert "--max-profile" not in commands.choices[name].format_help()
-    connected = root.parse_args(["connect", "--profile", "standard", "--max-profile", "large"])
-    assert connected.profile == "standard" and connected.max_profile == "large"
-    checked = root.parse_args(["check", "Main.lean", "--profile", "standard"])
-    assert checked.profile == "standard"
-
-
-def test_cli_forwards_legacy_profile_flags_for_existing_automation(tmp_path, monkeypatch, capsys):
-    from leanwarp_cloud import LeanWarpCloud, cli
-
-    project(tmp_path)
-    service = Service()
-    monkeypatch.setattr(
-        cli,
-        "load_client",
-        lambda *, interface: LeanWarpCloud(
-            TEST_KEY,
-            base_url="https://api.example",
-            transport=httpx.MockTransport(service.handle),
-            interface=interface,
-        ),
-    )
-    assert (
-        cli.main(
-            [
-                "--project",
-                str(tmp_path),
-                "connect",
-                "--profile",
-                "standard",
-                "--max-profile",
-                "large",
-            ]
-        )
-        == 0
-    )
-    create = next(request for request in service.requests if request.method == "POST")
-    assert json.loads(create.content) == {
-        "bundle_id": "b",
-        "resource_profile": "standard",
-        "max_resource_profile": "large",
-        "max_spend_microusd": None,
-    }
-    assert cli.main(["--project", str(tmp_path), "check", "Main.lean", "--profile", "large"]) == 1
-    submit = next(request for request in reversed(service.requests) if request.method == "POST")
-    assert json.loads(submit.content)["resource_profile"] == "large"
-    assert TEST_KEY not in capsys.readouterr().out
+    with pytest.raises(SystemExit) as exited:
+        main(arguments)
+    assert exited.value.code == 2
+    assert json.loads(capsys.readouterr().out)["error"] == "invalid_arguments"
 
 
 def test_cli_explains_a_malformed_key(monkeypatch, capsys, tmp_path):
@@ -593,6 +554,19 @@ def test_doctor_checks_a_project_against_the_public_catalog_before_sign_in(
     assert "No LeanWarp environment matches" in json.loads(capsys.readouterr().out)["message"]
 
 
+def _batch(status: str, entries: list[str]) -> dict[str, Any]:
+    """A well-formed batch result whose counters count `entries`."""
+    return {
+        "status": status,
+        "passed": entries.count("ok"),
+        "failed": entries.count("error") + entries.count("rejected"),
+        "timed_out": entries.count("timeout"),
+        "infrastructure_failures": entries.count("infrastructure_failure"),
+        "not_checked": entries.count("not_checked"),
+        "results": [{"status": entry} for entry in entries],
+    }
+
+
 def _completed(kind: str, result: dict[str, Any]) -> OperationOutcome:
     return OperationOutcome(
         {
@@ -610,13 +584,14 @@ def _completed(kind: str, result: dict[str, Any]) -> OperationOutcome:
     [
         ("suggest", {"status": "closed", "verification": "strict", "patch": {}}, True),
         ("suggest", {"status": "closed", "verification": "declaration", "patch": {}}, True),
-        ("suggest", {"status": "closed", "verification": "partial", "patch": {}}, True),
+        ("suggest", {"status": "closed", "verification": "declaration", "patch": {}}, True),
+        ("suggest", {"status": "closed", "verification": "partial", "patch": {}}, False),
         # A tier this client does not know is never taken for a proof.
         ("suggest", {"status": "closed", "verification": "no_new_errors", "patch": {}}, False),
         # A closing tactic without a recheck verdict or patch is not a usable suggestion.
         ("suggest", {"status": "closed", "patch": {}}, False),
         ("suggest", {"status": "closed", "verification": "strict"}, False),
-        ("suggest", {"status": "not_closed"}, False),
+        ("suggest", {"status": "not_closed", "tried": 1, "rejections": []}, False),
         ("holes", {"status": "ok", "holes": []}, True),
         # Listing a file that does not compile yet still lists it.
         ("holes", {"status": "error", "holes": []}, True),
@@ -624,16 +599,16 @@ def _completed(kind: str, result: dict[str, Any]) -> OperationOutcome:
         ("extract_decls", {"status": "ok", "declarations": []}, True),
         ("extract_decls", {"status": "error", "declarations": []}, True),
         ("extract_decls", {"status": "timeout", "declarations": []}, False),
-        ("sorry2lemma", {"status": "extracted"}, True),
-        ("sorry2lemma", {"status": "no_targets"}, True),
-        ("sorry2lemma", {"status": "failed"}, False),
-        ("check_files", {"status": "ok", "failed": 0}, True),
-        ("check_files", {"status": "failed", "failed": 1}, False),
+        ("sorry2lemma", {"status": "extracted", "targets": [], "source_changed": True}, True),
+        ("sorry2lemma", {"status": "no_targets", "targets": [], "source_changed": False}, True),
+        ("sorry2lemma", {"status": "failed", "targets": [], "source_changed": False}, False),
+        ("check_files", _batch("ok", ["ok"]), True),
+        ("check_files", _batch("failed", ["error"]), False),
         # Every file must pass, whatever an inconsistent summary claims.
-        ("check_files", {"status": "ok", "failed": 1}, False),
-        ("verify_batch", {"status": "ok", "failed": 0}, True),
-        ("verify_batch", {"status": "failed", "failed": 2}, False),
-        ("verify_batch", {"status": "ok", "failed": 1}, False),
+        ("check_files", _batch("ok", ["error"]), False),
+        ("verify_batch", _batch("ok", ["ok"]), True),
+        ("verify_batch", _batch("failed", ["error", "rejected"]), False),
+        ("verify_batch", _batch("ok", ["ok", "rejected"]), False),
     ],
 )
 def test_source_tool_outcomes_report_success_only_for_usable_results(kind, result, success):
@@ -766,7 +741,16 @@ def test_cli_verify_batch_reads_proofs_from_standard_input(tmp_path, monkeypatch
     capsys.readouterr()
     lines = "".join(json.dumps(code) + "\n" for code in PROOFS).encode()
     monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(lines)))
-    # The fake service rejects every proof: the batch did not pass.
+    # Lean refuses every proof: the batch did not pass, and that is a verdict.
+    service.result_for = lambda body: {
+        "status": "failed",
+        "passed": 0,
+        "failed": 2,
+        "timed_out": 0,
+        "infrastructure_failures": 0,
+        "not_checked": 0,
+        "results": [{"status": "error"}, {"status": "error"}],
+    }
     assert cli.main(["--project", str(tmp_path), "verify-batch", "-", "--wait", "0"]) == 1
     submit = next(request for request in reversed(service.requests) if request.method == "POST")
     assert json.loads(submit.content)["payload"] == {"codes": PROOFS, "strict": True}
@@ -837,7 +821,7 @@ def test_edits_apply_only_to_the_exact_source_and_promised_result():
     edited = source.replace("sorry", "trivial")
     result = {
         "status": "closed",
-        "verification": "partial",
+        "verification": "declaration",
         "source_sha256": hashlib.sha256(source.encode()).hexdigest(),
         "patched_source_sha256": hashlib.sha256(edited.encode()).hexdigest(),
         "patch": {
@@ -887,3 +871,183 @@ def test_edits_apply_only_to_the_exact_source_and_promised_result():
             {"status": "failed", "source_sha256": result["source_sha256"], "source_changed": True},
             source,
         )
+
+
+def _verification(kind: str, result: dict[str, Any], state: str = "completed") -> dict[str, Any]:
+    return {
+        "operation_id": "o",
+        "revision": 1,
+        "state": state,
+        "kind": kind,
+        "result": {"operation_id": "o", "revision": 1, "generation": 1, "result": result},
+    }
+
+
+V2 = {"policy": "fixed_target_kernel_check_v2", "candidate_declaration": "t"}
+
+
+@pytest.mark.parametrize(
+    ("kind", "result", "successful", "decided"),
+    [
+        ("check", {"status": "ok", "diagnostics": []}, True, True),
+        ("check", {"status": "error", "diagnostics": []}, False, True),
+        (
+            "check",
+            {"status": "rejected", "failure": {"kind": "axioms"}, "diagnostics": []},
+            False,
+            True,
+        ),
+        ("check", {"status": "timeout", "failure": {"kind": "timeout"}}, False, False),
+        ("check", {"status": "infrastructure_failure"}, False, False),
+        ("check", {"status": "not_checked"}, False, False),
+        ("verify_target", {"status": "ok", "receipt": V2}, True, True),
+        # An ok without the checker's receipt is no evidence either way: not a
+        # wrong proof, and not an acceptance.
+        ("verify_target", {"status": "ok", "receipt": {"policy": "v1"}}, False, False),
+        ("verify_target", {"status": "ok"}, False, False),
+        ("verify_target", {"status": "ok", "receipt": {"policy": V2["policy"]}}, False, False),
+        # Missing, unknown or malformed results decide nothing.
+        ("check", {}, False, False),
+        ("check", {"status": "open_goals"}, False, False),
+        ("check", {"status": ["ok"]}, False, False),
+        ("verify_batch", {"status": "ok"}, False, False),
+        ("verify_batch", {"status": "failed", "failed": 0}, False, False),
+        ("suggest", {"status": "maybe"}, False, False),
+        # A tool's own answers are decided; a stopped preparation is not.
+        ("suggest", {"status": "not_closed", "tried": 1, "rejections": []}, False, True),
+        # A listing of a file that does not compile still ran.
+        ("holes", {"status": "error", "holes": []}, True, True),
+        ("holes", {"status": "error", "error": {"code": "timeout"}}, False, False),
+        (
+            "verify_target",
+            {"status": "rejected", "failure": {"kind": "axioms"}, "diagnostics": []},
+            False,
+            True,
+        ),
+        ("verify_target", {"status": "infrastructure_failure"}, False, False),
+        ("verify_batch", _batch("ok", ["ok"]), True, True),
+        ("verify_batch", _batch("failed", ["error"]), False, True),
+        ("verify_batch", _batch("incomplete", ["timeout"]), False, False),
+        ("check_files", _batch("incomplete", ["not_checked"]), False, False),
+    ],
+)
+def test_outcome_tells_a_wrong_proof_from_no_verdict(
+    kind: str, result: dict[str, Any], successful: bool, decided: bool
+) -> None:
+    outcome = OperationOutcome(_verification(kind, result))
+    assert (outcome.successful, outcome.decided) == (successful, decided)
+
+
+@pytest.mark.parametrize(
+    ("state", "result", "code"),
+    [
+        ("completed", {"status": "ok", "diagnostics": []}, 0),
+        ("completed", {"status": "error", "diagnostics": []}, 1),
+        ("completed", {"status": "rejected", "failure": {"kind": "axioms"}, "diagnostics": []}, 1),
+        ("completed", {"status": "timeout"}, 4),
+        ("completed", {"status": "infrastructure_failure"}, 4),
+        ("completed", {"status": "not_checked"}, 4),
+        ("completed", {}, 4),
+        ("completed", {"status": "something_new"}, 4),
+        ("failed", None, 4),
+        ("queued", None, 3),
+    ],
+)
+def test_the_cli_exit_code_tells_a_wrong_proof_from_no_verdict(
+    state: str, result: dict[str, Any] | None, code: int
+) -> None:
+    from leanwarp_cloud.cli import _exit_code
+
+    operation = _verification("check", result or {}, state)
+    if result is None:
+        del operation["result"]
+    assert _exit_code(operation) == code
+
+
+def test_the_cli_documents_each_exit_code() -> None:
+    from leanwarp_cloud.cli import _EPILOG
+
+    for line in ("0  success", "1  the check or proof did not pass", "4  no verdict"):
+        assert line in _EPILOG
+
+
+def test_a_verify_batch_target_reaches_the_service(tmp_path, monkeypatch, capsys):
+    import io
+
+    service = Service()
+    cli = _batch_cli(tmp_path, monkeypatch, service)
+    target = {"context": "import Mathlib", "statement": "2 + 2 = 4", "declaration": "t"}
+    bound = {"custom_id": "p1", "proof": "theorem t : 2 + 2 = 4 := rfl", "target": target}
+    monkeypatch.setattr(
+        sys, "stdin", io.TextIOWrapper(io.BytesIO((json.dumps(bound) + "\n").encode()))
+    )
+    cli.main(["--project", str(tmp_path), "verify-batch", "-", "--wait", "0"])
+    submit = next(request for request in reversed(service.requests) if request.method == "POST")
+    assert json.loads(submit.content)["payload"]["codes"] == [bound]
+
+
+# A result is decided only with the fields its status promises.
+
+WELL_FORMED: list[tuple[str, dict[str, Any], bool]] = [
+    ("check", {"status": "ok", "diagnostics": []}, True),
+    ("verify_target", {"status": "ok", "receipt": V2, "diagnostics": []}, True),
+    ("inspect", {"status": "available", "goal_contexts": [{"target": "True"}]}, True),
+    ("inspect", {"status": "unavailable"}, False),
+    ("suggest", {"status": "closed", "verification": "strict", "patch": {}}, True),
+    ("suggest", {"status": "not_closed", "tried": 0, "rejections": []}, False),
+    ("holes", {"status": "ok", "holes": []}, True),
+    ("extract_decls", {"status": "ok", "declarations": []}, True),
+    ("sorry2lemma", {"status": "extracted", "targets": [], "source_changed": True}, True),
+    ("try_tactics", {"results": []}, True),
+    ("check_files", _batch("ok", ["ok", "ok"]), True),
+    ("verify_batch", _batch("failed", ["ok", "rejected", "timeout"]), False),
+]
+
+
+@pytest.mark.parametrize(("kind", "result", "success"), WELL_FORMED)
+def test_a_well_formed_result_of_each_kind_is_decided(
+    kind: str, result: dict[str, Any], success: bool
+) -> None:
+    from leanwarp_cloud.outcome import judge_result
+
+    judgement = judge_result(kind, result)
+    assert (judgement.success, judgement.decided) == (success, True)
+
+
+@pytest.mark.parametrize(
+    ("kind", "result"),
+    [
+        ("holes", {"status": "ok"}),
+        ("holes", {"status": "ok", "holes": "none"}),
+        ("extract_decls", {"status": "ok"}),
+        ("suggest", {"status": "closed"}),
+        ("suggest", {"status": "closed", "verification": "partial", "patch": {}}),
+        ("suggest", {"status": "closed", "verification": "strict", "patch": "p"}),
+        ("suggest", {"status": "not_closed"}),
+        ("suggest", {"status": "not_closed", "tried": True, "rejections": []}),
+        ("sorry2lemma", {"status": "extracted"}),
+        ("sorry2lemma", {"status": "failed", "targets": []}),
+        ("inspect", {"status": "available"}),
+        ("check", {"status": "ok"}),
+        ("check", {"status": "error"}),
+        ("check", {"status": "error", "error": {"code": "timeout"}}),
+        ("check", {"status": "rejected", "diagnostics": []}),
+        ("verify_target", {"status": "rejected", "failure": {}, "diagnostics": []}),
+        ("verify_target", {"status": "error"}),
+        # Batches: integer counters that partition the results.
+        ("verify_batch", {"status": "ok", "failed": False}),
+        ("check_files", {**_batch("ok", ["ok"]), "failed": False}),
+        ("check_files", {**_batch("ok", ["ok"]), "passed": True}),
+        ("check_files", {**_batch("ok", ["ok"]), "passed": 2}),
+        ("check_files", {**_batch("failed", ["error"]), "failed": 1.0}),
+        ("check_files", {**_batch("ok", ["ok"]), "results": "all"}),
+        ("check_files", {**_batch("ok", ["ok"]), "results": [{"status": "error"}]}),
+        ("check_files", {**_batch("ok", ["ok"]), "results": [1]}),
+        ("verify_batch", {k: v for k, v in _batch("ok", ["ok"]).items() if k != "timed_out"}),
+    ],
+)
+def test_a_result_without_its_kinds_fields_is_undecided(kind: str, result: dict[str, Any]) -> None:
+    from leanwarp_cloud.outcome import judge_result
+
+    judgement = judge_result(kind, result)
+    assert (judgement.success, judgement.decided, judgement.exit_code) == (False, False, 4)

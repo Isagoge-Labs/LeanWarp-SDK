@@ -23,9 +23,11 @@ from .client import (
     MAX_FEEDBACK_SUMMARY,
     MIN_FEEDBACK_SUMMARY,
     OPERATION_KINDS,
+    RETENTIONS,
     FeedbackKind,
     FeedbackSeverity,
     LeanWarpCloud,
+    Retention,
 )
 from .compact import summary
 from .edits import EDITING_KINDS, edited_sha256, edited_source
@@ -705,10 +707,13 @@ class ProjectSession:
         *,
         resource_profile: str | None = None,
         timeout_seconds: int | None = None,
+        retention: Retention | None = None,
     ) -> dict[str, Any]:
         """Sync acknowledged source, then submit without hiding a second paid operation."""
         if kind not in OPERATION_KINDS:
             raise UsageError(f"{kind!r} is not a LeanWarp operation")
+        if retention is not None and retention not in RETENTIONS:
+            raise UsageError('retention must be "standard" or "short"')
         if timeout_seconds is not None and (
             type(timeout_seconds) is not int or not 1 <= timeout_seconds <= 600
         ):
@@ -736,6 +741,10 @@ class ProjectSession:
                 body["resource_profile"] = resource_profile
             if timeout_seconds is not None:
                 body["timeout_seconds"] = timeout_seconds
+            # Standard is the default: sending it changes nothing, so it is never
+            # sent, and a resend compares the same request however it was asked for.
+            if retention == "short":
+                body["retention"] = retention
             # Running the same command again after a lost response asks for the work
             # the resent request just started; submitting it too would pay twice.
             if update is None and settled is not None and _same_submission(settled[0], body):
@@ -764,6 +773,7 @@ class ProjectSession:
         wait_seconds: float,
         resource_profile: str | None = None,
         timeout_seconds: int | None = None,
+        retention: Retention | None = None,
     ) -> dict[str, Any]:
         """Submit, then poll briefly for the result in the same call.
 
@@ -781,7 +791,11 @@ class ProjectSession:
                 "poll longer with wait"
             )
         operation = self.submit(
-            kind, payload, resource_profile=resource_profile, timeout_seconds=timeout_seconds
+            kind,
+            payload,
+            resource_profile=resource_profile,
+            timeout_seconds=timeout_seconds,
+            retention=retention,
         )
         if wait_seconds == 0 or operation.get("state") in _TERMINAL_STATES:
             self._note_finished(operation)
@@ -1158,7 +1172,20 @@ class ProjectSession:
         after a revision conflict, run reconcile and then sync instead.
         """
         with self._locked() as state:
-            self._settle(state)
+            pending = state.get("pending")
+            try:
+                self._settle(state)
+            except LeanWarpCloudError as error:
+                # An earlier apply's upload, resent: it meets the same conflict.
+                if (
+                    error.code != "revision_conflict"
+                    or not isinstance(pending, dict)
+                    or pending.get("method") != "sync_files"
+                ):
+                    raise
+                raise _kept_for_reconcile(
+                    error, "Your local files are kept, any edit apply wrote included, but"
+                ) from None
             _check_apply_recovery(self.directory)
             if not isinstance(state.get("operation_id"), str):
                 raise SessionError("this project has not submitted an operation")
@@ -1170,10 +1197,6 @@ class ProjectSession:
                 raise SessionError("only a suggest or sorry2lemma result can be applied")
             if operation.get("state") != "completed":
                 raise SessionError("the latest operation has not completed; run `leanwarp wait`")
-            if operation.get("revision") != state["revision"]:
-                raise SessionError(
-                    "files were uploaded after this result was computed; run it again"
-                )
             result = OperationOutcome(operation).result
             file = result.get("file") if result is not None else None
             if result is None or not isinstance(file, str) or file not in state["files"]:
@@ -1187,11 +1210,20 @@ class ProjectSession:
                 )
             if not OperationOutcome(operation).successful:
                 raise SessionError("the latest result is not a verified edit")
-            # Fail on a changed toolchain before the file is written, not after.
-            self._environment(state)
+            promised = edited_sha256(str(kind), result)
             current = collect_lean_sources(self.root).get(file)
             digest = hashlib.sha256(current.encode()).hexdigest() if current is not None else None
-            if digest == edited_sha256(str(kind), result):
+            # An earlier apply whose response was lost can have uploaded the edit;
+            # settling recorded that upload, so only other changed files remain.
+            if operation.get("revision") != state["revision"] and not (
+                digest == promised and state["files"][file] == promised
+            ):
+                raise SessionError(
+                    "files were uploaded after this result was computed; run it again"
+                )
+            # Fail on a changed toolchain before the file is written, not after.
+            self._environment(state)
+            if digest == promised:
                 pass  # Written by an earlier apply whose upload did not finish.
             elif digest == state["files"][file] and current is not None:
                 try:
@@ -1203,7 +1235,13 @@ class ProjectSession:
                 raise SessionError(
                     f"{file} changed locally after the result was computed; run it again"
                 )
-            uploaded = self._sync(state)
+            try:
+                uploaded = self._sync(state)
+            except LeanWarpCloudError as error:
+                if error.code != "revision_conflict":
+                    raise
+                # Applying again would meet the same conflict; say the edit is kept.
+                raise _kept_for_reconcile(error, f"{file} now holds the edit, but") from None
             return {
                 "status": "applied",
                 "backup_directory": str(self.directory / "apply-backups"),
@@ -1612,9 +1650,15 @@ def block_seconds(timeout_seconds: int | None) -> float:
 
 def _same_submission(pending: Mapping[str, Any], body: Mapping[str, Any]) -> bool:
     """Whether a resent request submitted exactly the operation now being asked for."""
-    return pending["method"] in {"submit", "run"} and all(
-        pending["arguments"].get(field) == body.get(field)
-        for field in ("kind", "payload", "resource_profile", "timeout_seconds")
+    arguments = pending["arguments"]
+    return (
+        pending["method"] in {"submit", "run"}
+        and all(
+            arguments.get(field) == body.get(field)
+            for field in ("kind", "payload", "resource_profile", "timeout_seconds")
+        )
+        # Leaving retention out asks for the standard one.
+        and arguments.get("retention", "standard") == body.get("retention", "standard")
     )
 
 
@@ -1703,7 +1747,7 @@ def _validate_journal(state: dict[str, Any]) -> None:
                 and revision(args.get("expected_revision"))
             )
             update = {"files", "delete_paths"}
-            submission = {"kind", "payload", "resource_profile", "timeout_seconds"}
+            submission = {"kind", "payload", "resource_profile", "timeout_seconds", "retention"}
             if method in {"sync_files", "run"}:
                 valid = (
                     valid
@@ -1742,9 +1786,25 @@ def _validate_journal(state: dict[str, Any]) -> None:
                             and 1 <= args["timeout_seconds"] <= 600
                         )
                     )
+                    and (
+                        "retention" not in args
+                        or (isinstance(args["retention"], str) and args["retention"] in RETENTIONS)
+                    )
                 )
     if not valid:
         raise SessionError(_JOURNAL_DAMAGED)
+
+
+def _kept_for_reconcile(error: LeanWarpCloudError, kept: str) -> LeanWarpCloudError:
+    """Apply's upload met a revision conflict: what is kept, and what to do next."""
+    return LeanWarpCloudError(
+        error.status_code,
+        error.code,
+        f"{kept} another client changed the workspace since this project's last sync, so "
+        "nothing was uploaded. Decide with the other writer which files to keep, then run "
+        "reconcile and sync.",
+        idempotency_key=error.idempotency_key,
+    )
 
 
 def _check_apply_recovery(directory: Path) -> None:

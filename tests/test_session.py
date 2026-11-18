@@ -961,9 +961,15 @@ class SharedWorkspace(Service):
     def __init__(self) -> None:
         super().__init__()
         self.denied_submissions = 0
+        # Drop the next upload's connection before the service receives it.
+        self.drop_upload = False
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
+        if request.method == "PUT" and path.endswith("/files") and self.drop_upload:
+            self.drop_upload = False
+            self.requests.append(request)
+            raise httpx.ConnectError("connection reset", request=request)
         if request.method == "GET" and path.endswith("/files"):
             self.requests.append(request)
             return httpx.Response(
@@ -1562,16 +1568,80 @@ def test_apply_refuses_a_result_the_client_does_not_count_as_successful(project)
     assert (root / "Main.lean").read_text() == SORRY
 
 
-def test_apply_after_a_failed_upload_uploads_the_edit_it_already_wrote(project):
+def test_apply_after_a_refused_upload_uploads_the_edit_it_already_wrote(project):
     root, service, session, edited = _suggestion_for_apply(project)
     revision = service.revision
-    service.reject = True  # Another device advanced the workspace first.
+    service.reject = True  # The service refuses the upload once.
     with pytest.raises(LeanWarpCloudError):
         session.apply()
     assert (root / "Main.lean").read_text() == edited
     applied = session.apply()
     assert applied["status"] == "applied" and service.sources["Main.lean"] == edited
     assert applied["revision"] == service.revision == revision + 1
+
+
+def test_apply_after_a_lost_upload_response_reports_the_edit_applied(project):
+    root, service, session, edited = _suggestion_for_apply(project)
+    revision = service.revision
+    service.lose = "/files"  # The upload lands; its response does not.
+    with pytest.raises(LeanWarpTransportError):
+        session.apply()
+    (root / "Helper.lean").write_text("def helper := 2")
+    applied = session.apply()
+    assert applied["status"] == "applied" and applied["file"] == "Main.lean"
+    assert (root / "Main.lean").read_text() == service.sources["Main.lean"] == edited
+    # Other changed files are still uploaded, as by sync.
+    assert service.sources["Helper.lean"] == "def helper := 2"
+    assert applied["revision"] == service.revision == revision + 2
+
+
+def test_apply_after_another_client_changed_the_workspace_keeps_the_edit_for_reconcile(
+    shared,
+):
+    root, service, session = shared
+    (root / "Main.lean").write_text(SORRY)
+    service.result_for, edited = _suggested(SORRY)
+    session.connect()
+    session.submit_and_wait(
+        "suggest", {"file": "Main.lean", "line": 2, "column": 3}, wait_seconds=0
+    )
+    service.sources["Other.lean"] = "def other := 1"
+    service.revision += 1
+    for _ in range(2):  # Applying again meets the same conflict.
+        with pytest.raises(LeanWarpCloudError, match="now holds the edit") as conflict:
+            session.apply()
+        assert conflict.value.code == "revision_conflict" and conflict.value.status == 409
+        assert (root / "Main.lean").read_text() == edited
+    session.reconcile()
+    session.sync()
+    assert service.sources["Main.lean"] == edited and "Other.lean" in service.sources
+    assert session.apply()["revision"] == service.revision
+
+
+def test_apply_after_a_dropped_upload_and_another_clients_change_keeps_the_edit(shared):
+    root, service, session = shared
+    (root / "Main.lean").write_text(SORRY)
+    service.result_for, edited = _suggested(SORRY)
+    session.connect()
+    session.submit_and_wait(
+        "suggest", {"file": "Main.lean", "line": 2, "column": 3}, wait_seconds=0
+    )
+    service.drop_upload = True
+    with pytest.raises(LeanWarpTransportError):
+        session.apply()
+    assert (root / "Main.lean").read_text() == edited
+    # Another client advances the workspace before the upload is resent.
+    service.sources["Other.lean"] = "def other := 1"
+    service.revision += 1
+    for _ in range(2):  # The resent upload, then applying again, meet the conflict.
+        with pytest.raises(LeanWarpCloudError, match="nothing was uploaded") as conflict:
+            session.apply()
+        assert conflict.value.code == "revision_conflict" and conflict.value.status == 409
+        assert "reconcile and sync" in str(conflict.value)
+        assert (root / "Main.lean").read_text() == edited
+    session.reconcile()
+    session.sync()
+    assert service.sources["Main.lean"] == edited and "Other.lean" in service.sources
 
 
 def test_apply_writes_nothing_when_the_environment_changed(project):

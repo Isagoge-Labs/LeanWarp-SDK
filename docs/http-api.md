@@ -30,10 +30,12 @@ Authorization: Bearer lw_live_…
 
 Steps 3 to 5 can be one request: `POST /workspaces/{workspace_id}/run` takes the
 files to upload or delete (`files`, `delete_paths`) with the operation (`kind`,
-`payload`, and optionally `resource_profile` and `timeout_seconds`). It returns
-the new `revision` and the `operation`. Add `?wait_seconds=20` to hold it until
-the operation ends. One `Idempotency-Key` covers the upload and the operation;
-resending replays whichever already happened. Use a new key for each different
+`payload`, and optionally `resource_profile`, `timeout_seconds` and
+`retention`). `timeout_seconds` limits running the operation; starting a worker
+does not count against it (see below). It returns the new `revision` and the
+`operation`. Add `?wait_seconds=20` to hold it until the operation ends. One
+`Idempotency-Key` covers the upload and the operation; resending replays
+whichever already happened. Use a new key for each different
 request: the upload commits first, so files sent under a key already used for
 another operation are committed before that conflict is reported. After a
 rejected request, `GET /workspaces/{workspace_id}/files` shows whether the upload
@@ -103,10 +105,10 @@ start at 1, and columns count characters (Unicode code points).
 | --- | --- |
 | `check` | `file`, `strict` (default `true`; `false` is a draft check, in which `sorry` is only a warning). |
 | `inspect` | `file`, `line`, `column`. |
-| `try_tactics` | `file`, `line`, `column`, `tactics` (1 to 32), `timeout_ms` per tactic (default 30000). |
+| `try_tactics` | `file`, `line`, `column`, `tactics` (1 to 32), `timeout_ms` per tactic (default 30000). Near the operation's limit, tactics tried together share the time left, and those with no time left are listed in `skipped`. |
 | `verify_target` | `file`, `candidate_declaration`, `target_statement`, `target_context` (it may import only the environment's packages, never the workspace's modules), `execution_mode` (`reusable` or `fresh`), `timeout` seconds. |
 | `holes` | `file`, `goals` (default `true`: bounded goals for the first 16 unfinished or unknown placeholders). |
-| `suggest` | `file`, `line`, `column`. Optional `tactics` (1 to 32) to use instead of LeanWarp's portfolio, and `timeout_ms` per tactic (learned budgets by default). |
+| `suggest` | `file`, `line`, `column`. Optional `tactics` (1 to 32) to use instead of LeanWarp's portfolio, and `timeout_ms` per tactic (learned budgets by default). Near the operation's limit, tactics tried together share the time left. |
 | `extract_decls` | `file`. |
 | `sorry2lemma` | `file`, `max_extractions` (1 to 256, default 64), optional `name_prefix`, `strict_final_check` (default `false`). |
 | `check_files` | `files` (1 to 64 distinct paths), `strict` (default `true`), optional `timeout` seconds per file (default 60), which starts once the file's imports have loaded, except in a file using `native_decide`. It must fit the operation's budget for its entries (see below). |
@@ -115,6 +117,24 @@ start at 1, and columns count characters (Unicode code points).
 Any `payload` may also carry `lean_options`, an object of Lean options applied as
 a lakefile's `leanOptions` would be, such as `{"maxSynthPendingDepth": 3}`. Options
 that could weaken checking are refused.
+
+An operation's `timeout_seconds` limits execution to 1–600 seconds. The default
+depends on the operation. For example, `check` and `inspect` default to 120 seconds.
+Every stage shares that one limit: preparing the file's local imports,
+capturing its proof state, checking it and running tactic trials. A check or
+verification whose Lean run reaches it returns a `timeout` non-verdict, retryable
+with more time. A batch keeps the entries it finished (see below). Otherwise,
+including a check that reaches it while its imports are still being prepared,
+the operation fails with `operation_timeout`.
+
+Starting a worker does not count against `timeout_seconds`, so a file gets the
+same limit on a warm worker as on a cold one. A start has its own limits. It
+fails with `capacity_unavailable` if it is still waiting for capacity 10 minutes
+after the operation's submission, queueing included (whenever the service
+reclaims an operation and must start a worker for it, the wait starts afresh).
+It then has up to 15 minutes to create the worker and 5 more for it to become
+ready (`worker_start_timeout`). Both failures are retryable, and nothing ran.
+Uploading files counts against neither limit.
 
 `suggest`, `check_files` and `verify_batch` stop starting new work after four
 minutes. Their default `timeout_seconds` is 600, enough for the work still in
@@ -172,6 +192,16 @@ with `operation_active`; cancel it or wait. Reading an operation never deletes i
 
 Resubmitting a deleted request with the same `Idempotency-Key` answers
 `operation_expired` and does not run it again.
+
+A `check`, `inspect` or `try_tactics` can instead ask for short retention: send
+`"retention": "short"` with the operation. Its result is then eligible for
+removal about 60 seconds after it finishes, instead of an hour, so a search loop
+stays within its limits without a `DELETE` for each result. This is not an
+erasure time: history removes results only when it needs room, so a quiet
+workspace may keep one longer, and each workspace's newest operation is always
+kept. Until it is removed, resending the request returns the original result;
+afterwards it answers `operation_expired`, as a deleted one does. Other kinds
+refuse `"short"` with `invalid_request`. The default is `"standard"`.
 
 ### Waiting on many operations
 
@@ -280,9 +310,13 @@ twice. Use a new key for each new request.
 
 LeanWarp keeps a window of finished history, not all of it (see
 [limits](../src/leanwarp_cloud/skills/leanwarp/references/usage.md#credentials-credit-and-limits)).
-A replay within an hour of the original always returns its result. Later, a
-submission whose operation was removed returns `operation_expired` for at least
-7 days, and is not run again. Reading that operation returns `not_found`.
+A replay returns the original result while it is stored. Unless you explicitly
+delete it, history keeps a finished result for at least an hour, or a minute
+with [short retention](#releasing-results). After deletion or removal by history,
+replaying the submission returns `operation_expired` for at least 7 days.
+Reading the removed operation returns `not_found`. `retention` is part of the
+request: leaving it out is the same as `"standard"`, and resending a key with a
+different `retention` is an `idempotency_conflict`.
 
 Creating a workspace replays this way until 7 days after the workspace is
 deleted; after that, the same key creates a new workspace.
@@ -319,17 +353,18 @@ do next. It may change. Common codes:
 | `idempotency_conflict` | 409 | The `Idempotency-Key` was used for a different request. |
 | `operation_expired` | 409 | The request already ran and its result is no longer stored. It was not run again. |
 | `operation_active` | 409 | The operation has not finished, so its result cannot be deleted yet. |
-| `operation_limit_exceeded` | 429 | The workspace holds the account's limit of operations from the last hour (1,000 by default). |
+| `operation_limit_exceeded` | 429 | The workspace stores the account's limit of operations (1,000 by default). |
 | `operation_storage_limit_exceeded` | 429 | Stored results, and the space held for queued and running operations, reached the account's limit (512 MiB by default). |
 | `source_history_limit_exceeded` | 429 | The workspace reached the account's sync limit (1,000 by default) within the last hour, or stored source reached the account's limit (64 MiB by default). |
 | `workspace_creation_limit_exceeded` | 429 | The account created its limit of workspaces within the last hour (300 by default). |
 
 The four limits above free with time, so they answer `429` with `Retry-After`:
-the seconds until the oldest record that counts leaves the hour-long window (or
-the whole window when nothing is waiting to leave it; for storage held only by
-running operations, 30 seconds). Deleting results you have read frees operation
-history and storage at once. Stored source frees only when you delete files or
-workspaces, so waiting does not help that case. An account's limits can be
+the seconds until enough records that count can be removed, an hour after each
+finished or a minute for short retention (or the whole hour-long window when
+nothing is waiting to leave it; for storage held only by running operations, 30
+seconds). Deleting results you have read frees operation history and storage at
+once. Stored source frees only when you delete files or workspaces, so waiting
+does not help that case. An account's limits can be
 raised; email contact@isagoge.in.
 
 ## Results and failed operations
@@ -398,10 +433,18 @@ until it stops. The operation's own fields are under `result.result`, and the
 [reference](../src/leanwarp_cloud/skills/leanwarp/references/usage.md#results)
 lists them. Completed operations also have `execution`, which says which worker
 ran them and what was reused, and `timing`, with `queued_ms`, `worker_ms`,
-`upload_ms` and `run_ms`. Parts of `run_ms` appear when Lean timed them:
-`elaboration_ms` (checks: importing and checking the file), `proof_state_ms` and
-`tactics_ms` (tactic trials: capturing the proof state, then running the
-tactics). After dispatch recovery, `queued_ms` is absent rather than an estimate
+`upload_ms` and `run_ms`. When a worker was started for the operation,
+`worker_ms` has parts, and may also include other work: `start_wait_ms`
+(waiting for capacity to start one, after the wait in `queued_ms`), `create_ms`
+(creating it) and `ready_ms` (waiting for it to answer). The worker also reports
+its own measures of its start: `isolation_ms` (setting up resource limits and
+metering), `project_ms` (preparing the project) and `engine_start_ms` (starting
+the Lean engine). It times these itself, so they can overlap `create_ms` and
+need not add up to `ready_ms`. Parts of `run_ms` appear when Lean timed them:
+`elaboration_ms` (checks: importing and checking the file), with `imports_ms`
+(loading the imports, such as Mathlib) inside it for strict checks,
+`proof_state_ms` and `tactics_ms` (tactic trials: capturing the proof state,
+then running the tactics). After dispatch recovery, `queued_ms` is absent rather than an estimate
 of earlier attempts. Clients should tolerate absent timing.
 
 A service update can interrupt an operation that is running. Most finish during

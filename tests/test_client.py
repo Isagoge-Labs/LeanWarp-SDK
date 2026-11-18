@@ -445,6 +445,53 @@ def test_verify_batch_submits_inline_proofs_and_bounds_their_count() -> None:
     assert bodies[1]["payload"] == {"codes": codes, "strict": True}
 
 
+def test_short_retention_is_sent_only_when_asked_for() -> None:
+    requests: list[httpx.Request] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(202, json={"operation_id": "op"})
+
+    with LeanWarpCloud(
+        "secret", base_url="https://cloud.example", transport=httpx.MockTransport(handle)
+    ) as api:
+        api.check("workspace", "Main.lean", expected_revision=1)
+        api.check("workspace", "Main.lean", expected_revision=1, retention="short")
+        api.inspect(
+            "workspace", "Main.lean", expected_revision=1, line=1, column=0, retention="short"
+        )
+        api.try_tactics(
+            "workspace",
+            "Main.lean",
+            expected_revision=1,
+            line=1,
+            column=0,
+            tactics=["simp"],
+            retention="short",
+        )
+        api.submit(
+            "workspace",
+            "check",
+            expected_revision=1,
+            payload={"file": "Main.lean"},
+            retention="standard",
+        )
+        api.run("workspace", "check", expected_revision=1, payload={}, retention="short")
+        with pytest.raises(ValueError, match="retention"):
+            api.check("workspace", "Main.lean", expected_revision=1, retention="brief")  # type: ignore[arg-type]
+    bodies = [json.loads(request.content) for request in requests]
+    assert [body.get("retention") for body in bodies] == [
+        None,
+        "short",
+        "short",
+        "short",
+        "standard",
+        "short",
+    ]
+    assert "retention" not in bodies[0]
+    assert requests[-1].url.path.endswith("/run")
+
+
 @pytest.mark.parametrize("deadline", [0, 601, True, 1.5])
 def test_invalid_execution_deadline_is_rejected_before_submission(deadline: object) -> None:
     def unexpected(_request: httpx.Request) -> httpx.Response:

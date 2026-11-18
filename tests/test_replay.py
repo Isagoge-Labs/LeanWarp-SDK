@@ -96,6 +96,96 @@ def test_repeating_the_same_command_after_a_lost_response_pays_once(project):
     assert journal(root)["operation_id"] == first
 
 
+@pytest.mark.parametrize("lost", ["/operations", "/run"])
+def test_a_resend_keeps_the_retention_it_was_submitted_with(project, lost):
+    root, service, session = project
+    session.connect()
+    if lost == "/operations":
+        session.sync()
+    service.lose = lost
+    with pytest.raises(LeanWarpTransportError):
+        session.submit("check", {"file": "Main.lean"}, retention="short")
+    assert journal(root)["pending"]["arguments"]["retention"] == "short"
+    first = service.operation["operation_id"]
+    # The same command with the same retention is the resent work, paid once.
+    again = session.submit("check", {"file": "Main.lean"}, retention="short")
+    assert again["operation_id"] == first
+    (one, two) = posts(service, lost)
+    assert one.headers["Idempotency-Key"] == two.headers["Idempotency-Key"]
+    assert one.content == two.content
+    assert json.loads(two.content)["retention"] == "short"
+
+
+def test_another_retention_is_not_taken_for_the_resent_work(project):
+    _, service, session = project
+    session.connect()
+    session.sync()
+    service.lose = "/operations"
+    with pytest.raises(LeanWarpTransportError):
+        session.submit("check", {"file": "Main.lean"}, retention="short")
+    first = service.operation["operation_id"]
+    other = session.submit("check", {"file": "Main.lean"})
+    assert other["operation_id"] != first
+    (_, resent, fresh) = posts(service, "/operations")
+    assert json.loads(resent.content)["retention"] == "short"
+    assert "retention" not in json.loads(fresh.content)
+
+
+@pytest.mark.parametrize(("first", "second"), [(None, "standard"), ("standard", None)])
+@pytest.mark.parametrize("lost", ["/operations", "/run"])
+def test_standard_retention_resends_like_an_omitted_one(project, lost, first, second):
+    _, service, session = project
+    session.connect()
+    if lost == "/operations":
+        session.sync()
+    service.lose = lost
+    with pytest.raises(LeanWarpTransportError):
+        session.submit("check", {"file": "Main.lean"}, retention=first)
+    original = service.operation["operation_id"]
+    again = session.submit("check", {"file": "Main.lean"}, retention=second)
+    # Either spelling of the default is the same request: resent once, paid once.
+    assert again["operation_id"] == original
+    (one, two) = posts(service, lost)
+    assert one.content == two.content and "retention" not in json.loads(two.content)
+
+
+@pytest.mark.parametrize("lost", ["/operations", "/run"])
+def test_a_saved_standard_retention_resends_like_an_omitted_one(project, lost):
+    root, service, session = project
+    session.connect()
+    if lost == "/operations":
+        session.sync()
+    service.lose = lost
+    with pytest.raises(LeanWarpTransportError):
+        session.submit("check", {"file": "Main.lean"})
+    original = service.operation["operation_id"]
+    # A journal (and its sent request) that spelled out the default still names
+    # the same request.
+    saved = journal(root)
+    saved["pending"]["arguments"]["retention"] = "standard"
+    (root / ".leanwarp/session.json").write_text(json.dumps(saved))
+    for key, (body, result) in list(service.receipts.items()):
+        if "kind" in body:
+            service.receipts[key] = ({**body, "retention": "standard"}, result)
+    again = ProjectSession(session.cloud, root).submit("check", {"file": "Main.lean"})
+    assert again["operation_id"] == original
+    assert len(posts(service, lost)) == 2
+
+
+def test_a_journal_with_an_unknown_retention_is_refused(project):
+    root, service, session = project
+    session.connect()
+    session.sync()
+    service.lose = "/operations"
+    with pytest.raises(LeanWarpTransportError):
+        session.submit("check", {"file": "Main.lean"}, retention="short")
+    damaged = journal(root)
+    damaged["pending"]["arguments"]["retention"] = "forever"
+    (root / ".leanwarp/session.json").write_text(json.dumps(damaged))
+    with pytest.raises(SessionError):
+        ProjectSession(session.cloud, root).recover()
+
+
 def test_a_different_command_after_a_resend_runs_once_the_first_has_finished(project):
     _, service, session = project
     session.connect()

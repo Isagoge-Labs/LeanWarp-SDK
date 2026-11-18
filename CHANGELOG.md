@@ -2,6 +2,17 @@
 
 Update an installed SDK with `leanwarp update`.
 
+## 0.2.8
+
+- `check`, `inspect` and `try_tactics` take `retention="short"`: a finished
+  result is then eligible for removal about 60 seconds after it finishes, so a
+  search loop need not delete each one. The default stays `"standard"`.
+- If `apply` reports a `revision_conflict`, it keeps your local files. Check
+  whether the edit was written, then use `reconcile` to review what `sync`
+  would upload or delete.
+- `apply` run again after an upload whose response was lost reports `applied`
+  when that upload landed, instead of asking to run the operation again.
+
 ## 0.2.7
 
 - Every result says whether there was a verdict. A check, batch entry or

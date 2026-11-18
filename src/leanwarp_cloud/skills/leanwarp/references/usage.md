@@ -108,7 +108,8 @@ LeanWarp checks the search tactic itself instead.
 Preparing imports, the portfolio and its rechecks share one four-minute budget.
 
 `apply` writes a result only onto the exact bytes it was computed from. Run it
-straight after `suggest` or `sorry2lemma`. The result must:
+straight after `suggest` or `sorry2lemma`. To write the edit for the first time,
+the result must:
 
 - be this project's latest operation, and successful;
 - have completed at the revision the project last uploaded;
@@ -116,8 +117,14 @@ straight after `suggest` or `sorry2lemma`. The result must:
 
 Each result names the SHA-256 of the source it read and of the source it
 produces. `apply` also uploads other changed files, as `sync` would. It prints
-`status: applied` with the new `revision`. If the upload fails after the file is
-written, run `apply` again. It sees the edit is already in place and uploads it.
+`status: applied` with the new `revision`. If the file was written and the
+upload response was lost, run `apply` again. It confirms the edit if the upload
+landed, or finishes uploading it.
+
+If `apply` reports a `revision_conflict`, your local files are preserved.
+Check the file first. A conflict on an earlier pending upload can stop `apply`
+before it writes the edit. Run `reconcile`, review what the next `sync` would
+upload or delete, then run `sync` once you agree with those changes.
 
 `apply` refuses a read-only or hard-linked file. It also refuses a result for a
 file the operation was not asked about. The project records the files it
@@ -470,7 +477,9 @@ For many workspaces at once, `LeanWarpCloud.wait_operations(ids, wait_seconds=20
 waits on up to 100 operations in one request and returns as soon as any ends:
 `{"operations": [...], "unread": [...]}`, where `unread` names finished operations
 to read with `operation(id)`. Free storage as you go with
-`delete_operation(id)` once you have read a result.
+`delete_operation(id)` once you have read a result, or pass `retention="short"`
+to `check`, `inspect`, `try_tactics`, `submit` or `run` so history may remove the
+result a minute after it finishes, with no delete.
 
 The client resends reads, `stop`, `cancel`, `delete` and writes with an
 idempotency key after `429`, `502`, `503`, `504` or a lost connection. It waits
@@ -620,16 +629,19 @@ higher. Email contact@isagoge.in to raise them. `status` reports the account's
 history limits.
 
 History is a window, not a lifetime allowance. When a new operation or sync
-would pass a history limit, LeanWarp removes the oldest finished operations and
-sync records that finished more than an hour ago, but only if that makes enough
-room. Otherwise nothing is removed, and the request reports the limit with HTTP
+would pass a history limit, LeanWarp removes finished operations and sync
+records that finished more than an hour ago (a minute for an operation with
+short retention), soonest removable first, but only if that makes enough room.
+Otherwise nothing is removed, and the request reports the limit with HTTP
 `429` and `Retry-After`, the seconds until room frees; the client resends after
 it, within the call's deadline. LeanWarp never removes queued or running work, each workspace's newest
 operation and sync, or your uploaded files.
 
-Retrying a request with the same idempotency key within the hour returns the
-original result. Later, a removed operation reads as `not_found`. For at least 7
-days, resubmitting it returns `operation_expired` without running it again.
+Until history removes an operation, at least an hour after it finished (a minute
+for short retention), retrying its request with the same idempotency key returns
+the original result. Later, a removed operation reads as `not_found`. For at
+least 7 days, resubmitting it returns `operation_expired` without running it
+again.
 Keep results you need with `export`. `status` reports `history_usage`: each
 limit's `used` and `limit`.
 
@@ -637,6 +649,15 @@ To free storage sooner, delete a finished operation's result once you have read
 it (`DELETE /operations/{id}`). Resubmitting that request returns
 `operation_expired`; see the [HTTP
 API](https://github.com/Isagoge-Labs/LeanWarp-SDK/blob/main/docs/http-api.md#releasing-results).
+
+A search loop that submits many `check`, `inspect` or `try_tactics` operations
+can skip the delete: submit them with `retention="short"` (`"retention": "short"`
+over HTTP). Each result is then eligible for removal about 60 seconds after it
+finishes. That is not an erasure time: history removes results only when it
+needs room, so a quiet workspace may keep one longer, and each workspace's newest
+operation is kept. Until the result is removed, a resent request returns the
+original; once it has been removed, `operation_expired`. Other kinds refuse
+short retention.
 
 Hidden directories, `.lake`, `lakefile.lean` and symlinks are never uploaded,
 and symlinked Lean files are rejected. Lake scripts and dependency builds never

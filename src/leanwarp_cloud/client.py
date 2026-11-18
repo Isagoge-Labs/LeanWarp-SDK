@@ -52,6 +52,11 @@ OperationKind = Literal[
     "verify_batch",
 ]
 OPERATION_KINDS: frozenset[str] = frozenset(get_args(OperationKind))
+#: How long a finished operation is kept before history may remove it to admit new
+#: work: about an hour, or about a minute with ``"short"``, which only check,
+#: inspect and try_tactics accept.
+Retention = Literal["standard", "short"]
+RETENTIONS: frozenset[str] = frozenset(get_args(Retention))
 #: The most files one check_files operation checks.
 MAX_BATCH_FILES = 64
 #: The most proofs one verify_batch operation checks.
@@ -303,6 +308,7 @@ class LeanWarpCloud:
         payload: Mapping[str, Any],
         resource_profile: str | None = None,
         timeout_seconds: int | None = None,
+        retention: Retention | None = None,
         idempotency_key: str | None = None,
         deadline: float | None = None,
     ) -> dict[str, Any]:
@@ -317,6 +323,7 @@ class LeanWarpCloud:
             if type(timeout_seconds) is not int or not 1 <= timeout_seconds <= 600:
                 raise UsageError("timeout_seconds must be an integer between 1 and 600")
             body["timeout_seconds"] = timeout_seconds
+        _set_retention(body, retention)
         return self._request(
             "POST",
             f"workspaces/{_segment(workspace_id)}/operations",
@@ -336,6 +343,7 @@ class LeanWarpCloud:
         delete_paths: tuple[str, ...] | list[str] = (),
         resource_profile: str | None = None,
         timeout_seconds: int | None = None,
+        retention: Retention | None = None,
         idempotency_key: str | None = None,
         deadline: float | None = None,
         wait_seconds: float = 0,
@@ -361,6 +369,7 @@ class LeanWarpCloud:
             if type(timeout_seconds) is not int or not 1 <= timeout_seconds <= 600:
                 raise UsageError("timeout_seconds must be an integer between 1 and 600")
             body["timeout_seconds"] = timeout_seconds
+        _set_retention(body, retention)
         path = f"workspaces/{_segment(workspace_id)}/run"
         if wait_seconds > 0:
             path += f"?wait_seconds={wait_seconds:.3f}"
@@ -440,6 +449,7 @@ class LeanWarpCloud:
         *,
         expected_revision: int,
         strict: bool = True,
+        retention: Retention | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         return self.submit(
@@ -447,6 +457,7 @@ class LeanWarpCloud:
             "check",
             expected_revision=expected_revision,
             payload={"file": file, "strict": strict},
+            retention=retention,
             idempotency_key=idempotency_key,
         )
 
@@ -458,6 +469,7 @@ class LeanWarpCloud:
         expected_revision: int,
         line: int,
         column: int,
+        retention: Retention | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         return self.submit(
@@ -465,6 +477,7 @@ class LeanWarpCloud:
             "inspect",
             expected_revision=expected_revision,
             payload={"file": file, "line": line, "column": column},
+            retention=retention,
             idempotency_key=idempotency_key,
         )
 
@@ -478,6 +491,7 @@ class LeanWarpCloud:
         column: int,
         tactics: list[str],
         timeout_ms: int = 30_000,
+        retention: Retention | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         return self.submit(
@@ -491,6 +505,7 @@ class LeanWarpCloud:
                 "tactics": tactics,
                 "timeout_ms": timeout_ms,
             },
+            retention=retention,
             idempotency_key=idempotency_key,
         )
 
@@ -1052,6 +1067,15 @@ def _decoded(response: httpx.Response, idempotency_key: str | None) -> dict[str,
             502, "invalid_response", "expected a JSON object", idempotency_key=idempotency_key
         )
     return result
+
+
+def _set_retention(body: dict[str, Any], retention: Retention | None) -> None:
+    """Send a retention only when asked for one: the service's default is standard."""
+    if retention is None:
+        return
+    if retention not in RETENTIONS:
+        raise UsageError('retention must be "standard" or "short"')
+    body["retention"] = retention
 
 
 def _segment(value: str) -> str:

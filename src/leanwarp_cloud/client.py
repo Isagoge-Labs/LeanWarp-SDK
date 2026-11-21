@@ -48,6 +48,9 @@ OperationKind = Literal[
     "holes",
     "extract_decls",
     "sorry2lemma",
+    "have2lemma",
+    "simplify_proofs",
+    "repair_proofs",
     "check_files",
     "verify_batch",
 ]
@@ -634,6 +637,84 @@ class LeanWarpCloud:
             idempotency_key=idempotency_key,
         )
 
+    def have2lemma(
+        self,
+        workspace_id: str,
+        file: str,
+        *,
+        expected_revision: int,
+        max_extractions: int = 64,
+        name_prefix: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Lift each named `have` into its own lemma; the file is not changed."""
+        payload: dict[str, Any] = {"file": file, "max_extractions": max_extractions}
+        if name_prefix is not None:
+            payload["name_prefix"] = name_prefix
+        return self.submit(
+            workspace_id,
+            "have2lemma",
+            expected_revision=expected_revision,
+            payload=payload,
+            idempotency_key=idempotency_key,
+        )
+
+    def simplify_proofs(
+        self,
+        workspace_id: str,
+        file: str,
+        *,
+        expected_revision: int,
+        tactics: list[str] | None = None,
+        timeout_ms: int = 10_000,
+        max_simplifications: int = 16,
+        min_reduction_bytes: int = 1,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Replace theorem proofs with shorter ones that still check; the file is not changed."""
+        payload: dict[str, Any] = {
+            "file": file,
+            "timeout_ms": timeout_ms,
+            "max_simplifications": max_simplifications,
+            "min_reduction_bytes": min_reduction_bytes,
+        }
+        if tactics is not None:
+            payload["tactics"] = tactics
+        return self.submit(
+            workspace_id,
+            "simplify_proofs",
+            expected_revision=expected_revision,
+            payload=payload,
+            idempotency_key=idempotency_key,
+        )
+
+    def repair_proofs(
+        self,
+        workspace_id: str,
+        file: str,
+        *,
+        expected_revision: int,
+        tactics: list[str] | None = None,
+        timeout_ms: int = 10_000,
+        max_repairs: int = 16,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Try to repair `sorry` holes within the limits. Leaves the local file unchanged."""
+        payload: dict[str, Any] = {
+            "file": file,
+            "timeout_ms": timeout_ms,
+            "max_repairs": max_repairs,
+        }
+        if tactics is not None:
+            payload["tactics"] = tactics
+        return self.submit(
+            workspace_id,
+            "repair_proofs",
+            expected_revision=expected_revision,
+            payload=payload,
+            idempotency_key=idempotency_key,
+        )
+
     def check_files(
         self,
         workspace_id: str,
@@ -814,11 +895,31 @@ class LeanWarpCloud:
             "POST", f"operations/{_segment(operation_id)}/cancel", deadline=deadline, retry=True
         )
 
-    def stop(self, workspace_id: str, *, deadline: float | None = None) -> dict[str, Any]:
-        """Stop the worker. Stopping twice changes nothing, so a failed attempt is resent."""
-        return self._request(
-            "POST", f"workspaces/{_segment(workspace_id)}/stop", deadline=deadline, retry=True
-        )
+    def stop(
+        self,
+        workspace_id: str,
+        *,
+        generation: int | None = None,
+        require_idle: bool = False,
+        deadline: float | None = None,
+    ) -> dict[str, Any]:
+        """End billing for this generation. GET the workspace to follow cleanup.
+
+        Pass the generation from a prior response to retry that close safely
+        across restarts. An unqualified stop acts on the current generation. Set
+        require_idle to check for active operations even when replaying a close.
+        """
+        path = f"workspaces/{_segment(workspace_id)}/stop"
+        query: dict[str, str] = {}
+        if generation is not None:
+            if type(generation) is not int or not 0 <= generation < 2**63:
+                raise UsageError("generation must be a nonnegative 64-bit integer")
+            query["generation"] = str(generation)
+        if require_idle:
+            query["require_idle"] = "true"
+        if query:
+            path += "?" + urlencode(query)
+        return self._request("POST", path, deadline=deadline, retry=generation is not None)
 
     def delete_operation(self, operation_id: str, *, deadline: float | None = None) -> None:
         """Delete a finished operation's stored request and result now, to free the

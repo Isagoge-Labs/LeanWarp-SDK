@@ -16,6 +16,7 @@ from .client import (
     FeedbackKind,
     FeedbackSeverity,
     LeanWarpCloud,
+    Retention,
 )
 from .compact import compact, summary
 from .config import feedback_enabled, load_client
@@ -97,7 +98,7 @@ def create_server(cloud: LeanWarpCloud | Callable[[], LeanWarpCloud], root: str)
             "call wait with that operation_id, never resubmit. decided is false when there was "
             "no verdict (status timeout, infrastructure_failure or not_checked, or a failed "
             "operation): retry it, when retryable, instead of changing the proof; success false "
-            "with decided true (error, or rejected with failure.kind) means the proof is wrong. "
+            "with decided true means the operation did not succeed. For inspect, read goal_status. "
             "Results are compact: errors "
             "first, with omitted counting what was left out; pass detail='full' for all of "
             "it. Never weaken the user's statement. "
@@ -133,9 +134,17 @@ def create_server(cloud: LeanWarpCloud | Callable[[], LeanWarpCloud], root: str)
         return result if detail == "full" else compact(result)
 
     def operate(
-        kind: str, payload: dict[str, Any], *, wait_seconds: float, detail: Detail
+        kind: str,
+        payload: dict[str, Any],
+        *,
+        wait_seconds: float,
+        detail: Detail,
+        retention: Retention | None = None,
     ) -> dict[str, Any]:
-        return shown(session().submit_and_wait(kind, payload, wait_seconds=wait_seconds), detail)
+        operation = session().submit_and_wait(
+            kind, payload, wait_seconds=wait_seconds, retention=retention
+        )
+        return shown(operation, detail)
 
     read = ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=True)
     write = ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True)
@@ -256,6 +265,7 @@ def create_server(cloud: LeanWarpCloud | Callable[[], LeanWarpCloud], root: str)
         draft: bool = False,
         wait_seconds: float = DEFAULT_WAIT_SECONDS,
         detail: Detail = "compact",
+        retention: Retention = "standard",
     ) -> dict[str, Any]:
         """Compile a file and report Lean errors and warnings. Uploads changed files first.
 
@@ -265,10 +275,16 @@ def create_server(cloud: LeanWarpCloud | Callable[[], LeanWarpCloud], root: str)
         strict check or verify_target. status is ok, error or rejected (failure.kind
         says why), or, with no verdict, timeout, infrastructure_failure or
         not_checked: then retry, when failure.retryable, rather than change the
-        proof. May start a worker, which uses credit.
+        proof. retention="short" lets LeanWarp remove the finished result about a
+        minute later, so a search loop need not delete each one. May start a worker,
+        which uses credit.
         """
         return operate(
-            "check", {"file": file, "strict": not draft}, wait_seconds=wait_seconds, detail=detail
+            "check",
+            {"file": file, "strict": not draft},
+            wait_seconds=wait_seconds,
+            detail=detail,
+            retention=retention,
         )
 
     @server.tool(annotations=write)
@@ -279,17 +295,21 @@ def create_server(cloud: LeanWarpCloud | Callable[[], LeanWarpCloud], root: str)
         column: int,
         wait_seconds: float = DEFAULT_WAIT_SECONDS,
         detail: Detail = "compact",
+        retention: Retention = "standard",
     ) -> dict[str, Any]:
-        """Show the goals at a proof hole; line and column start at 1 and count characters.
+        """Show goals at a tactic or proof hole. Lines and character columns start at 1.
 
-        A position that selects no single hole returns the error cursor_outside_proof
-        or ambiguous_cursor_capture. May start a worker, which uses credit.
+        no_goals means a known empty tactic state. omitted counts hidden goals.
+        Use detail="full" for a selection too large for the compact answer.
+        retention="short" lets LeanWarp remove the finished result after about a minute.
+        May start a worker, which uses credit.
         """
         return operate(
             "inspect",
             {"file": file, "line": line, "column": column},
             wait_seconds=wait_seconds,
             detail=detail,
+            retention=retention,
         )
 
     @server.tool(annotations=write)
@@ -301,16 +321,22 @@ def create_server(cloud: LeanWarpCloud | Callable[[], LeanWarpCloud], root: str)
         tactics: list[str],
         wait_seconds: float = DEFAULT_WAIT_SECONDS,
         detail: Detail = "compact",
+        retention: Retention = "standard",
     ) -> dict[str, Any]:
         """Try tactics at a position without editing the file. Read each result's outcome.
 
-        success means the trial ran, not that the theorem is proved. May use credit.
+        The default limit covers the sum of the tactic budgets plus overhead, up to
+        the operation maximum. A shorter explicit limit scales tactic budgets down.
+        Read each outcome to see whether the tactic closed its goal.
+        retention="short" lets LeanWarp remove the finished result after about a minute.
+        May use credit.
         """
         return operate(
             "try_tactics",
             {"file": file, "line": line, "column": column, "tactics": tactics},
             wait_seconds=wait_seconds,
             detail=detail,
+            retention=retention,
         )
 
     @server.tool(annotations=write)
@@ -365,8 +391,8 @@ def create_server(cloud: LeanWarpCloud | Callable[[], LeanWarpCloud], root: str)
         by the independent checker; declaration, this declaration (others still have
         holes), an editing aid and not a verdict: run check on the finished file. A hole in a
         declaration that keeps other holes is not closed
-        (declaration_has_other_holes): run sorry2lemma to move each hole into its own
-        lemma, then suggest on that lemma. The file is not changed until
+        (declaration_has_other_holes). Solve the remaining holes together or manually
+        separate them into lemmas before retrying. The file is not changed until
         apply, which writes only the latest result: call it before any other tool,
         then call holes again, since line numbers change. wait and status start no
         operation, so they are safe in between. If not_closed, rejections gives each
@@ -440,6 +466,86 @@ def create_server(cloud: LeanWarpCloud | Callable[[], LeanWarpCloud], root: str)
 
     @server.tool(annotations=write)
     @_safe_tool
+    def have2lemma(
+        file: str,
+        max_extractions: int = 64,
+        name_prefix: str | None = None,
+        wait_seconds: float = DEFAULT_WAIT_SECONDS,
+        detail: Detail = "compact",
+    ) -> dict[str, Any]:
+        """Move each named `have` in a theorem's proof into its own lemma; call apply to write it.
+
+        The `have` then calls the new lemma, which takes the theorem's parameters.
+        LeanWarp returns the new file only after checking that every statement is
+        unchanged and nothing else was added; status rejected, with reason, means
+        that audit refused it. The file is not changed until apply. May use credit.
+        """
+        payload: dict[str, Any] = {"file": file, "max_extractions": max_extractions}
+        if name_prefix is not None:
+            payload["name_prefix"] = name_prefix
+        return operate("have2lemma", payload, wait_seconds=wait_seconds, detail=detail)
+
+    @server.tool(annotations=write)
+    @_safe_tool
+    def simplify_proofs(
+        file: str,
+        tactics: list[str] | None = None,
+        timeout_ms: int = 10_000,
+        max_simplifications: int = 16,
+        min_reduction_bytes: int = 1,
+        wait_seconds: float = DEFAULT_WAIT_SECONDS,
+        detail: Detail = "compact",
+    ) -> dict[str, Any]:
+        """Replace theorem proofs with shorter tactic proofs; call apply to write the file.
+
+        Each candidate is kept only if the whole file still checks with it and it is
+        at least min_reduction_bytes shorter; timeout_ms bounds each attempt. Each
+        theorem it edits must end complete with Lean's standard axioms only, and no
+        statement may change; status rejected, with reason, means LeanWarp's audit
+        refused the rewritten file. Tactics may not use sorry or admit. The file is
+        not changed until apply. May use credit.
+        """
+        payload: dict[str, Any] = {
+            "file": file,
+            "timeout_ms": timeout_ms,
+            "max_simplifications": max_simplifications,
+            "min_reduction_bytes": min_reduction_bytes,
+        }
+        if tactics is not None:
+            payload["tactics"] = tactics
+        return operate("simplify_proofs", payload, wait_seconds=wait_seconds, detail=detail)
+
+    @server.tool(annotations=write)
+    @_safe_tool
+    def repair_proofs(
+        file: str,
+        tactics: list[str] | None = None,
+        timeout_ms: int = 10_000,
+        max_repairs: int = 16,
+        wait_seconds: float = DEFAULT_WAIT_SECONDS,
+        detail: Detail = "compact",
+    ) -> dict[str, Any]:
+        """Try to repair sorry holes. Call apply only when source_changed is true.
+
+        Every attempt checks the whole patched file; timeout_ms bounds each one, and
+        sorrys that do not fit the operation's time come back skipped. Each theorem
+        it edits must end complete with Lean's standard axioms only: a theorem that
+        keeps another sorry is refused (declaration_has_other_holes). Solve its
+        remaining holes together or manually separate them into lemmas. Tactics
+        may not use sorry or admit. A rejected response gives the audit's reason.
+        The file is not changed until apply. May use credit.
+        """
+        payload: dict[str, Any] = {
+            "file": file,
+            "timeout_ms": timeout_ms,
+            "max_repairs": max_repairs,
+        }
+        if tactics is not None:
+            payload["tactics"] = tactics
+        return operate("repair_proofs", payload, wait_seconds=wait_seconds, detail=detail)
+
+    @server.tool(annotations=write)
+    @_safe_tool
     def check_files(
         files: list[str],
         draft: bool = False,
@@ -497,11 +603,12 @@ def create_server(cloud: LeanWarpCloud | Callable[[], LeanWarpCloud], root: str)
     )
     @_safe_tool
     def apply() -> dict[str, Any]:
-        """Write the latest successful suggest or sorry2lemma result into its file, then upload it.
+        """Write the latest successful suggest or file-rewrite result into its file, then upload it.
 
         Refuses if the file changed since the result was computed. If the upload
-        fails after the write, call apply again to upload it. Run check or
-        verify_target afterwards to confirm the whole proof.
+        response was lost, retry apply. For revision_conflict, inspect the local file,
+        run reconcile, review the changes, then sync. Run check or verify_target
+        afterwards to confirm the proof.
         """
         return session().apply()
 
@@ -546,9 +653,9 @@ def create_server(cloud: LeanWarpCloud | Callable[[], LeanWarpCloud], root: str)
 
     @server.tool(annotations=write)
     @_safe_tool
-    def stop() -> dict[str, Any]:
+    def stop(generation: int | None = None) -> dict[str, Any]:
         """Stop the worker so it stops using credit. Saved files are kept."""
-        return session().stop()
+        return session().stop(generation=generation)
 
     # Never raises: a report that fails must not send the agent into recovery or retries.
     # Every argument accepts any JSON value, so a missing, null or mistyped one reaches

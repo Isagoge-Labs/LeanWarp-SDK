@@ -53,7 +53,9 @@ class CIService(Service):
             return httpx.Response(204)
         if path.endswith("/stop"):
             self.requests.append(request)
-            return httpx.Response(200, json={"workspace_id": "w", "state": "stopped"})
+            return httpx.Response(
+                200, json={"workspace_id": "w", "state": "stopped", "generation": 1}
+            )
         if path.endswith("/cancel"):
             self.requests.append(request)
             self.cancelled.append(path.split("/")[-2])
@@ -382,13 +384,21 @@ def serving_shared(service: CIService, monkeypatch) -> None:
     def handled(request: httpx.Request) -> httpx.Response:
         if request.method == "GET" and request.url.path.endswith("/workspaces/shared"):
             return httpx.Response(
-                200, json={"workspace_id": "shared", "state": "stopped", "bundle_id": "b"}
+                200,
+                json={
+                    "workspace_id": "shared",
+                    "state": "stopped",
+                    "generation": 1,
+                    "bundle_id": "b",
+                },
             )
         if request.method == "GET" and request.url.path.endswith("/workspaces/shared/files"):
             listed = handle(request).json()
             return httpx.Response(200, json={**listed, "workspace_id": "shared"})
         if request.method == "GET" and request.url.path.endswith("/workspaces/w"):
-            return httpx.Response(200, json={"workspace_id": "w", "state": "stopped"})
+            return httpx.Response(
+                200, json={"workspace_id": "w", "state": "stopped", "generation": 1}
+            )
         return handle(request)
 
     monkeypatch.setattr(service, "handle", handled)
@@ -441,7 +451,8 @@ def test_a_resend_that_fails_still_stops_the_worker_and_keeps_the_request(
     assert json.loads((root / ".leanwarp/session.json").read_text())["pending"] is not None
 
 
-def test_a_refused_deletion_stops_the_worker_again(project, capsys, monkeypatch):
+@pytest.mark.parametrize("final_state", ["stopped", "stopping"])
+def test_a_refused_deletion_stops_the_worker_again(project, capsys, monkeypatch, final_state):
     root, service = project
     run(root, capsys, "connect", "--ephemeral")
     handle = service.handle
@@ -449,11 +460,19 @@ def test_a_refused_deletion_stops_the_worker_again(project, capsys, monkeypatch)
     def busy(request: httpx.Request) -> httpx.Response:
         if request.method == "DELETE":
             return httpx.Response(409, json={"error": {"code": "workspace_busy", "message": "no"}})
+        if request.url.path.endswith("/stop") and any(
+            r.url.path.endswith("/stop") for r in service.requests
+        ):
+            service.requests.append(request)
+            return httpx.Response(
+                202 if final_state == "stopping" else 200,
+                json={"workspace_id": "w", "state": final_state, "generation": 1},
+            )
         return handle(request)
 
     monkeypatch.setattr(service, "handle", busy)
     code, result = run(root, capsys, "stop", "--delete")
-    assert code == 2 and result["status"] == "stopped"
+    assert code == 2 and result["status"] == final_state
     assert [error["step"] for error in result["errors"]] == ["delete"]
     stops = [r for r in service.requests if r.url.path.endswith("/stop")]
     assert len(stops) == 2

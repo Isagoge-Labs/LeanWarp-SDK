@@ -40,7 +40,8 @@ def test_setup_installs_skills_and_adds_mcp_entries_without_replacing_any(tmp_pa
         skill = tmp_path / folder / "skills" / "leanwarp"
         assert results[agent]["skill"] == str(skill)
         assert (skill / "SKILL.md").read_text().startswith("---\nname: leanwarp")
-        assert (skill / "references" / "usage.md").exists()
+        usage = (skill / "references" / "usage.md").read_text()
+        assert "one race" in usage and "same batches" not in usage
     assert results["claude-code"]["mcp"] == "claude_cli_not_found"
     assert results["codex"]["mcp"] == "configured"
     codex = (tmp_path / ".codex" / "config.toml").read_text()

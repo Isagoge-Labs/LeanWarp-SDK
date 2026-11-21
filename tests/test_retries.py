@@ -74,6 +74,8 @@ GONE = httpx.Response(204)
 
 
 def cleanup(cloud: LeanWarpCloud, action: str):
+    if action == "stop":
+        return cloud.stop("w", generation=3)
     return getattr(cloud, action)(OPERATION_ID if action == "cancel" else "w")
 
 
@@ -97,7 +99,8 @@ def test_naturally_idempotent_calls_are_retried(monkeypatch, action, failure):
     with cloud:
         cleanup(cloud, action)
     assert len(requests) == 3
-    # They need no idempotency key: repeating them is harmless by nature.
+    if action == "stop":
+        assert all(request.url.params["generation"] == "3" for request in requests)
     assert all("Idempotency-Key" not in request.headers for request in requests)
 
 
@@ -105,7 +108,7 @@ def test_a_definite_refusal_is_not_retried(monkeypatch):
     Clock(monkeypatch)
     cloud, requests = scripted([refused(409, code="workspace_busy")])
     with cloud, pytest.raises(LeanWarpCloudError) as raised:
-        cloud.stop("w")
+        cloud.stop("w", generation=3)
     assert len(requests) == 1 and raised.value.retryable is False
 
 
@@ -131,7 +134,7 @@ def test_retries_stop_at_the_window_when_there_is_no_deadline(monkeypatch, inter
     clock = Clock(monkeypatch)
     cloud, requests = scripted([refused(503)], interface=interface)
     with cloud, pytest.raises(LeanWarpCloudError):
-        cloud.stop("w")
+        cloud.stop("w", generation=3)
     assert clock.now - 1000 < window
     # A patient loop, not two quick tries: backoff is capped, so it used the window.
     assert clock.now - 1000 > window / 2
@@ -142,7 +145,7 @@ def test_retries_stop_at_the_callers_deadline(monkeypatch):
     clock = Clock(monkeypatch)
     cloud, _ = scripted([refused(503)])
     with cloud, pytest.raises(LeanWarpCloudError):
-        cloud.stop("w", deadline=clock.now + 5)
+        cloud.stop("w", generation=3, deadline=clock.now + 5)
     assert clock.now < 1005
 
 
@@ -150,7 +153,7 @@ def test_retries_can_be_limited_or_disabled(monkeypatch):
     Clock(monkeypatch)
     cloud, requests = scripted([refused(503)], retries=0)
     with cloud, pytest.raises(LeanWarpCloudError):
-        cloud.stop("w")
+        cloud.stop("w", generation=3)
     assert len(requests) == 1
 
 
@@ -158,7 +161,7 @@ def test_retry_after_is_honoured_beyond_five_seconds_within_the_deadline(monkeyp
     clock = Clock(monkeypatch)
     cloud, requests = scripted([refused(503, retry_after="30"), OK_STOP])
     with cloud:
-        cloud.stop("w", deadline=clock.now + 60)
+        cloud.stop("w", generation=3, deadline=clock.now + 60)
     assert len(requests) == 2 and 30 <= clock.sleeps[0] <= 31
 
 
@@ -171,7 +174,7 @@ def test_retry_after_as_an_http_date_is_honoured(monkeypatch):
     when = format_datetime(in_thirty, usegmt=True)
     cloud, requests = scripted([refused(503, retry_after=when), OK_STOP])
     with cloud:
-        cloud.stop("w", deadline=clock.now + 60)
+        cloud.stop("w", generation=3, deadline=clock.now + 60)
     # HTTP dates have whole seconds, so the wait is within a second of thirty.
     assert len(requests) == 2 and 28.5 <= clock.sleeps[0] <= 31.5
 
@@ -184,7 +187,7 @@ def test_an_unparsable_retry_after_is_treated_as_absent(monkeypatch, value):
     Clock(monkeypatch)
     cloud, requests = scripted([refused(503, retry_after=value), OK_STOP])
     with cloud:
-        cloud.stop("w")
+        cloud.stop("w", generation=3)
     assert len(requests) == 2
 
 
@@ -192,7 +195,7 @@ def test_retry_after_past_the_deadline_fails_at_once_and_says_when(monkeypatch):
     clock = Clock(monkeypatch)
     cloud, requests = scripted([refused(429, retry_after="120")])
     with cloud, pytest.raises(LeanWarpCloudError) as raised:
-        cloud.stop("w", deadline=clock.now + 10)
+        cloud.stop("w", generation=3, deadline=clock.now + 10)
     assert len(requests) == 1 and clock.sleeps == []
     assert raised.value.retry_after == 120 and raised.value.retryable is True
 
@@ -203,7 +206,7 @@ def test_backoff_is_jittered_so_processes_do_not_retry_in_step(monkeypatch):
         clock = Clock(monkeypatch)
         cloud, _requests = scripted([refused(503), refused(503), refused(503), OK_STOP])
         with cloud:
-            cloud.stop("w")
+            cloud.stop("w", generation=3)
         runs.append(clock.sleeps)
     assert runs[0] != runs[1]
     for attempt, delay in enumerate(runs[0]):
@@ -506,3 +509,10 @@ def test_service_errors_keep_the_status_code_name_earlier_releases_used():
     error = LeanWarpCloudError(503, "persistence_request_unavailable", "busy")
     assert error.status_code == error.status == 503
     assert pickle.loads(pickle.dumps(error)).status_code == 503  # noqa: S301 - this test's own object
+
+
+def test_an_unqualified_stop_is_sent_once_when_the_response_is_lost():
+    cloud, requests = scripted([httpx.ReadTimeout("lost"), OK_STOP])
+    with cloud, pytest.raises(LeanWarpTransportError):
+        cloud.stop("w")
+    assert len(requests) == 1

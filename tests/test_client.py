@@ -795,7 +795,7 @@ def test_transient_persistence_retries_remain_bounded_and_safe(status, method, a
         if method == "GET":
             api.workspace("w")
         else:
-            api.stop("w")  # Stopping twice changes nothing; it needs no idempotency key.
+            api.stop("w", generation=2)
     assert raised.value.status == status
     assert len(requests) == attempts
     assert all("Idempotency-Key" not in request.headers for request in requests)

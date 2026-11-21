@@ -26,7 +26,7 @@ Authorization: Bearer lw_live_…
    `completed`, `failed` or `cancelled`. The server holds each read until the
    operation ends or `wait_seconds` (0 to 20) pass, so you don't need to poll
    quickly.
-6. `POST /workspaces/{workspace_id}/stop` stops the worker.
+6. `POST /workspaces/{workspace_id}/stop` ends billing for the current workspace generation. A running worker returns `202` with `state: stopping`, its `generation`, and `charge_cutoff_at`. Poll the workspace until it is `stopped`. A workspace with nothing to clean up returns `200`.
 
 Steps 3 to 5 can be one request: `POST /workspaces/{workspace_id}/run` takes the
 files to upload or delete (`files`, `delete_paths`) with the operation (`kind`,
@@ -73,7 +73,7 @@ axioms. Send `"strict": false` for a faster draft check while editing.
 | `GET` | `/operations?ids=A,B,…` | read | Up to 100 operations at once. `&wait_seconds=N` returns as soon as any of them ends, waiting up to 20 seconds. See [Waiting on many operations](#waiting-on-many-operations). |
 | `POST` | `/operations/{operation_id}/cancel` | execute | Ask to cancel, then poll until it ends. |
 | `DELETE` | `/operations/{operation_id}` | write or execute | Delete a finished operation's stored request and result. See [Releasing results](#releasing-results). |
-| `POST` | `/workspaces/{workspace_id}/stop` | write or execute | Stop the worker. Files are kept. |
+| `POST` | `/workspaces/{workspace_id}/stop` | write or execute | End billing and request cleanup. An optional `generation` query parameter scopes a retry to the generation from the first answer. A retry returns the saved close even if new work has queued. Disconnect sends `require_idle=true` to check for active work on that generation. Files are kept. |
 | `DELETE` | `/workspaces/{workspace_id}` | write | Delete a workspace. |
 | `POST` | `/feedback` | any | Report a problem with LeanWarp itself. See [Feedback](#feedback). |
 
@@ -104,13 +104,16 @@ start at 1, and columns count characters (Unicode code points).
 | `kind` | `payload` |
 | --- | --- |
 | `check` | `file`, `strict` (default `true`; `false` is a draft check, in which `sorry` is only a warning). |
-| `inspect` | `file`, `line`, `column`. |
+| `inspect` | `file`, `line`, `column`. Select a proof hole or a tactic in a proof. |
 | `try_tactics` | `file`, `line`, `column`, `tactics` (1 to 32), `timeout_ms` per tactic (default 30000). Near the operation's limit, tactics tried together share the time left, and those with no time left are listed in `skipped`. |
 | `verify_target` | `file`, `candidate_declaration`, `target_statement`, `target_context` (it may import only the environment's packages, never the workspace's modules), `execution_mode` (`reusable` or `fresh`), `timeout` seconds. |
 | `holes` | `file`, `goals` (default `true`: bounded goals for the first 16 unfinished or unknown placeholders). |
 | `suggest` | `file`, `line`, `column`. Optional `tactics` (1 to 32) to use instead of LeanWarp's portfolio, and `timeout_ms` per tactic (learned budgets by default). Near the operation's limit, tactics tried together share the time left. |
 | `extract_decls` | `file`. |
 | `sorry2lemma` | `file`, `max_extractions` (1 to 256, default 64), optional `name_prefix`, `strict_final_check` (default `false`). |
+| `have2lemma` | `file`, `max_extractions` (1 to 256, default 64), optional `name_prefix`. |
+| `simplify_proofs` | `file`. Optional `tactics` (1 to 32, without `sorry` or `admit`) instead of LeanWarp's default list, `timeout_ms` per attempt (1 to 60000, default 10000), `max_simplifications` (1 to 256, default 16), `min_reduction_bytes` (default 1). |
+| `repair_proofs` | `file`. Optional `tactics` (1 to 32, without `sorry` or `admit`) instead of LeanWarp's default list, `timeout_ms` per attempt (1 to 60000, default 10000), `max_repairs` (1 to 256, default 16). The operation attempts repairs within its time budget and repair limit; remaining holes can be `skipped`. Each theorem it edits must end complete. |
 | `check_files` | `files` (1 to 64 distinct paths), `strict` (default `true`), optional `timeout` seconds per file (default 60), which starts once the file's imports have loaded, except in a file using `native_decide`. It must fit the operation's budget for its entries (see below). |
 | `verify_batch` | `codes`: 1 to 64 objects `{"custom_id", "proof"}`. Each `custom_id` is unique and 1 to 128 characters, without control characters. Proofs must not be blank. The payload is at most 256 KiB of UTF-8. Also `strict` (default `true`) and optional `timeout` seconds per proof (default 60), which starts once the proof's imports have loaded, except in a proof using `native_decide`. It must fit the operation's budget for its entries (see below). The proofs run in the workspace's environment. They may import its packages, such as Mathlib, but not the workspace's own modules. Such a proof is refused without running: `status` `rejected`, `failure.kind` `policy`, `error.code` `unsupported_import`. A code may add `target`: `{"context", "statement", "declaration"}` (see below). |
 
@@ -119,7 +122,26 @@ a lakefile's `leanOptions` would be, such as `{"maxSynthPendingDepth": 3}`. Opti
 that could weaken checking are refused.
 
 An operation's `timeout_seconds` limits execution to 1–600 seconds. The default
-depends on the operation. For example, `check` and `inspect` default to 120 seconds.
+depends on the operation. For example, `check` and `inspect` default to 120 seconds,
+and `suggest`, `simplify_proofs`, `repair_proofs`, `check_files` and
+`verify_batch` to 600.
+For `try_tactics` with N submitted tactics the default in seconds is
+`min(600, max(120, 30 + ceil((N × timeout_ms + 100) / 1000)))`.
+A per-tactic timeout above 60,000 ms is capped at 60,000 ms before calculating
+the default limit or running a race. Each trial reports its `effective_timeout_ms`.
+An explicit limit shorter than the sum scales the per-tactic budgets down.
+Whitespace-equivalent tactics share a trial and each input position receives its
+outcome. When the remaining time cannot fund a race, every input appears in
+`skipped` with reason `operation_budget_exhausted`. A zero-duration engine
+timeout appears in `results`.
+
+Inspection returns `selected_hole` or `selected_tactic` and one complete list
+in `goal_contexts`. With `goal_status: no_goals` Lean observed an empty tactic
+state. With `omitted`, `context_omitted.goal_contexts` counts the hidden goals.
+Both have public `status: unavailable`. A usable observation has
+`status: metadata_only`, `observation_only: true` and `retained_proof_state: false`.
+An unknown draft hole may recover goals by capture, with `observation_only: false`.
+
 Every stage shares that one limit: preparing the file's local imports,
 capturing its proof state, checking it and running tactic trials. A check or
 verification whose Lean run reaches it returns a `timeout` non-verdict, retryable
@@ -221,8 +243,12 @@ key cannot see, or whose result was already deleted, is left out.
 
 A completed `suggest` with `status` `closed` returns `patch`. To apply it,
 replace the UTF-8 bytes from `start_utf8_offset` to `end_utf8_offset` with
-`replacement`. A `sorry2lemma` with `source_changed` returns the whole
-`transformed_source`. To apply either one:
+`replacement`. A `sorry2lemma`, `have2lemma`, `simplify_proofs` or
+`repair_proofs` with `source_changed` returns the whole `transformed_source`.
+The last three return it only once LeanWarp's audit has accepted the rewritten
+file. If the audit rejects it, the response gives the reason and marks the
+proposed edits as rejected. It returns zero accepted edits and no replacements.
+To apply an accepted edit:
 
 1. Check that your copy of the file hashes to `source_sha256`. If it doesn't,
    don't apply the result.
@@ -321,8 +347,10 @@ different `retention` is an `idempotency_conflict`.
 Creating a workspace replays this way until 7 days after the workspace is
 deleted; after that, the same key creates a new workspace.
 
-Stopping a worker, cancelling an operation and deleting a workspace or a result
-need no key: repeating them changes nothing. A repeated workspace delete answers
+Stop, cancel and delete requests need no idempotency key. To retry a stop,
+specify the original workspace generation. A stop without a generation acts on
+the current worker, which may have changed since the first request.
+A repeated workspace delete answers
 `not_found`, so after a lost response treat that as deleted. A repeated result
 delete answers `204`.
 
@@ -428,12 +456,13 @@ is `fixed_target_kernel_check_v2`.
 produced it. The operation's `build` field names the same build as soon as the
 operation is dispatched to a worker, while it runs, and is `null` until then. An
 operation that was interrupted and rerun names the worker that reran it. A workspace's `bundle_id`
-is the build its next worker starts on; a running worker keeps its own build
-until it stops. The operation's own fields are under `result.result`, and the
+names its current build. After a build update, the next operation starts a new worker. The operation's own fields are under `result.result`, and the
 [reference](../src/leanwarp_cloud/skills/leanwarp/references/usage.md#results)
 lists them. Completed operations also have `execution`, which says which worker
 ran them and what was reused, and `timing`, with `queued_ms`, `worker_ms`,
-`upload_ms` and `run_ms`. When a worker was started for the operation,
+`upload_ms` and `run_ms`. On terminal operations, `timing.total_ms` measures
+elapsed service time from enqueue until completion, failure, or cancellation,
+including time spent in earlier attempts after recovery. When a worker was started for the operation,
 `worker_ms` has parts, and may also include other work: `start_wait_ms`
 (waiting for capacity to start one, after the wait in `queued_ms`), `create_ms`
 (creating it) and `ready_ms` (waiting for it to answer). The worker also reports
@@ -442,7 +471,7 @@ metering), `project_ms` (preparing the project) and `engine_start_ms` (starting
 the Lean engine). It times these itself, so they can overlap `create_ms` and
 need not add up to `ready_ms`. Parts of `run_ms` appear when Lean timed them:
 `elaboration_ms` (checks: importing and checking the file), with `imports_ms`
-(loading the imports, such as Mathlib) inside it for strict checks,
+(loading the imports, such as Mathlib) inside it for draft and strict checks when measured (zero is a measurement),
 `proof_state_ms` and `tactics_ms` (tactic trials: capturing the proof state,
 then running the tactics). After dispatch recovery, `queued_ms` is absent rather than an estimate
 of earlier attempts. Clients should tolerate absent timing.

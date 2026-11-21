@@ -46,6 +46,23 @@ _ANSWERS: dict[str, frozenset[str]] = {
     "sorry2lemma": frozenset(
         {"extracted", "partial", "unchanged", "no_targets", "failed", "error"}
     ),
+    # A proof rewrite is `rejected` when LeanWarp's audit refused the rewritten file.
+    "have2lemma": frozenset(
+        {"extracted", "partial", "unchanged", "no_targets", "failed", "rejected", "error"}
+    ),
+    "simplify_proofs": frozenset(
+        {"simplified", "partial", "unchanged", "no_targets", "failed", "rejected", "error"}
+    ),
+    "repair_proofs": frozenset(
+        {"repaired", "partial", "no_targets", "failed", "rejected", "error"}
+    ),
+}
+# Each file rewrite's statuses that answered without a failure.
+REWRITE_SUCCESSES: Mapping[str, frozenset[str]] = {
+    "sorry2lemma": frozenset({"extracted", "partial", "unchanged", "no_targets"}),
+    "have2lemma": frozenset({"extracted", "partial", "unchanged", "no_targets"}),
+    "simplify_proofs": frozenset({"simplified", "partial", "unchanged", "no_targets"}),
+    "repair_proofs": frozenset({"repaired", "partial", "no_targets"}),
 }
 # Error codes of a source tool's dependency preparation that stopped without
 # Lean's answer: no answer either.
@@ -67,7 +84,7 @@ class Judgement:
 
     @property
     def exit_code(self) -> int:
-        """0 success, 1 a decided failure (the proof is wrong), 3 running, 4 no verdict."""
+        """0 success, 1 a decided failure, 3 running, 4 no verdict."""
         if self.success is None:
             return 3
         if self.success:
@@ -102,7 +119,10 @@ def judge_result(kind: object, result: object) -> Judgement:
     if kind in _BATCHES:
         return _judge_entries(result)
     if kind == "try_tactics":
-        if isinstance(result.get("results"), list):
+        trials = result.get("results")
+        if isinstance(trials, list):
+            if not trials and result.get("skipped"):
+                return UNDECIDED
             # A completed trial batch can contain unsuccessful candidate tactics.
             # This says nothing about whether the theorem has been proved.
             return Judgement(success=True, decided=True)
@@ -160,9 +180,11 @@ def _well_formed(kind: str, status: str, result: dict[str, Any]) -> bool:
                 result.get("patch"), dict
             )
         return type(result.get("tried")) is int and isinstance(result.get("rejections"), list)
-    if kind == "sorry2lemma":
-        return isinstance(result.get("targets"), list) and (
-            type(result.get("source_changed")) is bool
+    if kind in REWRITE_SUCCESSES:
+        return (
+            isinstance(result.get("targets"), list)
+            and type(result.get("source_changed")) is bool
+            and (status != "rejected" or isinstance(result.get("reason"), str))
         )
     # A check or a fixed-target verification.
     if status == "ok" and kind == "verify_target":
@@ -220,9 +242,9 @@ def _succeeded(kind: str, result: dict[str, Any]) -> bool:
         # A listing of a file that does not compile yet is still a listing;
         # its status and diagnostics say whether the file compiles.
         return isinstance(result.get(_LISTINGS[kind]), list)
-    if kind == "sorry2lemma":
-        # Obligations are extracted, not proved; a failed extraction is not success.
-        return status in {"extracted", "partial", "unchanged", "no_targets"}
+    if kind in REWRITE_SUCCESSES:
+        # Obligations are extracted, not proved; a failed or refused rewrite is not success.
+        return status in REWRITE_SUCCESSES[kind]
     return status == "ok"
 
 

@@ -1116,8 +1116,13 @@ class ProjectSession:
                 raise SessionError("run `leanwarp stop` before disconnecting this project")
             # Runtime state alone does not exclude queued or temporary work.
             # The server's guarded stop also checks work submitted elsewhere.
-            stopped = self.cloud.stop(workspace_id)
-            if stopped.get("workspace_id") != workspace_id or stopped.get("state") != "stopped":
+            generation = workspace["generation"]
+            stopped = self.cloud.stop(workspace_id, generation=generation, require_idle=True)
+            if (
+                stopped.get("workspace_id") != workspace_id
+                or stopped.get("state") != "stopped"
+                or stopped.get("generation") != generation
+            ):
                 raise SessionError(
                     "LeanWarp did not confirm the stop; run `leanwarp status` and try again"
                 )
@@ -1163,7 +1168,7 @@ class ProjectSession:
         self.ephemeral.unlink(missing_ok=True)
 
     def apply(self) -> dict[str, Any]:
-        """Write the latest suggest or sorry2lemma result into its file, then upload it.
+        """Write the latest suggest or file-rewrite result into its file, then upload it.
 
         The edit applies only to the bytes the operation read: the operation must
         have completed at the revision this project last uploaded, and the file must
@@ -1194,7 +1199,10 @@ class ProjectSession:
                 raise SessionError(_OPERATION_EXPIRED)
             kind = operation.get("kind")
             if kind not in EDITING_KINDS:
-                raise SessionError("only a suggest or sorry2lemma result can be applied")
+                raise SessionError(
+                    "only a suggest, sorry2lemma, have2lemma, simplify_proofs or "
+                    "repair_proofs result can be applied"
+                )
             if operation.get("state") != "completed":
                 raise SessionError("the latest operation has not completed; run `leanwarp wait`")
             result = OperationOutcome(operation).result
@@ -1299,7 +1307,7 @@ class ProjectSession:
                 "deleted": remote_only,
             }
 
-    def stop(self, *, delete: bool = False) -> dict[str, Any]:
+    def stop(self, *, delete: bool = False, generation: int | None = None) -> dict[str, Any]:
         """Stop the worker. An unresolved request never blocks this.
 
         With ``delete``, also delete a workspace made by ``connect(ephemeral=True)``
@@ -1311,11 +1319,13 @@ class ProjectSession:
         never run anything, so there is nothing to stop.
         """
         if delete:
+            if generation is not None:
+                raise SessionError("a generation-scoped stop cannot delete the workspace")
             return self._tear_down()
         with self._locked() as state:
             if not state.get("workspace_id") and state.get("pending") is not None:
                 return {"status": "no_worker", "recovery_required": True}
-            result = self.cloud.stop(self._workspace(state))
+            result = self.cloud.stop(self._workspace(state), generation=generation)
             if state.get("pending") is not None:
                 result = {**result, "recovery_required": True}
             return result
@@ -1350,9 +1360,11 @@ class ProjectSession:
                 )
             errors: list[dict[str, Any]] = []
 
-            def attempt(step: str, action: Callable[[], object]) -> bool:
+            failed = object()
+
+            def attempt(step: str, action: Callable[[], object]) -> object:
                 try:
-                    action()
+                    return action()
                 except LeanWarpError as error:
                     errors.append(
                         {
@@ -1362,34 +1374,41 @@ class ProjectSession:
                             "retryable": error.retryable,
                         }
                     )
-                    return False
-                return True
+                    return failed
 
             if creating:
                 # An unconfirmed creation has never run anything; learn its identity.
-                if not attempt("resend", lambda: self._settle(state)):
-                    return _teardown_report(None, deleted=False, stopped=True, errors=errors)
+                if attempt("resend", lambda: self._settle(state)) is failed:
+                    return _teardown_report(None, status="stopped", errors=errors)
                 if not self._ephemeral_matches(state):
                     raise SessionError("the ephemeral workspace's creation did not confirm it")
             workspace_id = self._workspace(state)
-            stopped = attempt("stop", lambda: self.cloud.stop(workspace_id))
-            if state.get("pending") is not None and not attempt(
-                "resend", lambda: self._settle(state)
+
+            def fallback_stop() -> dict[str, Any]:
+                receipt = attempt("stop", lambda: self.cloud.stop(workspace_id))
+                status = receipt.get("state") if isinstance(receipt, dict) else None
+                return _teardown_report(
+                    workspace_id,
+                    status=status if status in ("stopping", "stopped") else "failed",
+                    errors=errors,
+                )
+
+            attempt("stop", lambda: self.cloud.stop(workspace_id))
+            if (
+                state.get("pending") is not None
+                and attempt("resend", lambda: self._settle(state)) is failed
             ):
                 # The service may have accepted the resend and lost only its response,
                 # starting a worker after the first stop; what is reported is the last.
-                stopped = attempt("stop", lambda: self.cloud.stop(workspace_id))
-                return _teardown_report(workspace_id, deleted=False, stopped=stopped, errors=errors)
+                return fallback_stop()
             latest = state.get("operation_id")
             if isinstance(latest, str):
                 attempt("cancel", lambda: self._cancel_running(state, latest))
-            deleted = attempt("delete", lambda: self._delete_workspace(workspace_id))
-            if deleted:
-                self._forget(state)
-            else:
+            if attempt("delete", lambda: self._delete_workspace(workspace_id)) is failed:
                 # A resend may have started a worker that the refused deletion left up.
-                stopped = attempt("stop", lambda: self.cloud.stop(workspace_id))
-            return _teardown_report(workspace_id, deleted=deleted, stopped=stopped, errors=errors)
+                return fallback_stop()
+            self._forget(state)
+            return _teardown_report(workspace_id, status="deleted", errors=errors)
 
     def _cancel_running(self, state: Mapping[str, Any], operation_id: str) -> None:
         operation = self._previous_operation(state)
@@ -1626,11 +1645,12 @@ _COUNTS = tuple(BATCH_COUNTERS)
 
 
 def _teardown_report(
-    workspace_id: str | None, *, deleted: bool, stopped: bool, errors: list[dict[str, Any]]
+    workspace_id: str | None, *, status: str, errors: list[dict[str, Any]]
 ) -> dict[str, Any]:
     """What tearing down did; ``errors`` lists each step that failed, in order."""
+    deleted = status == "deleted"
     return {
-        "status": "deleted" if deleted else "stopped" if stopped else "failed",
+        "status": status,
         "workspace_id": workspace_id,
         "deleted": deleted,
         "disconnected": deleted,

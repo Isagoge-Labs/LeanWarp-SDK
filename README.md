@@ -16,26 +16,42 @@ command, an MCP server and a Python library.
 | Operation | What you get | CLI |
 | --- | --- | --- |
 | Check | Lean's errors and warnings for a file; `--draft` reuses Lean's work on the unchanged part while you edit. | `leanwarp check` |
-| Inspect | The goals and local context at a position in a proof. | `leanwarp inspect` |
+| Inspect | Lean’s goals and hypotheses at a tactic or proof hole. | `leanwarp inspect` |
 | Try tactics | Several tactics from the same captured goal: which close it, which leave goals, which fail. The file is not edited. | `leanwarp try-tactics` |
 | Verify | Whether a declaration proves exactly the statement you give, checked by Lean's kernel. | `leanwarp verify` |
 | Holes | Every `sorry` and `?_` in a file, with its position, and the goals of the first 16. | `leanwarp holes` |
 | Suggest | A tactic that closes a hole, accepted only if nothing else changes and the proof gains no unproved lemma or extra axiom. `apply` writes it into the file. | `leanwarp suggest`, `leanwarp apply` |
 | Sorry to lemma | The proof of each theorem that still has a `sorry` moved into a new named lemma the theorem then uses; the lemma keeps its `sorry`. `apply` writes it. | `leanwarp sorry2lemma` |
+| Have to lemma | Each named `have` in a theorem's proof moved into its own lemma, which the `have` then uses. `apply` writes it. | `leanwarp have2lemma` |
+| Simplify proofs | Theorem proofs replaced by shorter tactic proofs that still check. `apply` writes it. | `leanwarp simplify-proofs` |
+| Repair proofs | Try tactics on `sorry` holes within the repair limit and time budget. If `source_changed` is true, run `apply`, then `check` to see what remains. | `leanwarp repair-proofs` |
 | Declarations | The declarations a file adds, with their types and dependencies. | `leanwarp declarations` |
 | Check files | Up to 64 files checked in one operation. | `leanwarp check-files` |
 | Verify batch | Up to 64 inline proofs checked in one operation, without uploading them as files; each result keeps its `custom_id`. | `leanwarp verify-batch` |
 
+For a hole-free proof in `Main.lean`, inspect the start of `exact` on line 2.
+
+```lean
+example (h : True) : True := by
+  exact h
+```
+
+`leanwarp inspect Main.lean --line 2 --column 3` shows the goal `True` and
+the hypothesis `h : True`. A `goal_status` of `no_goals` means the selected
+tactic state has no remaining goals. With `omitted`, the goals did not fit
+and `context_omitted.goal_contexts` gives their count.
+
+A per-tactic timeout above 60,000 ms is capped at 60,000 ms.
+Tactic trials default to 30 seconds plus the sum of those tactic
+budgets and 100 ms, rounded up and bounded to 120–600 seconds. An explicit
+operation limit shorter than the sum scales down the per-tactic budgets.
+
 The [reference](https://isagoge.in/leanwarp/docs/reference#commands)
 lists every command and option; `leanwarp skill --reference` prints it.
 
-### Coming soon
-
-These are planned and not available yet:
-
-- **Proof simplification**: replace a proof with a shorter one that still checks.
-- **`have` extraction**: lift named `have` blocks into top-level lemmas.
-- **Batch repair**: fill several holes in one operation.
+LeanWarp returns a rewritten file only after checking it: no errors, every
+statement unchanged, nothing added but the reported lemmas, and every theorem a
+repair or simplification edits complete, with no axiom beyond Lean's own.
 
 ## Install in two steps
 

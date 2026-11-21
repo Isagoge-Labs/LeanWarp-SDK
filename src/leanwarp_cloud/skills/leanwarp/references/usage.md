@@ -19,15 +19,18 @@ A **workspace** holds the project's uploaded files and results on LeanWarp. A
 | `files` | List the Lean files that would upload, their sizes and any problems. No key needed. |
 | `connect [--environment NAME] [--max-spend USD] [--ephemeral]` | Create the project's workspace. `--max-spend` sets a spending cap. `--ephemeral` makes it this run's alone, for `stop --delete` to delete. Starts no worker. |
 | `connect --workspace ID` | Connect the project to an existing workspace instead, such as one from another machine. Reports what the next sync uploads or deletes, and the files only the workspace has (`remote_only`), which stay. Starts no worker. |
-| `check FILE [--draft]` | Compile a file and report Lean's errors and warnings. |
+| `check FILE [--draft] [--retention short]` | Compile a file and report Lean's errors and warnings. |
 | `check --all [--draft]` | Check every file that uploads, in batches of up to 64, as one result. Waits until the last batch finishes. |
-| `inspect FILE --line N --column N` | Show the goals and local context at a proof hole. A position that selects no single hole returns the error `cursor_outside_proof` or `ambiguous_cursor_capture`. |
-| `try-tactics FILE --line N --column N --tactic T [--tactic T …]` | Try tactics without editing the file. |
+| `inspect FILE --line N --column N [--retention short]` | Show the goals and hypotheses at a tactic or proof hole. An outside or ambiguous position returns `cursor_outside_proof` or `ambiguous_cursor_capture`. |
+| `try-tactics FILE --line N --column N --tactic T [--tactic T …] [--retention short]` | Try tactics without editing the file. |
 | `verify FILE --declaration NAME --target STATEMENT [--context-file PATH]` | Check that a declaration proves exactly the given statement. |
 | `holes FILE [--no-goals]` | List every `sorry` and `?_` with its position, and the goals of the first 16. |
 | `suggest FILE --line N --column N [--tactic T …] [--tactic-timeout MS]` | Find a tactic that closes the hole at a position. Never edits the file. |
-| `apply` | Write the latest `suggest` or `sorry2lemma` result into its file and upload it. |
+| `apply` | Write the latest `suggest`, `sorry2lemma`, `have2lemma`, `simplify-proofs` or `repair-proofs` result into its file and upload it. |
 | `sorry2lemma FILE [--max N] [--prefix NAME] [--strict-final-check]` | For each theorem that still has a `sorry`, move its proof into a named lemma, and make the theorem use that lemma. Never edits the file. |
+| `have2lemma FILE [--max N] [--prefix NAME]` | Move each named `have` in a theorem's proof into its own lemma, which the `have` then uses. Never edits the file. |
+| `simplify-proofs FILE [--tactic T …] [--tactic-timeout MS] [--max N] [--min-saving BYTES]` | Replace theorem proofs with shorter tactic proofs that still check. Never edits the file. |
+| `repair-proofs FILE [--tactic T …] [--tactic-timeout MS] [--max N]` | Try to repair `sorry` holes within the time budget and repair limit. Never edits the file. |
 | `declarations FILE` | List the declarations a file adds, with types and dependencies. |
 | `check-files FILE [FILE …] [--draft] [--file-timeout SECONDS]` | Check up to 64 files in one operation. Strict unless `--draft`. |
 | `verify-batch FILE.jsonl [--draft] [--proof-timeout SECONDS]` | Check up to 64 inline proofs in one operation. Strict unless `--draft`. Each line of the file is `{"custom_id": "...", "proof": "..."}`, optionally with `"target": {"context": "...", "statement": "...", "declaration": "..."}` to bind the proof to a statement. Pass `-` to read standard input. The proofs are not uploaded as files. |
@@ -36,7 +39,7 @@ A **workspace** holds the project's uploaded files and results on LeanWarp. A
 | `workspaces` | List your account's workspaces. `this_project` marks this project's workspace. |
 | `export --output FILE [--workspace ID]` | Save every stored operation and result to a new file, as JSON Lines, newest first. |
 | `cancel` | Cancel the latest operation. |
-| `stop [--delete]` | Stop the worker. Files are kept. `--delete` also cancels any running operation, then deletes the workspace `connect --ephemeral` created, and no other, and disconnects. It never deletes while a lost request cannot be resent: the workspace is then left stopped, the request kept for `recover`, `errors` names the failed step and the exit code is `2`. |
+| `stop [--generation N \| --delete]` | End billing for the selected worker generation and request cleanup. Files are kept. `--delete` also cancels any running operation, then deletes the workspace `connect --ephemeral` created, and no other, and disconnects. It never deletes while a lost request cannot be resent: the request stays available for `recover`, and the response reports the last confirmed state and any errors. |
 | `feedback --kind KIND --summary TEXT [--details TEXT] [--severity S] [--operation ID]` | Report a confirmed problem with LeanWarp itself to its team. The report names the latest operation. Free, and starts no worker. |
 | `recover` | Resend a request whose response was lost. |
 | `reconcile` | After another client changed the workspace, adopt its revision. Reports what the next sync uploads or deletes, and the new files only the workspace has (`remote_only`), which stay. |
@@ -48,8 +51,8 @@ A **workspace** holds the project's uploaded files and results on LeanWarp. A
 | `mcp` | Run the MCP server for this project over stdio. |
 
 Operations are the commands that run Lean: `check`, `inspect`, `try-tactics`,
-`verify`, `holes`, `suggest`, `sorry2lemma`, `declarations`, `check-files` and
-`verify-batch`. Each first uploads changed files and removes deleted ones. They
+`verify`, `holes`, `suggest`, `sorry2lemma`, `have2lemma`, `simplify-proofs`,
+`repair-proofs`, `declarations`, `check-files` and `verify-batch`. Each first uploads changed files and removes deleted ones. They
 accept:
 
 - `--wait SECONDS`: how long to wait for the result, 0 to 40 (default 30).
@@ -67,14 +70,19 @@ keeps the file open, and after an edit Lean reuses its work on the unchanged
 part of the file. In a draft check, `sorry` is only a warning. So finish with a
 full `check` or with `verify`.
 
-Tactic trials start from the same captured goal without changing the file.
-They run in bounded parallel batches within the worker's resource limits.
+`try_tactics` runs the supplied tactics in one race from the same captured
+goal. The file stays unchanged.
+A per-tactic timeout above 60,000 ms is capped at 60,000 ms.
+The default tactic-trial limit is 30 seconds plus the sum of those
+tactic budgets and 100 ms, rounded up to seconds and bounded to 120–600 seconds.
+Eight 30-second tactics get 271 seconds. An explicit limit shorter than the sum
+scales the per-tactic budgets down to fit the remaining time.
 Results preserve the order of the supplied tactics. To see the path that
 actually ran, read each result's `execution` fields.
 
-`suggest` runs LeanWarp's ranked portfolio for the goal in the same batches:
-default tactics, the goal's premises and what has worked before. `--tactic` runs
-your alternatives instead. Without `--tactic-timeout`, each tactic gets
+`suggest` searches LeanWarp's ranked portfolio for a tactic that closes the
+goal and passes a recheck. It draws on default tactics, the goal's premises
+and what has worked before. Use `--tactic` to search your own alternatives. Without `--tactic-timeout`, each tactic gets
 LeanWarp's learned time budget for its family.
 
 A tactic that closes the goal is accepted only if it changes nothing else:
@@ -95,10 +103,10 @@ Then a fresh recheck sets `verification`:
 
 A hole in a declaration that still has other holes is not closed, with the
 reason `declaration_has_other_holes`: those holes contribute `sorryAx`
-themselves, so no audit can vouch for this edit. Run `sorry2lemma` to move each
-hole into its own lemma, then `suggest` on the lemma. Both tiers rest on the
-kernel's axiom audit, so a tactic that reaches `sorry` by any route, a macro
-included, is refused.
+themselves, so no audit can vouch for this edit. Solve the remaining holes
+together or manually separate them into lemmas before retrying. Both tiers use
+the kernel's axiom audit, so a tactic that reaches `sorry` by any route,
+including a macro, is refused.
 
 When a search tactic such as `exact?` closes the goal, the patch holds the term
 it found (`exact Nat.add_comm a b`), and `found_by` names the search. This way,
@@ -108,7 +116,8 @@ LeanWarp checks the search tactic itself instead.
 Preparing imports, the portfolio and its rechecks share one four-minute budget.
 
 `apply` writes a result only onto the exact bytes it was computed from. Run it
-straight after `suggest` or `sorry2lemma`. To write the edit for the first time,
+straight after `suggest` or a file rewrite (`sorry2lemma`, `have2lemma`,
+`simplify-proofs`, `repair-proofs`). To write the edit for the first time,
 the result must:
 
 - be this project's latest operation, and successful;
@@ -155,6 +164,26 @@ call that lemma. The rest of the file must compile. The lemmas keep their
 `sorry`, so prove each one next. Section variables are preserved in the
 generated lemma application. A failed transformation leaves the source
 unchanged.
+
+`have2lemma`, `simplify-proofs` and `repair-proofs` rewrite proofs. The engine
+keeps each edit only after a fresh check of the whole patched file. LeanWarp then
+returns the rewritten file only if it has no errors, keeps every statement,
+adds nothing but the lemmas `have2lemma` reports, changes no text between
+declarations, and leaves every unchanged declaration referring to exactly what
+it did. Each theorem `simplify-proofs` or `repair-proofs` edits must end
+complete, using no axiom but Lean's standard ones, as for `suggest`: a theorem
+that keeps another `sorry` is refused with `declaration_has_other_holes`.
+Solve the remaining holes together or manually separate them into lemmas.
+`have2lemma` moves proof text, so a new lemma may keep a `sorry` the theorem had.
+Otherwise `status` is `rejected` and `reason` says which check failed.
+`have2lemma` gives each new lemma the theorem's explicit parameters; a `have`
+that uses an earlier local, or is unnamed, may be skipped or fail.
+`simplify-proofs` keeps a shorter proof only if it saves at least
+`--min-saving` bytes. `repair-proofs` keeps the first tactic the whole file accepts for
+each eligible `sorry`. It leaves `?_` placeholders alone. Each attempt is bounded
+by `--tactic-timeout`. Holes outside the repair limit or time budget can be skipped. Tactics may not use `sorry` or
+`admit`. Without `--tactic`, both try `rfl`, `trivial`, `simp`, `simpa`,
+`omega`, `constructor`, `assumption` and `exact True.intro`.
 
 `check-files` runs each file as `check` would, on the workspace's warm (already
 running) workers, within a four-minute budget. A file the budget does not reach
@@ -220,8 +249,8 @@ follows, as LeanWarp returned it:
 | `success` | `decided` | Meaning | Exit code |
 | --- | --- | --- | --- |
 | `true` | `true` | The check passed, the proof was verified, inspection returned goal context, the tactic trial ran, a suggestion closed its hole, an extraction completed, or a listing (`holes`, `declarations`) completed, even of a file that does not compile yet. For `check-files` and `verify-batch`, every file or proof passed. | `0` |
-| `false` | `true` | It did not pass: Lean reported errors (`error`) or the proof was refused (`rejected`, with `failure.kind`). Fix the proof. | `1` |
-| `false` | `false` | No verdict: the check timed out, LeanWarp could not complete it, it was not checked, or the operation failed or was cancelled. Retry it; do not change the proof because of it. | `4` |
+| `false` | `true` | The operation did not succeed. For checks and verification, read the diagnostics or rejection reason. For inspection, read `goal_status` to see whether there were goals at the position. | `1` |
+| `false` | `false` | No verdict: the check timed out, LeanWarp could not complete it, it was not checked, every tactic was skipped, or the operation failed or was cancelled. Retry when appropriate; do not change the proof because of it. | `4` |
 | `null` | `null` | Still running. Run `wait`. Never submit it again. | `3` |
 
 Every verification result (a check, a batch entry, a fixed-target
@@ -266,13 +295,14 @@ What to read in `result.result`:
 | Operation | Fields |
 | --- | --- |
 | `check` | `status` (`ok` when there are no errors), `diagnostics` and `cached`. |
-| `inspect` | `goal_status`: either `available` with `goal_contexts`, or `unavailable` with `unavailable_reason`. `retained_proof_state`, when present, says whether the worker kept a proof state. It does not promise which tactic execution path will run. Also `selected_hole`, `enclosing_declaration`, `premise_hints` and `context_omitted`. |
-| `try_tactics` | `results`: one entry per tactic, in the order given, each with `tactic`, `outcome`, `status`, `diagnostics`, `elapsed_ms` and `execution`. `skipped` lists tactics that did not run, with a reason. |
+| `inspect` | `goal_status` describes the selected state. `available` includes every goal and hypothesis. `no_goals` means a known empty tactic state. `omitted` counts the hidden goals in `context_omitted.goal_contexts`. `retained_proof_state`, when present, says whether the worker kept a proof state. It does not promise which tactic execution path will run. Also `selected_tactic` or `selected_hole`, `enclosing_declaration`, `premise_hints` and `context_omitted`. |
+| `try_tactics` | `results`: one entry per tactic, in the order given, each with `tactic`, `outcome`, `status`, `diagnostics`, `elapsed_ms` and `execution`. Tactics that differ only in surrounding whitespace share one trial. Later positions report `execution: repeated` and zero additional `elapsed_ms`. `skipped` lists tactics that did not run, with a reason. |
 | `verify_target` | `status` `ok` and `receipt.policy` `fixed_target_kernel_check_v2`. A rejection, a timeout or an infrastructure failure has `failure`. |
 | `holes` | `holes`: each with `kind`, `token`, its exact semantic `state` (`resolved`, `sorry`, `unresolved` or `unknown`), `unfinished` and source positions. A filled `?_` is resolved independently of other holes in its declaration. `unfinished_count` counts confirmed `sorry` and `unresolved` placeholders. `unknown_count` is separate. The legacy `unfinished` boolean stays true for unknowns. False means positively resolved. `hole_count` counts all syntax placeholders, not remaining goals. `resolved_count`, `holes_omitted` and `goals_omitted` account for resolved entries and output limits. Goals (`target`, `hypotheses`) are returned only for the first 16 unfinished or unknown entries. `goal_status: omitted` means the context was not returned. `status: error` and `diagnostics` keep compilation errors. `diagnostics_complete` says whether elaboration finished. |
 | `suggest` | Either `status` `closed`, with `tactic`, `found_by` (when `tactic` is what a search such as `exact?` found), `verification` (`strict` or `declaration`), `patch` (`start_utf8_offset`, `end_utf8_offset`, `replacement`), `source_sha256` and `patched_source_sha256`. Or `not_closed`, with `tried`, `candidates`, `rejected_by_recheck`, `rejections` (each closing `tactic` the recheck refused, with its `reason`, listed below) and `exhausted` (`portfolio` or `budget`). `portfolio` is `leanwarp` or `caller`. |
 | `extract_decls` | `declarations` written in the file, not those Lean generates, such as recursors. Each has `name`, `kind`, `type`, `local_dependencies`, `dependencies` (up to 128, then `dependencies_omitted`), `level_params`, `is_unsafe`, `is_partial` and the source range. `declarations_omitted` counts any beyond 512 or beyond the result's size. |
 | `sorry2lemma` | `status` (`extracted`, `partial`, `unchanged`, `no_targets` or `failed`), and `targets`, each with `declaration_name`, `generated_lemma_name` and `status`. When `source_changed`, also `transformed_source` with its `transformed_source_sha256`. Then `final_check` and, if requested, `strict_final_check`. A transformed file too large to return gives `status` `error` with `error.code` `result_too_large`. |
+| `have2lemma`, `simplify_proofs`, `repair_proofs` | As `sorry2lemma`, without `final_check`: `status` (`have2lemma`: `extracted`, `partial`, `unchanged`, `no_targets` or `failed`; `simplify_proofs`: `simplified` in place of `extracted`; `repair_proofs`: `repaired`, `partial`, `no_targets` or `failed`), or `rejected` with `reason` (`file_has_errors`, `changes_declarations`, `changes_dependencies`, `edit_outside_declaration`, `declaration_has_other_holes`, `uses_unproved_or_extra_axiom`, `axiom_audit_unavailable`, `too_many_declarations`, `recheck_incomplete`). Counts `extracted`, `simplified` or `repaired`, with `failed` and `skipped`; `simplify_proofs` also has `bytes_saved`. Each target has its `status` and `replacement` when accepted; `have2lemma` names `declaration_name`, `have_name` and `generated_lemma_name`; `simplify_proofs` names `declaration_name`; `repair_proofs` gives the hole's `kind` and `range`. A `timeout_seconds` too short for one attempt with every tactic gives `status` `error` with `error.code` `budget_too_small`. |
 | `check_files` | `status`: `ok` when every file passed, `failed` when Lean or the checker refused at least one, otherwise `incomplete`. `passed`, `failed` (`error` and `rejected`), `timed_out`, `infrastructure_failures` and `not_checked` count every file once. `results` in the order given, each with `file`, `status`, `diagnostics`, `elapsed_ms` and, for `rejected`, `timeout` and `infrastructure_failure`, `failure`. A file whose imports could not be prepared has `phase` `dependencies`. A file LeanWarp could not finish is `infrastructure_failure`; the other results still count. |
 | `verify_batch` | As `check_files`, with `strict`, and each result has `custom_id` instead of `file`. An accepted entry with a `target` also has its `receipt`. A proof whose imports were refused or could not be read has `phase` `dependencies`. |
 
@@ -302,16 +332,19 @@ succeeds in a trial isn't a proof until the file checks with it. Engine errors,
 such as a position outside any proof, arrive as `status` `error`, with an
 `error` object holding `code` and `message`.
 
-Inspection supports ordinary `sorry` drafts and explicit proof holes. The
-position you select must identify one goal context. Tactic inputs are bare Lean
-tactics. A `by` wrapper is optional.
+Inspection also works in completed proofs. In the following file, run
+`leanwarp inspect Main.lean --line 2 --column 3` to see the goal and
+hypothesis before `exact h`.
 
-For successful inspections, `status` keeps the older `proof_state` or
-`metadata_only` marker, for compatibility. These markers describe what was
-retained, not whether goals are available: `metadata_only` can still contain
-useful goals. Use `goal_status` and `goal_contexts` to decide whether context
-was returned. An unavailable context has `status: unavailable`, so older clients
-also report it as unsuccessful.
+```lean
+example (h : True) : True := by
+  exact h
+```
+
+A tactic selection includes its states in source order. A recovered draft
+hole can carry a retained proof state. For either selection, use
+`goal_status` to distinguish complete goals, a known empty state, and
+omitted or unavailable goals.
 
 ### How it ran
 
@@ -324,11 +357,11 @@ and `timing`, which says where the time went. Only the facts that apply appear.
 | `imports` | `reused`: the file's imports were already loaded. `extended`: loaded imports were extended. `loaded`: imported now. |
 | `document` | Draft checks only. `incremental`: Lean reused its earlier work on the file. `full`: Lean processed (elaborated) the file from the start. |
 | `restarted` | Present only when the operation was interrupted and started again. `count`: how many times. `reason`, for the last one: `release` when a LeanWarp update moved it, `worker_lost` when its worker or server stopped responding. |
-| `trials` | Tactic trials, counted by how they ran. `proof_state`: from Lean's captured proof state. `document_state`: replayed from the captured document. `source_recheck`: the file was rechecked with the tactic in place. `cached`: an identical earlier trial. |
+| `trials` | Distinct tactic trials, counted by how they ran. Repeated inputs in the same request count once. `proof_state`: from Lean's captured proof state. `document_state`: replayed from the captured document. `source_recheck`: the file was rechecked with the tactic in place. `cached`: an identical earlier trial. |
 
 `timing` has `queued_ms`, `worker_ms` (getting a ready worker, including any
 start), `upload_ms` and `run_ms`. Parts of `run_ms` appear when Lean timed them:
-`elaboration_ms` (checks), and `proof_state_ms` and `tactics_ms` (tactic trials). `queued_ms` is
+`elaboration_ms` (checks, including `imports_ms` when import loading was timed), and `proof_state_ms` and `tactics_ms` (tactic trials). `queued_ms` is
 left out when the operation was recovered after a failed attempt. Trials also report
 their own `execution` and `elapsed_ms`.
 
@@ -389,9 +422,10 @@ state. Commands on one project take turns: each waits up to 10 seconds for the
 one before it, so tools can be called in parallel.
 
 Tools: `doctor`, `files`, `environments`, `connect`, `check` (`draft`),
-`inspect`, `try_tactics`, `verify_target` (`file`, `candidate_declaration`,
-`target_statement`, `target_context`), `holes`, `suggest` (`tactics` optional),
-`apply`, `sorry2lemma`, `extract_decls`, `check_files` (`files`, `draft`),
+`inspect`, `try_tactics` (these three take `retention`), `verify_target`
+(`file`, `candidate_declaration`, `target_statement`, `target_context`),
+`holes`, `suggest` (`tactics` optional), `apply`, `sorry2lemma`, `have2lemma`,
+`simplify_proofs`, `repair_proofs`, `extract_decls`, `check_files` (`files`, `draft`),
 `verify_batch` (`codes`, `draft`), `wait`, `status`, `cancel`, `stop`,
 `recover`, `reconcile`, `disconnect`, `workspaces`, `history` (one page; pass
 `next_cursor` for older ones), `delete` (`workspace_id`), `account`, `resources`
@@ -450,7 +484,7 @@ keeps the workspace, revisions and any unfinished request in
 `.leanwarp/session.json`. `connect(environment=NAME)` chooses an environment
 explicitly. Closing the client doesn't stop the worker, so call `stop()`.
 
-`project.apply()` writes the latest `suggest` or `sorry2lemma` result, as the
+`project.apply()` writes the latest `suggest` or file-rewrite result, as the
 CLI does. With the lower-level client, `leanwarp_cloud.edits.edited_source(kind,
 result, source)` returns the edited file. It raises `EditError` unless the
 source and the result's checksums match.
@@ -481,7 +515,7 @@ to read with `operation(id)`. Free storage as you go with
 to `check`, `inspect`, `try_tactics`, `submit` or `run` so history may remove the
 result a minute after it finishes, with no delete.
 
-The client resends reads, `stop`, `cancel`, `delete` and writes with an
+The client resends reads, generation-scoped stops, `cancel`, `delete` and writes with an
 idempotency key after `429`, `502`, `503`, `504` or a lost connection. It waits
 between attempts with jittered backoff, or as long as `Retry-After` asks, until
 the call's `deadline` or, without one, for a minute (15 seconds under MCP).
@@ -529,10 +563,12 @@ is sent, so a lost response never runs anything twice.
   Run the intended command again.
 - With nothing to recover, `recover` returns the same view as `status`.
 
-`cancel` and `stop` need nothing saved: the SDK resends them itself after a
-transient failure, since repeating them changes nothing. Don't assume a closed
-client stopped billing. `stop` never waits on or resends a saved request, which
-stays saved for the next command.
+A plain `stop` is sent once. If the reply is lost, run `status` to see which
+generation is active. To retry a stop for a known generation, use
+`stop --generation N` (or `generation=N` in Python and MCP).
+A `stopping` reply confirms billing has ended for that generation. Cleanup
+continues until the workspace reports `stopped`. A saved request stays
+available for recovery.
 
 The project's connection lives in its `.leanwarp/` folder. A clone of the
 project on another machine can create its own workspace with `connect`. Or it
@@ -651,8 +687,8 @@ it (`DELETE /operations/{id}`). Resubmitting that request returns
 API](https://github.com/Isagoge-Labs/LeanWarp-SDK/blob/main/docs/http-api.md#releasing-results).
 
 A search loop that submits many `check`, `inspect` or `try_tactics` operations
-can skip the delete: submit them with `retention="short"` (`"retention": "short"`
-over HTTP). Each result is then eligible for removal about 60 seconds after it
+can skip the delete: submit them with `retention="short"` (`--retention short`
+in the CLI, `retention` in MCP, `"retention": "short"` over HTTP). Each result is then eligible for removal about 60 seconds after it
 finishes. That is not an erasure time: history removes results only when it
 needs room, so a quiet workspace may keep one longer, and each workspace's newest
 operation is kept. Until the result is removed, a resent request returns the

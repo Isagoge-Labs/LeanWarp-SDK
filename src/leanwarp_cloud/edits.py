@@ -1,7 +1,8 @@
 """Apply an operation's edit to the exact source it was computed from.
 
-A suggest patch and a sorry2lemma transformation each name the SHA-256 of the
-source they were computed from and of the source they produce. The edit is
+A suggest patch and a file rewrite (sorry2lemma, have2lemma, simplify_proofs,
+repair_proofs) each name the SHA-256 of the source they were computed from and of
+the source they produce. The edit is
 applied only to those exact bytes, and the result must hash as promised, so a
 stale or tampered result can never silently rewrite a different file.
 """
@@ -13,9 +14,9 @@ from collections.abc import Mapping
 from typing import Any
 
 from .errors import EditError
-from .outcome import SUGGESTION_VERIFICATIONS
+from .outcome import REWRITE_SUCCESSES, SUGGESTION_VERIFICATIONS
 
-EDITING_KINDS = frozenset({"suggest", "sorry2lemma"})
+EDITING_KINDS = frozenset({"suggest", *REWRITE_SUCCESSES})
 
 
 def _sha256(text: str) -> str:
@@ -56,13 +57,13 @@ def edited_source(kind: str, result: Mapping[str, Any], source: str) -> str:
         except UnicodeDecodeError:
             raise EditError("the suggestion's patch splits a character") from None
     else:
-        if result.get("status") not in {"extracted", "partial"}:
-            raise EditError("the extraction did not complete")
+        if result.get("status") not in REWRITE_SUCCESSES[kind] - {"unchanged", "no_targets"}:
+            raise EditError(f"the {kind} result changed nothing to apply")
         if result.get("source_changed") is not True:
-            raise EditError("the extraction left the file unchanged")
+            raise EditError(f"the {kind} result left the file unchanged")
         transformed = result.get("transformed_source")
         if not isinstance(transformed, str):
-            raise EditError("the extraction returned no transformed file")
+            raise EditError(f"the {kind} result returned no transformed file")
         edited = transformed
     if _sha256(edited) != edited_sha256(kind, result):
         raise EditError("the edited file does not match the result's checksum")

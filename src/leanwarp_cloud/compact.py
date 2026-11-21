@@ -44,6 +44,15 @@ def compact(operation: Mapping[str, Any]) -> dict[str, Any]:
     shown = summary(operation)
     if not isinstance(result, Mapping):
         return shown
+    if operation.get("kind") == "inspect":
+        candidate = {**shown, "result": result}
+        if len(json.dumps(candidate, ensure_ascii=False).encode("utf-8")) <= _BUDGET_BYTES:
+            return candidate
+        return {
+            **shown,
+            "omitted": {f"result.{key}": _size(value) for key, value in result.items()},
+            "hint": 'Request detail="full" to read the complete inspection.',
+        }
     counts = _severities(result.get("diagnostics"))
     if counts:
         shown["counts"] = counts

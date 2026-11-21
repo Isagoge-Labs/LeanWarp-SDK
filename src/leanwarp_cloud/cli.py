@@ -201,12 +201,18 @@ def parser() -> argparse.ArgumentParser:
     )
 
     inspect = commands.add_parser(
-        "inspect", help="show the goals and local context at a position in a proof"
+        "inspect",
+        help="show goals at a tactic or proof hole",
+        description="Show goals at a tactic or proof hole. no_goals means a known empty state. "
+        "omitted means the complete goal list did not fit.",
     )
     inspect.add_argument("file", metavar="FILE", help="a .lean file in the project")
 
     tactics = commands.add_parser(
-        "try-tactics", help="try tactics at a position without editing the file"
+        "try-tactics",
+        help="try tactics at a position without editing the file",
+        description="Try tactics from one captured goal. The default limit uses the sum of the "
+        "tactic budgets plus overhead. A shorter explicit limit scales budgets down.",
     )
     tactics.add_argument("file", metavar="FILE", help="a .lean file in the project")
 
@@ -293,6 +299,59 @@ def parser() -> argparse.ArgumentParser:
         help="also report whether the result passes a strict check (it keeps the sorrys)",
     )
 
+    lifts = commands.add_parser(
+        "have2lemma",
+        help="move each named `have` in a theorem's proof into its own lemma; "
+        "`leanwarp apply` writes the new file",
+    )
+    lifts.add_argument("file", metavar="FILE", help="a .lean file in the project")
+    lifts.add_argument(
+        "--max", type=int, default=64, metavar="N", help="at most this many, 1 to 256"
+    )
+    lifts.add_argument("--prefix", metavar="NAME", help="prefix for the generated lemmas")
+
+    rewrites = []
+    for name, noun, help_text in (
+        (
+            "simplify-proofs",
+            "simplifications",
+            "replace theorem proofs with shorter ones that still check; "
+            "`leanwarp apply` writes the new file",
+        ),
+        (
+            "repair-proofs",
+            "repairs",
+            "try to repair sorry holes; use `leanwarp apply` when source_changed is true",
+        ),
+    ):
+        rewrite = commands.add_parser(name, help=help_text)
+        rewrite.add_argument("file", metavar="FILE", help="a .lean file in the project")
+        rewrite.add_argument(
+            "--tactic",
+            action="append",
+            metavar="TACTIC",
+            help="a tactic to try instead of LeanWarp's default list; repeat for several",
+        )
+        rewrite.add_argument(
+            "--tactic-timeout",
+            type=int,
+            default=10_000,
+            metavar="MS",
+            help="milliseconds per attempt, 1 to 60000 (default 10000)",
+        )
+        rewrite.add_argument(
+            "--max", type=int, default=16, metavar="N", help=f"at most this many {noun}, 1 to 256"
+        )
+        rewrites.append(rewrite)
+    simplify, repair = rewrites
+    simplify.add_argument(
+        "--min-saving",
+        type=int,
+        default=1,
+        metavar="BYTES",
+        help="keep a shorter proof only if it saves at least this many bytes (default 1)",
+    )
+
     batch = commands.add_parser(
         "check-files", help="check several files in one operation (up to 64)"
     )
@@ -332,7 +391,8 @@ def parser() -> argparse.ArgumentParser:
 
     commands.add_parser(
         "apply",
-        help="write the latest suggest or sorry2lemma result into its file and upload it",
+        help="write the latest suggest, sorry2lemma, have2lemma, simplify-proofs or "
+        "repair-proofs result into its file and upload it",
     )
 
     for operation in (
@@ -344,6 +404,9 @@ def parser() -> argparse.ArgumentParser:
         holes,
         declarations,
         obligations,
+        lifts,
+        simplify,
+        repair,
         batch,
         proofs,
     ):
@@ -363,6 +426,14 @@ def parser() -> argparse.ArgumentParser:
             type=int,
             metavar="SECONDS",
             help="stop the operation on the server after this long, 1 to 600",
+        )
+
+    for operation in (check, inspect, tactics):
+        operation.add_argument(
+            "--retention",
+            choices=("standard", "short"),
+            help="short: the result may be removed about a minute after it finishes, "
+            "so a search loop need not delete each one (default: standard)",
         )
 
     wait = commands.add_parser("wait", help="wait for the latest operation's result")
@@ -385,7 +456,9 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser("sync", help="upload changed files (operations also sync automatically)")
     commands.add_parser("cancel", help="cancel the latest operation")
     stop = commands.add_parser("stop", help="stop the worker; saved files are kept")
-    stop.add_argument(
+    stop_options = stop.add_mutually_exclusive_group()
+    stop_options.add_argument("--generation", type=int, help="retry the close for this generation")
+    stop_options.add_argument(
         "--delete",
         action="store_true",
         help="also delete a workspace made by `connect --ephemeral`, and disconnect",
@@ -587,6 +660,7 @@ def _operation(project: ProjectSession, args: argparse.Namespace) -> dict[str, A
         *_request(args),
         wait_seconds=0 if args.block else inline,
         timeout_seconds=args.execution_timeout,
+        retention=getattr(args, "retention", None),
     )
     if args.block and not OperationOutcome(operation).terminal:
         return project.wait(
@@ -613,6 +687,18 @@ def _request(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
         payload.update(max_extractions=args.max, strict_final_check=args.strict_final_check)
         if args.prefix is not None:
             payload["name_prefix"] = args.prefix
+    elif kind == "have2lemma":
+        payload["max_extractions"] = args.max
+        if args.prefix is not None:
+            payload["name_prefix"] = args.prefix
+    elif kind in {"simplify_proofs", "repair_proofs"}:
+        payload["timeout_ms"] = args.tactic_timeout
+        if kind == "simplify_proofs":
+            payload.update(max_simplifications=args.max, min_reduction_bytes=args.min_saving)
+        else:
+            payload["max_repairs"] = args.max
+        if args.tactic:
+            payload["tactics"] = args.tactic
     elif kind == "check_files":
         payload.update(files=args.files, strict=not args.draft)
         if args.file_timeout is not None:
@@ -668,6 +754,8 @@ def main(argv: list[str] | None = None) -> int:
         root.error("check takes a FILE or --all")
     if args.command == "check" and args.all and args.wait is not None:
         root.error("check --all always waits until it is done; drop --wait")
+    if args.command == "check" and args.all and args.retention is not None:
+        root.error("--retention applies to one file's check; drop it with --all")
     if args.command == "wait" and args.execution_timeout is not None and not args.block:
         root.error("--execution-timeout on wait needs --block")
     if args.command == "setup" and args.remove and (args.refresh or args.no_mcp):
@@ -778,7 +866,7 @@ def main(argv: list[str] | None = None) -> int:
                 _emit(_export(project, args.output, args.workspace))
                 return 0
             if args.command == "stop":
-                stopped = project.stop(delete=args.delete)
+                stopped = project.stop(delete=args.delete, generation=args.generation)
                 _emit(stopped)
                 # Tearing down that left the workspace in place did not finish its job.
                 return 2 if args.delete and not stopped["deleted"] else 0

@@ -669,6 +669,27 @@ PROOFS = [
             },
         ),
         (
+            ["have2lemma", "Main.lean", "--max", "2", "--prefix", "step"],
+            "have2lemma",
+            {"file": "Main.lean", "max_extractions": 2, "name_prefix": "step"},
+        ),
+        (
+            ["simplify-proofs", "Main.lean", "--tactic", "simp", "--min-saving", "4"],
+            "simplify_proofs",
+            {
+                "file": "Main.lean",
+                "timeout_ms": 10_000,
+                "max_simplifications": 16,
+                "min_reduction_bytes": 4,
+                "tactics": ["simp"],
+            },
+        ),
+        (
+            ["repair-proofs", "Main.lean", "--max", "4", "--tactic-timeout", "2000"],
+            "repair_proofs",
+            {"file": "Main.lean", "timeout_ms": 2000, "max_repairs": 4},
+        ),
+        (
             ["check-files", "Main.lean", "Other.lean", "--file-timeout", "30"],
             "check_files",
             {"files": ["Main.lean", "Other.lean"], "strict": True, "timeout": 30},
@@ -712,7 +733,13 @@ def test_cli_source_tools_submit_exactly_their_payload(
     submit = next(request for request in reversed(service.requests) if request.method == "POST")
     body = json.loads(submit.content)
     assert body["kind"] == kind and body["payload"] == payload
+    assert "retention" not in body
     assert TEST_KEY not in capsys.readouterr().out
+    if kind == "holes":
+        # Only check, inspect and try-tactics take a retention.
+        cli.main(["--project", str(tmp_path), "check", "Main.lean", "--retention", "short"])
+        submit = next(request for request in reversed(service.requests) if request.method == "POST")
+        assert json.loads(submit.content)["retention"] == "short"
 
 
 def _batch_cli(tmp_path, monkeypatch, service):
@@ -865,7 +892,7 @@ def test_edits_apply_only_to_the_exact_source_and_promised_result():
             },
             source,
         )
-    with pytest.raises(EditError, match="did not complete"):
+    with pytest.raises(EditError, match="changed nothing to apply"):
         edited_source(
             "sorry2lemma",
             {"status": "failed", "source_sha256": result["source_sha256"], "source_changed": True},
@@ -1002,6 +1029,26 @@ WELL_FORMED: list[tuple[str, dict[str, Any], bool]] = [
     ("check_files", _batch("ok", ["ok", "ok"]), True),
     ("verify_batch", _batch("failed", ["ok", "rejected", "timeout"]), False),
 ]
+
+
+@pytest.mark.parametrize(
+    ("trials", "expected"),
+    [
+        ([], (False, False, 4)),
+        ([{"tactic": "simp", "outcome": "open_proof_state"}], (True, True, 0)),
+    ],
+)
+def test_tactic_verdict_when_the_budget_skips_candidates(
+    trials: list[dict[str, str]], expected: tuple[bool, bool, int]
+) -> None:
+    from leanwarp_cloud.outcome import judge_result
+
+    result = {
+        "results": trials,
+        "skipped": [{"tactic": "omega", "reason": "operation_budget_exhausted"}],
+    }
+    judgement = judge_result("try_tactics", result)
+    assert (judgement.success, judgement.decided, judgement.exit_code) == expected
 
 
 @pytest.mark.parametrize(("kind", "result", "success"), WELL_FORMED)

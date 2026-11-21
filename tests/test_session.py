@@ -672,8 +672,18 @@ def test_disconnect_requires_confirmed_stop_and_allows_new_dependencies(project,
     session.connect()
     with pytest.raises(SessionError, match="stop"):
         session.disconnect()
-    monkeypatch.setattr(cloud, "workspace", lambda _: {"workspace_id": "w", "state": "stopped"})
-    monkeypatch.setattr(cloud, "stop", lambda _: {"workspace_id": "w", "state": "stopped"})
+    monkeypatch.setattr(
+        cloud, "workspace", lambda _: {"workspace_id": "w", "state": "stopped", "generation": 1}
+    )
+    monkeypatch.setattr(
+        cloud,
+        "stop",
+        lambda _, generation, require_idle: {
+            "workspace_id": "w",
+            "state": "stopped",
+            "generation": generation,
+        },
+    )
     assert session.disconnect()["workspace_id"] == "w"
     assert session.connect()["workspace_id"] == "w"
 
@@ -686,7 +696,9 @@ def test_disconnect_preserves_nonterminal_operation_on_stopped_workspace(
     session.connect()
     session.submit("check", {"file": "Main.lean"})
     service.operation["state"] = state
-    monkeypatch.setattr(cloud, "workspace", lambda _: {"workspace_id": "w", "state": "stopped"})
+    monkeypatch.setattr(
+        cloud, "workspace", lambda _: {"workspace_id": "w", "state": "stopped", "generation": 1}
+    )
     before = session.path.read_bytes()
     with pytest.raises(SessionError, match="still running"):
         session.disconnect()
@@ -696,9 +708,12 @@ def test_disconnect_preserves_nonterminal_operation_on_stopped_workspace(
 def test_disconnect_retains_connection_when_server_has_other_device_work(project, monkeypatch):
     _, _, cloud, session = project
     session.connect()
-    monkeypatch.setattr(cloud, "workspace", lambda _: {"workspace_id": "w", "state": "stopped"})
+    monkeypatch.setattr(
+        cloud, "workspace", lambda _: {"workspace_id": "w", "state": "stopped", "generation": 1}
+    )
 
-    def busy(_):
+    def busy(_, *, generation, require_idle):
+        assert require_idle
         raise LeanWarpCloudError(409, "workspace_busy", "operation is active")
 
     monkeypatch.setattr(cloud, "stop", busy)
@@ -1513,22 +1528,37 @@ def test_apply_refuses_results_whose_hashes_do_not_bind_this_file(project):
     assert (root / "Main.lean").read_text() == SORRY
 
 
-@pytest.mark.parametrize("kind", ["check", "holes", "check_files"])
+@pytest.mark.parametrize("kind", ["check", "holes", "check_files", "inspect"])
 def test_apply_only_writes_editing_results(project, kind):
-    _, _, _, session = project
+    root, service, _, session = project
     session.connect()
     payload = {"files": ["Main.lean"]} if kind == "check_files" else {"file": "Main.lean"}
+    if kind == "inspect":
+        payload.update(line=1, column=1)
     session.submit_and_wait(kind, payload, wait_seconds=0)
-    with pytest.raises(SessionError, match="only a suggest or sorry2lemma"):
+    before = (root / "Main.lean").read_bytes(), (service.revision, len(service.requests))
+    with pytest.raises(SessionError, match="only a suggest, sorry2lemma"):
         session.apply()
+    assert (root / "Main.lean").read_bytes() == before[0]
+    assert service.revision == before[1][0]
+    assert not any(r.method in {"PUT", "POST"} for r in service.requests[before[1][1] :])
 
 
-def test_apply_writes_a_sorry2lemma_transformation(project):
+@pytest.mark.parametrize(
+    ("kind", "status"),
+    [
+        ("sorry2lemma", "extracted"),
+        ("have2lemma", "partial"),
+        ("simplify_proofs", "simplified"),
+        ("repair_proofs", "repaired"),
+    ],
+)
+def test_apply_writes_a_file_rewrite(project, kind, status):
     root, service, _, session = project
     (root / "Main.lean").write_text(SORRY)
     transformed = "theorem obligation (a b : Nat) : a + b = b + a := by\n  sorry\n" + SORRY
     service.result_for = lambda body: {
-        "status": "extracted",
+        "status": status,
         "file": body["payload"]["file"],
         "source_changed": True,
         "targets": [],
@@ -1537,7 +1567,7 @@ def test_apply_writes_a_sorry2lemma_transformation(project):
         "transformed_source_sha256": hashlib.sha256(transformed.encode()).hexdigest(),
     }
     session.connect()
-    session.submit_and_wait("sorry2lemma", {"file": "Main.lean"}, wait_seconds=0)
+    session.submit_and_wait(kind, {"file": "Main.lean"}, wait_seconds=0)
     assert session.apply()["status"] == "applied"
     assert (root / "Main.lean").read_text() == transformed
 

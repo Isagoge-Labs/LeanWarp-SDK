@@ -106,8 +106,9 @@ The agent should first read the resources `leanwarp://guide` and
 
 - **Setup:** `doctor`, `files`, `environments`, `connect`.
 - **Proofs:** `check`, `inspect`, `try_tactics`, `verify_target`, `holes`,
-  `suggest`, `sorry2lemma`, `extract_decls`, `check_files`, `verify_batch`, and
-  `apply` to write a result into its file.
+  `suggest`, `sorry2lemma`, `have2lemma`, `simplify_proofs`, `repair_proofs`,
+  `extract_decls`, `check_files`, `verify_batch`, and `apply` to write a result
+  into its file.
 - **Control:** `wait`, `status`, `cancel`, `stop`, `recover`.
 - **Workspaces and account:** the rest.
 

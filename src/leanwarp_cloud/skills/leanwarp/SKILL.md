@@ -91,13 +91,13 @@ CLI, 20 in MCP) and returns it. Read `success` first:
   a suggestion closed its hole, or a listing (`holes`, `declarations`) completed.
   A listing succeeds even when the file does not compile, so for `holes` and
   `declarations` also read `status`: `error` means the file has errors.
-- `false` with `decided: true` (exit code `1`): the proof is wrong. Lean's
-  messages are in `result.result`; `status` is `error` (Lean's errors) or
-  `rejected` (refused, with `failure.kind`, such as `axioms` or
-  `target_mismatch`). Fix the proof.
+- `false` with `decided: true` (exit code `1`): read the result for the operation you ran.
+  For `check` or `verify`, use the diagnostics or rejection reason to see
+  what failed. For `inspect`, read `goal_status` before editing the proof.
 - `false` with `decided: false` (exit code `4`): no verdict. `status` is
   `timeout`, `infrastructure_failure` or `not_checked`, or the operation
-  failed (`error_message` says why). The proof was neither accepted nor
+  failed (`error_message` says why). A tactic run also returns no verdict
+  if every tactic was skipped. Check `skipped` for the reason. The proof was neither accepted nor
   refuted: retry the same command when `failure.retryable` is true, and do not
   change the proof because of it.
 - `null` (exit code `3`): still running. Run `leanwarp wait` until it finishes.
@@ -111,8 +111,10 @@ in `result.result.results` names its `tactic` and `outcome`: `closed_proof`,
 tactic that works, then check again; a successful trial is not a proof. Edit
 and repeat; the same workspace and warm worker are reused.
 
-For `inspect`, `goal_status: available` means `goal_contexts` holds the goals;
-`unavailable` means they could not be captured, not that the proof is finished.
+For `inspect`, read `goal_status`: `available` includes the goals in
+`goal_contexts`, `no_goals` means Lean observed zero goals at that position,
+and `omitted` means goals were hidden (`context_omitted.goal_contexts` counts
+them). With `unavailable`, LeanWarp could not capture the goals.
 
 ## Close holes one at a time
 
@@ -147,8 +149,8 @@ says how far the recheck reached:
   an editing aid, not a verdict: run `check` on the finished file.
 
 A hole in a declaration that still has other holes is not closed; the rejection
-reason is `declaration_has_other_holes`. Run `leanwarp sorry2lemma` to move each
-hole into its own lemma, then `suggest` on the lemma.
+reason is `declaration_has_other_holes`. Solve the remaining holes together or
+manually separate them into lemmas before retrying.
 
 `suggest` never edits the file. Run `leanwarp apply` straight after it: apply
 writes only the latest operation's result. A `check` or `holes` in between
@@ -166,12 +168,23 @@ then check it. A tactic refused with `recheck_incomplete` may still be fine.
 
 `leanwarp sorry2lemma Main.lean` moves the proof of each `theorem` or `lemma`
 that still has a `sorry` into a new lemma placed before it, and makes the
-original call that lemma; `apply` writes that file. The new lemmas keep their
-`sorry`, so every open step has a name; it does not split a proof into smaller
-goals. A failed transformation leaves the source unchanged. Its `status` is
+original call that lemma; `apply` writes that file. All holes from a given
+proof stay together in the new lemma. A failed transformation leaves the source
+unchanged. Its `status` is
 `extracted` (every target moved), `partial` (some moved), `unchanged` or
 `no_targets` (nothing to apply), or `failed`. `leanwarp declarations
 Main.lean` lists the file's declarations with their types and dependencies.
+
+Three more rewrites work the same way, through `apply`: `leanwarp have2lemma`
+moves each named `have` into its own lemma, `leanwarp simplify-proofs`
+replaces proofs with shorter ones that still check, and `leanwarp
+repair-proofs` attempts repairs within the time budget and repair limit.
+Run `apply` only when `source_changed` is true.
+LeanWarp returns the new file only if every statement is unchanged and each
+theorem repaired or simplified ends complete; otherwise `status` is `rejected`
+with a `reason`. If an edited theorem still contains a `sorry`
+(`declaration_has_other_holes`), solve the remaining holes together or manually
+separate them into lemmas. Run a strict `check` on the finished file.
 
 ## Check many proofs at once
 

@@ -76,6 +76,9 @@ OPERATION_TOOLS = {
     "holes": {"file": "Main.lean"},
     "extract_decls": {"file": "Main.lean"},
     "sorry2lemma": {"file": "Main.lean"},
+    "have2lemma": {"file": "Main.lean"},
+    "simplify_proofs": {"file": "Main.lean"},
+    "repair_proofs": {"file": "Main.lean", "tactics": ["simp"]},
     "check_files": {"files": ["Main.lean"]},
     "verify_batch": {"codes": [{"custom_id": "a", "proof": "example : True := trivial"}]},
 }
@@ -88,6 +91,10 @@ def test_every_operation_tool_returns_its_operation_id(served, tool):
     result = call(server, tool, OPERATION_TOOLS[tool])
     assert result["operation_id"] == service.operation["operation_id"]
     assert "success" in result and result["kind"] == tool
+    if tool in {"check", "inspect", "try_tactics"}:
+        call(server, tool, {**OPERATION_TOOLS[tool], "retention": "short"})
+        sent = next(request for request in reversed(service.requests) if request.method == "POST")
+        assert json.loads(sent.content)["retention"] == "short"
 
 
 def test_wait_status_and_cancel_accept_an_operation_id(served):
@@ -192,6 +199,27 @@ def test_results_are_compact_by_default_and_full_on_request(served):
     assert short["operation_id"] and short["success"] is False
     full = call(server, "wait", {"detail": "full"})
     assert len(full["result"]["result"]["diagnostics"]) == 302
+    goals = [
+        {"target": "∀ x, x = x", "hypotheses": ["h : β"] * 25},
+        {"target": "β", "hypotheses": []},
+    ]
+    result = {
+        "status": "metadata_only",
+        "goal_status": "available",
+        "goal_contexts": goals,
+        "selected_tactic": {"states": [{"side": "before", "source_range": None}]},
+    }
+    service.result_for = lambda _: result
+    inspect = {"file": "Main.lean", "line": 1, "column": 1}
+    assert call(server, "inspect", inspect)["result"] == result
+    goals[1]["target"] = "β" * 9000
+    hidden = call(server, "inspect", inspect)
+    assert (
+        hidden["success"]
+        and "result" not in hidden
+        and hidden["omitted"]["result.goal_contexts"] == 2
+    )
+    assert call(server, "wait", {"detail": "full"})["result"]["result"] == result
 
 
 def operation(result: dict[str, Any], kind: str = "check") -> dict[str, Any]:

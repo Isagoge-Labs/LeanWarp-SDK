@@ -2,6 +2,31 @@
 
 Update an installed SDK with `leanwarp update`.
 
+## 0.2.9
+
+- Three proof rewrites, each written into the file by `apply`:
+  `have2lemma` moves each named `have` into its own lemma, `simplify-proofs`
+  replaces theorem proofs with shorter ones that still check, and
+  `repair-proofs` attempts to fill `sorry` holes within the repair limit and
+  time budget. LeanWarp returns the rewritten file only once it has no errors,
+  keeps every statement, and each theorem repaired or simplified is complete;
+  otherwise `status` is `rejected` with a `reason`.
+- The CLI's `check`, `inspect` and `try-tactics` take `--retention short`, and
+  the MCP tools `check`, `inspect` and `try_tactics` take `retention`.
+- Inspect a tactic in a completed proof or a proof hole. `no_goals` identifies
+  a known empty tactic state. `omitted` counts hidden goals. Compact MCP
+  answers preserve complete selections and goals when they fit.
+- Tactic trials share one capture and race. The default limit sums their
+  budgets, adds 100 ms, rounds up to seconds and adds 30 seconds, bounded to
+  120–600 seconds. A shorter explicit limit scales the budgets down. An identical
+  retry after an upgrade reuses the accepted operation even if the default changed.
+- If every tactic was skipped, `try-tactics` reports no verdict (CLI exit `4`).
+  If a trial ran, read its outcome to see whether it closed the goal.
+- A workspace stop can return `stopping`. Billing for that generation has ended
+  while cleanup finishes. The Python client sends a stop without a generation
+  once. Pass the workspace generation to retry the same stop safely.
+- Draft and strict checks report `timing.imports_ms` when Lean measured import loading.
+
 ## 0.2.8
 
 - `check`, `inspect` and `try_tactics` take `retention="short"`: a finished
@@ -26,8 +51,8 @@ Update an installed SDK with `leanwarp update`.
   accepted. Receipts use the policy `fixed_target_kernel_check_v2`, which
   `OperationOutcome.verified` requires.
 - A `check` sent over HTTP is strict unless it says `"strict": false`.
-- `suggest` no longer has a `partial` tier: run `sorry2lemma` to give each hole
-  its own lemma, then `suggest` on it.
+- `suggest` no longer has a `partial` tier. A suggestion must close its
+  declaration even if other declarations still have holes.
 - A batch entry without `timeout` has 60 seconds. A `timeout` the operation
   cannot honour is refused when it is submitted.
 - Lean options set in your `lakefile` apply to every check and verification.

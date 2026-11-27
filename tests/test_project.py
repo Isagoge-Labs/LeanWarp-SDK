@@ -47,95 +47,17 @@ def test_limits_include_encoded_unicode_and_total_upload(tmp_path: Path) -> None
         collect_lean_sources(tmp_path, max_total_bytes=20)
 
 
-def test_plain_lean_files_need_no_project_metadata(tmp_path):
-    from leanwarp_cloud.project import project_environment, project_identity
-
-    (tmp_path / "Proof.lean").write_text("example : True := trivial")
-    identity = project_identity(tmp_path)
-    assert identity.toolchain is None and identity.manifest_sha256 is None
-    assert project_environment(tmp_path) == ("unspecified", "unlocked")
-
-
-def test_lean_files_in_a_subdirectory_count_as_a_project(tmp_path):
-    from leanwarp_cloud.project import project_environment
-
-    (tmp_path / "Algebra").mkdir()
-    (tmp_path / "Algebra" / "Basic.lean").write_text("example : True := trivial")
-    assert project_environment(tmp_path) == ("unspecified", "unlocked")
-
-
 def test_directory_without_lean_files_is_reported_as_the_wrong_directory(tmp_path):
-    from leanwarp_cloud.project import ProjectError, project_identity
+    from leanwarp_cloud.environment import project_inputs
+    from leanwarp_cloud.project import ProjectError
 
     (tmp_path / "notes.txt").write_text("not Lean")
     with pytest.raises(ProjectError, match="no Lean files") as error:
-        project_identity(tmp_path)
+        project_inputs(tmp_path, default_toolchain=lambda: "leanprover/lean4:v4.26.0")
     assert "--project" in str(error.value)
-
-
-TOOLCHAIN = "leanprover/lean4:v4.26.0"
-MANIFEST = b'{"version":"1.1.0","packages":[]}'
-
-
-def _build(environment, toolchain=TOOLCHAIN, manifest=MANIFEST):
-    from leanwarp_cloud.project import dependency_fingerprint
-
-    return {
-        "bundle_id": f"{environment}-{'a' * 20}",
-        "environment_id": environment,
-        "lean_toolchain": toolchain,
-        "lake_dependencies_sha256": dependency_fingerprint(manifest),
-    }
-
-
-CATALOG = [
-    _build("lean-4.26-mathlib"),
-    _build("lean-4.34-mathlib", "leanprover/lean4:v4.34.1", b'{"version":"1.2.0","packages":[]}'),
-]
-
-
-def test_pinned_project_runs_only_where_its_toolchain_and_lockfile_match(tmp_path):
-    from leanwarp_cloud.project import choose_environment, project_identity
-
-    (tmp_path / "lean-toolchain").write_text(TOOLCHAIN + "\n")
-    (tmp_path / "lake-manifest.json").write_bytes(MANIFEST)
-    choice = choose_environment(project_identity(tmp_path), CATALOG)
-    assert choice.public() == {
-        "environment": "lean-4.26-mathlib",
-        "lean_toolchain": TOOLCHAIN,
-        "match": "exact",
-        "matches_project": True,
-    }
-
-
-def test_unpinned_project_runs_on_the_newest_environment(tmp_path):
-    from leanwarp_cloud.project import choose_environment, project_identity
-
-    (tmp_path / "Proof.lean").write_text("example : True := trivial")
-    choice = choose_environment(project_identity(tmp_path), CATALOG)
-    assert (choice.public()["environment"], choice.match) == ("lean-4.34-mathlib", "unpinned")
-
-
-def test_toolchain_without_lockfile_selects_by_toolchain(tmp_path):
-    from leanwarp_cloud.project import choose_environment, project_identity
-
-    (tmp_path / "lean-toolchain").write_text(TOOLCHAIN)
-    choice = choose_environment(project_identity(tmp_path), CATALOG)
-    assert (choice.public()["environment"], choice.match) == ("lean-4.26-mathlib", "exact")
-
-
-def test_mismatched_project_needs_an_explicit_environment(tmp_path):
-    from leanwarp_cloud.project import ProjectError, choose_environment, project_identity
-
-    (tmp_path / "lean-toolchain").write_text("leanprover/lean4:v4.20.0")
-    identity = project_identity(tmp_path)
-    with pytest.raises(ProjectError, match="--environment NAME") as error:
-        choose_environment(identity, CATALOG)
-    assert "lean-4.26-mathlib, lean-4.34-mathlib" in str(error.value)
-    choice = choose_environment(identity, CATALOG, "lean-4.26-mathlib")
-    assert (choice.match, choice.matches_project) == ("requested", False)
-    with pytest.raises(ProjectError, match="does not serve"):
-        choose_environment(identity, CATALOG, "lean-3")
+    (tmp_path / "Algebra").mkdir()
+    (tmp_path / "Algebra" / "Basic.lean").write_text("example : True := trivial")
+    assert project_inputs(tmp_path, default_toolchain=lambda: "leanprover/lean4:v4.26.0").plain
 
 
 def test_real_manifest_ignores_root_name_format_and_dependency_order():
@@ -278,19 +200,6 @@ def test_ambiguous_or_unpinned_manifest_fails_closed(raw):
 
     with pytest.raises(ProjectError):
         dependency_fingerprint(raw)
-
-
-def test_explicit_bundle_choice_accepts_any_build_of_a_listed_environment():
-    from leanwarp_cloud.project import selects
-
-    current = {"bundle_id": "lean-4.26-mathlib-" + "b" * 20, "environment_id": "lean-4.26-mathlib"}
-    assert selects(current, None)
-    assert selects(current, current["bundle_id"])
-    assert selects(current, "lean-4.26-mathlib")
-    assert selects(current, "lean-4.26-mathlib-" + "a" * 20)
-    assert not selects(current, "lean-4.34-mathlib-" + "a" * 20)
-    # Older services list builds without an environment.
-    assert not selects({"bundle_id": "lean426"}, "lean-4.26-mathlib")
 
 
 def test_ignore_files_exclude_an_archive_that_could_not_be_uploaded(tmp_path: Path) -> None:

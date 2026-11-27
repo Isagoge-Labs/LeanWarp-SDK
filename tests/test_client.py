@@ -26,11 +26,11 @@ def test_workspace_default_belongs_to_service_and_explicit_profiles_are_preserve
     with LeanWarpCloud(
         "secret", base_url="https://cloud.example", transport=httpx.MockTransport(handle)
     ) as api:
-        api.create_workspace("b")
-        api.create_workspace("b", resource_profile="standard", max_resource_profile="large")
-    assert bodies[0] == {"bundle_id": "b", "max_spend_microusd": None}
+        api.create_workspace("e")
+        api.create_workspace("e", resource_profile="standard", max_resource_profile="large")
+    assert bodies[0] == {"environment_id": "e", "max_spend_microusd": None}
     assert bodies[1] == {
-        "bundle_id": "b",
+        "environment_id": "e",
         "max_spend_microusd": None,
         "resource_profile": "standard",
         "max_resource_profile": "large",
@@ -273,116 +273,64 @@ def test_streamed_response_limit_stops_before_an_unbounded_result() -> None:
     assert caught.value.code == "response_too_large"
 
 
-def test_project_selects_exact_environment_and_rejects_mismatch(tmp_path: Path) -> None:
-    (tmp_path / "lean-toolchain").write_text("leanprover/lean4:v4.26.0\n")
-    manifest = b'{"version":"1.1.0","packages": []}\n'
-    (tmp_path / "lake-manifest.json").write_bytes(manifest)
-    created: list[dict[str, object]] = []
+def test_project_workspace_is_created_in_the_projects_own_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import leanwarp_cloud.client as client_module
 
-    def handle(request: httpx.Request) -> httpx.Response:
-        if request.method == "GET":
-            return httpx.Response(
-                200,
-                json={
-                    "versions": [
-                        {
-                            "bundle_id": "exact",
-                            "lean_toolchain": "leanprover/lean4:v4.26.0",
-                            "lake_manifest_sha256": hashlib.sha256(manifest).hexdigest(),
-                        }
-                    ]
-                },
-            )
-        created.append(json.loads(request.content))
-        return httpx.Response(201, json={"workspace_id": "w"})
-
-    with LeanWarpCloud(
-        "secret", base_url="https://cloud.example", transport=httpx.MockTransport(handle)
-    ) as api:
-        assert (
-            api.create_workspace_for_project(tmp_path, max_spend_microusd=2_000_001)["workspace_id"]
-            == "w"
-        )
-        (tmp_path / "lean-toolchain").write_text("leanprover/lean4:v4.27.0\n")
-        with pytest.raises(ValueError, match="No LeanWarp environment matches"):
-            api.create_workspace_for_project(tmp_path)
-    assert len(created) == 1 and created[0]["bundle_id"] == "exact"
-    assert created[0]["max_spend_microusd"] == 2_000_001
-
-
-def test_project_connects_using_locked_dependencies_not_example_name(tmp_path: Path) -> None:
-    from leanwarp_cloud.project import dependency_fingerprint
-
+    monkeypatch.setattr(client_module, "_BUSY_SECONDS", 0.0)
     example = Path(__file__).parents[1] / "examples/lean-4.35"
-    original = (example / "lake-manifest.json").read_bytes()
-    (tmp_path / "lean-toolchain").write_bytes((example / "lean-toolchain").read_bytes())
-    manifest = json.loads(original)
-    manifest["name"] = "my_research_project"
-    manifest["packages"].reverse()
-    (tmp_path / "lake-manifest.json").write_text(json.dumps(manifest, indent=4))
-    selected = []
+    for name in ("lean-toolchain", "lakefile.toml", "lake-manifest.json"):
+        (tmp_path / name).write_bytes((example / name).read_bytes())
+    requests: list[tuple[str, str, object]] = []
 
     def handle(request: httpx.Request) -> httpx.Response:
-        if request.method == "GET":
+        path = request.url.path.removeprefix("/v1/leanwarp/")
+        body = (
+            json.loads(request.content)
+            if request.headers.get("content-type", "").startswith("application/json")
+            else request.content
+        )
+        requests.append((request.method, path.split("/")[0], body))
+        if path == "environment-uploads":
             return httpx.Response(
-                200,
-                json={
-                    "versions": [
-                        {
-                            "bundle_id": "qualified",
-                            "lean_toolchain": (example / "lean-toolchain").read_text().strip(),
-                            "lake_manifest_sha256": hashlib.sha256(original).hexdigest(),
-                            "lake_dependencies_sha256": dependency_fingerprint(original),
-                        }
-                    ]
-                },
+                201, json={"upload_id": "u", "expires_at": "x", "missing": sorted(body["blobs"])}
             )
-        selected.append(json.loads(request.content)["bundle_id"])
+        if path.startswith("environment-uploads/"):
+            if sum(method == "PUT" for method, _, _ in requests) == 1:
+                # Its address is still being erased: sent again once it is free.
+                return httpx.Response(409, json={"error": {"code": "upload_busy"}})
+            return httpx.Response(204)
+        if path == "environments":
+            if not any(method == "PUT" for method, _, _ in requests):
+                return httpx.Response(409, json={"error": {"code": "upload_required"}})
+            return httpx.Response(200, json={"environment_id": "e", "state": "ready"})
         return httpx.Response(201, json={"workspace_id": "w"})
 
     with LeanWarpCloud(
         "secret", base_url="https://cloud.example", transport=httpx.MockTransport(handle)
     ) as api:
-        assert api.create_workspace_for_project(tmp_path)["workspace_id"] == "w"
-        manifest["packages"][0]["rev"] = "f" * 40
-        (tmp_path / "lake-manifest.json").write_text(json.dumps(manifest))
-        with pytest.raises(ValueError, match="No LeanWarp environment matches"):
-            api.create_workspace_for_project(tmp_path)
-    assert selected == ["qualified"]
-
-
-def test_new_project_uses_latest_matching_build_and_allows_an_older_pin(tmp_path: Path) -> None:
-    (tmp_path / "lean-toolchain").write_text("leanprover/lean4:v4.26.0\n")
-    manifest = b'{"version":"1.1.0","packages": []}\n'
-    (tmp_path / "lake-manifest.json").write_bytes(manifest)
-    matching = {
-        "lean_toolchain": "leanprover/lean4:v4.26.0",
-        "lake_manifest_sha256": hashlib.sha256(manifest).hexdigest(),
-    }
-    catalog = [
-        {**matching, "bundle_id": "old"},
-        {**matching, "bundle_id": "new"},
-        {**matching, "bundle_id": "other", "lean_toolchain": "leanprover/lean4:v4.27.0"},
+        created = api.create_workspace_for_project(tmp_path, max_spend_microusd=2_000_001)
+    assert created["workspace_id"] == "w"
+    lakefile = (example / "lakefile.toml").read_bytes()
+    # Held inputs are never resent: an upload happens only when the service asks.
+    assert [(method, route) for method, route, _ in requests] == [
+        ("POST", "environments"),
+        ("POST", "environment-uploads"),
+        ("PUT", "environment-uploads"),
+        ("PUT", "environment-uploads"),
+        ("POST", "environments"),
+        ("POST", "workspaces"),
     ]
-    selected: list[str] = []
-
-    def handle(request: httpx.Request) -> httpx.Response:
-        if request.method == "GET":
-            return httpx.Response(200, json={"versions": catalog})
-        body = json.loads(request.content)
-        selected.append(body["bundle_id"])
-        return httpx.Response(201, json=body)
-
-    with LeanWarpCloud(
-        "secret", base_url="https://cloud.example", transport=httpx.MockTransport(handle)
-    ) as api:
-        api.create_workspace_for_project(tmp_path)
-        api.create_workspace_for_project(tmp_path, environment="old")
-        # An explicit choice runs on the named environment even if the project pins another.
-        api.create_workspace_for_project(tmp_path, environment="other")
-        with pytest.raises(ValueError, match="does not serve the environment 'missing'"):
-            api.create_workspace_for_project(tmp_path, environment="missing")
-    assert selected == ["new", "old", "other"]
+    assert requests[2][2] == requests[3][2] == lakefile
+    submitted = requests[4][2]
+    assert isinstance(submitted, dict)
+    assert submitted["manifest"] == (example / "lake-manifest.json").read_text()
+    assert submitted["lakefile"] == {
+        "name": "lakefile.toml",
+        "sha256": hashlib.sha256(lakefile).hexdigest(),
+    }
+    assert requests[5][2] == {"environment_id": "e", "max_spend_microusd": 2_000_001}
 
 
 def test_execution_deadline_is_forwarded_and_retried_independently_of_polling() -> None:
@@ -445,6 +393,32 @@ def test_verify_batch_submits_inline_proofs_and_bounds_their_count() -> None:
     assert bodies[1]["payload"] == {"codes": codes, "strict": True}
 
 
+@pytest.mark.parametrize(
+    ("method", "limits"),
+    [
+        ("simplify_proofs", {"max_simplifications": 16, "min_reduction_bytes": 1}),
+        ("repair_proofs", {"max_repairs": 16}),
+    ],
+)
+def test_proof_rewrites_leave_tactic_budgets_to_leanwarp_unless_given(
+    method: str, limits: dict[str, int]
+) -> None:
+    bodies: list[dict] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return httpx.Response(202, json={"operation_id": "op"})
+
+    with LeanWarpCloud(
+        "secret", base_url="https://cloud.example", transport=httpx.MockTransport(handle)
+    ) as api:
+        getattr(api, method)("workspace", "Main.lean", expected_revision=2)
+        getattr(api, method)("workspace", "Main.lean", expected_revision=2, timeout_ms=2000)
+    # A fixed per-tactic budget would crowd most targets out of the operation's time.
+    assert bodies[0]["payload"] == {"file": "Main.lean", **limits}
+    assert bodies[1]["payload"] == {"file": "Main.lean", "timeout_ms": 2000, **limits}
+
+
 def test_short_retention_is_sent_only_when_asked_for() -> None:
     requests: list[httpx.Request] = []
 
@@ -492,7 +466,7 @@ def test_short_retention_is_sent_only_when_asked_for() -> None:
     assert requests[-1].url.path.endswith("/run")
 
 
-@pytest.mark.parametrize("deadline", [0, 601, True, 1.5])
+@pytest.mark.parametrize("deadline", [0, 1801, True, 1.5])
 def test_invalid_execution_deadline_is_rejected_before_submission(deadline: object) -> None:
     def unexpected(_request: httpx.Request) -> httpx.Response:
         raise AssertionError("invalid deadline sent")
@@ -770,6 +744,15 @@ def test_cleanup_expired_deadline_never_starts_an_attempt(monkeypatch, action):
         else:
             getattr(cloud, action)("owned-id", deadline=1000.0)
     assert requests == []
+    # A backoff that wakes past the window sends no resend.
+    from leanwarp_cloud import client as client_module
+
+    now = [0.0]
+    monkeypatch.setattr("leanwarp_cloud.client.time.monotonic", lambda: now[0])
+    monkeypatch.setattr(
+        "leanwarp_cloud.client.time.sleep", lambda s: now.__setitem__(0, now[0] + s + 5)
+    )
+    assert client_module._pause(0.5, 2.0) is False
 
 
 @pytest.mark.parametrize(
@@ -799,3 +782,140 @@ def test_transient_persistence_retries_remain_bounded_and_safe(status, method, a
     assert raised.value.status == status
     assert len(requests) == attempts
     assert all("Idempotency-Key" not in request.headers for request in requests)
+
+
+def test_a_retry_after_a_lost_stored_input_offers_every_input_again(tmp_path: Path) -> None:
+    example = Path(__file__).parents[1] / "examples/lean-4.35"
+    for name in ("lean-toolchain", "lakefile.toml", "lake-manifest.json"):
+        (tmp_path / name).write_bytes((example / name).read_bytes())
+    requests: list[tuple[str, str]] = []
+    failed = {"environment_id": "e", "attempt_id": "a1", "state": "failed",
+              "error": {"code": "stored_file_missing", "action": "retry"}}  # fmt: skip
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        path = request.url.path.removeprefix("/v1/leanwarp/")
+        requests.append((request.method, path))
+        if path == "environment-uploads":
+            # The service no longer holds the input whose stored copy was lost.
+            blobs = json.loads(request.content)["blobs"]
+            return httpx.Response(201, json={"upload_id": "u", "expires_at": "x",
+                                             "missing": sorted(blobs)})  # fmt: skip
+        if path.startswith("environment-uploads/"):
+            return httpx.Response(204)
+        if path == "environments/e/retry":
+            return httpx.Response(202, json={**failed, "attempt_id": "a2", "state": "building"})
+        if path == "environments":
+            retried = any(route == "environments/e/retry" for _, route in requests)
+            return httpx.Response(
+                200, json={**failed, "state": "ready", "error": None} if retried else failed
+            )
+        return httpx.Response(404)
+
+    with LeanWarpCloud(
+        "secret", base_url="https://cloud.example", transport=httpx.MockTransport(handle)
+    ) as api:
+        ready = api.connect_environment(tmp_path, retry=True, timeout=30, poll_seconds=0)
+    assert ready["state"] == "ready"
+    # The inputs are offered (and the missing one sent) before the build is retried.
+    routes = [route for _, route in requests]
+    assert routes.index("environment-uploads") < routes.index("environments/e/retry")
+    assert any(method == "PUT" for method, _ in requests)
+    # A project edited before the failure reached it is connected as it is now: the
+    # failed environment, of other inputs, is not retried.
+    requests.clear()
+    edited = {**failed, "environment_id": "e2"}
+    submitted: list[str] = []
+
+    def changed(request: httpx.Request) -> httpx.Response:
+        path = request.url.path.removeprefix("/v1/leanwarp/")
+        requests.append((request.method, path))
+        if path == "environments":
+            submitted.append(json.loads(request.content)["lakefile"]["sha256"])
+            if len(submitted) == 1:
+                (tmp_path / "lakefile.toml").write_text(
+                    (tmp_path / "lakefile.toml").read_text() + "\n"
+                )
+                return httpx.Response(200, json=failed)
+            return httpx.Response(200, json={**edited, "state": "ready", "error": None})
+        return handle(request)
+
+    with LeanWarpCloud(
+        "secret", base_url="https://cloud.example", transport=httpx.MockTransport(changed)
+    ) as api:
+        assert api.connect_environment(tmp_path, retry=True, timeout=30)["environment_id"] == "e2"
+    assert len(set(submitted)) == 2
+    assert not any(route.endswith("/retry") for _, route in requests)
+
+
+def test_after_a_lost_input_a_reused_committed_answer_carries_its_commits_bytes(
+    tmp_path: Path,
+) -> None:
+    import subprocess
+    import time
+
+    from leanwarp_cloud.client import _Exchange
+    from leanwarp_cloud.environment import Commit, head_of
+
+    def git(*argv: str) -> None:
+        subprocess.run(  # noqa: S603 - the test's own fixed commands
+            ["git", "-C", str(tmp_path), *argv],  # noqa: S607
+            check=True,
+            capture_output=True,
+        )
+
+    git("init", "-q")
+    example = Path(__file__).parents[1] / "examples/lean-4.35"
+    project = tmp_path / "project"
+    (project / "Sub").mkdir(parents=True)
+    for name in ("lean-toolchain", "lakefile.toml", "lake-manifest.json"):
+        (project / name).write_bytes((example / name).read_bytes())
+    committed = {"../a.json": b'{"flag": 1}', "../b.json": b'{"flag": 22}'}
+    for path, data in committed.items():
+        (project / path).write_bytes(data)
+    git("add", "a.json", "b.json")
+    git("-c", "user.email=a@b", "-c", "user.name=a", "commit", "-qm", "x")
+    head = head_of(str(tmp_path))
+    assert head is not None
+    answers = {
+        path: {"kind": "file", "sha256": hashlib.sha256(data).hexdigest(), "size": len(data)}
+        for path, data in committed.items()
+    }
+    # The working copies changed since; the commit, which the builds were answered
+    # from, holds.
+    for path in committed:
+        (project / path).write_bytes(b"edited")
+    uploads: list[list[str]] = []
+    puts: list[str] = []
+    sent: list[dict] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        path = request.url.path.removeprefix("/v1/leanwarp/")
+        if path == "environment-uploads":
+            blobs = json.loads(request.content)["blobs"]
+            uploads.append(sorted(blobs))
+            return httpx.Response(201, json={"upload_id": "u", "expires_at": "x",
+                                             "missing": sorted(blobs)})  # fmt: skip
+        if path.startswith("environment-uploads/"):
+            puts.append(path.rsplit("/", 1)[1])
+            return httpx.Response(204)
+        sent.append(json.loads(request.content)["answers"])
+        return httpx.Response(202, json={"environment_id": "e", "state": "building"})
+
+    environment = {"environment_id": "e", "attempt_id": "a", "input_token": "t" * 64,
+                   "input_requests": sorted(committed)}  # fmt: skip
+    for start, restore in ((project, False), (project / "Sub", True)):
+        exchange = _Exchange(deadline=time.monotonic() + 30)
+        exchange.give(answers, dict.fromkeys(committed, Commit(str(tmp_path), head)))
+        exchange.restore = restore
+        uploads.clear()
+        puts.clear()
+        with LeanWarpCloud(
+            "secret", base_url="https://cloud.example", transport=httpx.MockTransport(handle)
+        ) as api:
+            api.answer_environment_inputs(environment, start, exchange=exchange)
+        # Reused as given; after a lost copy, from the project or a directory inside
+        # it, named once on one receipt and then sent one file at a time, each with
+        # its commit's bytes.
+        assert sent[-1] == answers
+        digests = sorted(item["sha256"] for item in answers.values())
+        assert (uploads, sorted(puts)) == (([digests], digests) if restore else ([], []))

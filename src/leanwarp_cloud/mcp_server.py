@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import threading
 from collections.abc import Awaitable, Callable
 from functools import partial, wraps
@@ -20,11 +21,13 @@ from .client import (
 )
 from .compact import compact, summary
 from .config import feedback_enabled, load_client
+from .environment import dependency_files
 from .errors import (
     LeanWarpCloudError,
     LeanWarpError,
     LeanWarpTransportError,
     OperationTimeout,
+    UsageError,
     WaitError,
 )
 from .outcome import reported
@@ -35,13 +38,15 @@ from .updates import noted
 
 # Warm checks usually finish within this; a cold start returns a pending operation.
 DEFAULT_WAIT_SECONDS = 20.0
+# How long one `connect` call waits on a build before reporting it as building.
+CONNECT_WAIT_SECONDS = MAX_INLINE_WAIT_SECONDS
 P = ParamSpec("P")
 #: How much of an operation a tool returns: the verdict and a shortened result, or all.
 Detail = Literal["compact", "full"]
 
 
 def _safe_tool(  # noqa: UP047 - PEP 695 needs Python 3.12; the SDK supports 3.10
-    function: Callable[P, dict[str, Any]],
+    function: Callable[P, dict[str, Any]] | Callable[P, Awaitable[dict[str, Any]]],
 ) -> Callable[P, Awaitable[dict[str, Any]]]:
     @wraps(function)
     async def call(*args: P.args, **kwargs: P.kwargs) -> dict[str, Any]:
@@ -49,8 +54,11 @@ def _safe_tool(  # noqa: UP047 - PEP 695 needs Python 3.12; the SDK supports 3.1
         from mcp.server.fastmcp.exceptions import ToolError
 
         try:
+            if inspect.iscoroutinefunction(function):
+                return noted(await function(*args, **kwargs))
             # HTTP polling must not block the MCP connection's event loop.
-            return noted(await anyio.to_thread.run_sync(partial(function, *args, **kwargs)))
+            blocking = cast(Callable[P, dict[str, Any]], function)
+            return noted(await anyio.to_thread.run_sync(partial(blocking, *args, **kwargs)))
         except OperationTimeout as error:
             raise ToolError(
                 f"still_running: operation {error.operation_id} is still running; call wait again"
@@ -129,6 +137,53 @@ def create_server(cloud: LeanWarpCloud | Callable[[], LeanWarpCloud], root: str)
                 sessions.append(ProjectSession(client(), root))
             return sessions[0]
 
+    # The project's one connect in progress: it keeps answering its build's reads
+    # for as long as this server lives, on its own thread and under the session's
+    # lock, and keeps its outcome until one connect call claims it.
+    jobs: list[dict[str, Any]] = []
+    connection = threading.Lock()
+
+    def building(job: dict[str, Any]) -> dict[str, Any]:
+        environment = job.get("progress") or {}
+        return {
+            "state": "building",
+            "environment_id": environment.get("environment_id"),
+            "phase": environment.get("phase"),
+            "input_requests": list(environment.get("input_requests") or ()),
+            "message": "LeanWarp is building this project's environment and this server "
+            "answers what the build asks; call connect again to keep waiting",
+        }
+
+    def joined(arguments: dict[str, Any]) -> dict[str, Any]:
+        """The connect in progress, or a new one with these arguments: never two. A
+        call naming other arguments than the one in progress is refused."""
+        with connection:
+            if jobs:
+                running = jobs[0]
+                # Only what this call supplied must match: an omitted argument follows.
+                asked = {name: value for name, value in arguments.items() if value is not None}
+                if any(running["arguments"].get(name) != value for name, value in asked.items()):
+                    raise UsageError(
+                        "a connect with other arguments is in progress; call connect without "
+                        "arguments to follow it, then again with these once it has finished"
+                    )
+                return running
+            effective = {**arguments, "retry": bool(arguments["retry"])}
+            job: dict[str, Any] = {"arguments": effective}
+
+            def run() -> None:
+                try:
+                    job["result"] = session().connect(
+                        **effective, progress=lambda environment: job.update(progress=environment)
+                    )
+                except BaseException as error:  # reported by the call that claims it
+                    job["error"] = error
+
+            job["thread"] = threading.Thread(target=run, name="leanwarp-connect", daemon=True)
+            jobs.append(job)
+            job["thread"].start()
+            return job
+
     def shown(operation: dict[str, Any], detail: Detail) -> dict[str, Any]:
         result = reported(operation)
         return result if detail == "full" else compact(result)
@@ -167,33 +222,48 @@ def create_server(cloud: LeanWarpCloud | Callable[[], LeanWarpCloud], root: str)
 
     @server.tool(annotations=read)
     @_safe_tool
-    def doctor(environment: str | None = None) -> dict[str, Any]:
-        """Show which LeanWarp environment this project runs on. Does not start compute.
-
-        Pass environment to check a project whose toolchain or lockfile matches none.
-        """
-        return session().doctor(environment=environment)
+    def doctor() -> dict[str, Any]:
+        """Show the project's toolchain and environment and whether it runs, and any
+        connect in progress. Does not start compute."""
+        report = session().doctor()
+        with connection:
+            if jobs:
+                job = jobs[0]
+                report["connect"] = (
+                    building(job)
+                    if job["thread"].is_alive()
+                    else {
+                        "state": "failed" if "error" in job else "finished",
+                        "message": "call connect for its outcome",
+                    }
+                )
+        return report
 
     @server.tool(name="files", annotations=read)
     @_safe_tool
-    def upload_files() -> dict[str, Any]:
+    def upload_files(dependencies: bool = False) -> dict[str, Any]:
         """List the Lean files that would upload, their sizes and any problems.
 
-        .gitignore and .leanwarpignore in the project exclude files. Needs no key.
+        .gitignore and .leanwarpignore in the project exclude files. With dependencies,
+        also each path dependency connect sends: its dir and its files with sizes.
+        Needs no key and uploads nothing.
         """
-        return plan_upload(root).public()
+        report = plan_upload(root).public()
+        if dependencies:
+            report["dependencies"] = dependency_files(root)
+        return report
 
     @server.tool(annotations=read)
     @_safe_tool
     def versions() -> dict[str, Any]:
-        """Compatibility name for the original environment catalog and its wire format."""
+        """List the Lean toolchains LeanWarp supports."""
         return client().versions()
 
     @server.tool(annotations=read)
     @_safe_tool
     def environments() -> dict[str, Any]:
-        """List the Lean and Mathlib environments LeanWarp serves."""
-        return {"environments": client().versions()["versions"]}
+        """List this account's environments: each project's build status and dependencies."""
+        return client().environments()
 
     @server.tool(annotations=read)
     @_safe_tool
@@ -209,26 +279,54 @@ def create_server(cloud: LeanWarpCloud | Callable[[], LeanWarpCloud], root: str)
 
     @server.tool(annotations=write)
     @_safe_tool
-    def connect(
-        environment: str | None = None,
+    async def connect(
         max_spend_microusd: Annotated[int, Field(strict=True, ge=0, le=10**12)] | None = None,
         workspace_id: str | None = None,
+        retry: bool | None = None,
     ) -> dict[str, Any]:
-        """Create this project's workspace once. Does not start compute.
+        """Connect this project. A new environment build uses prepaid credit.
 
-        LeanWarp picks the environment matching the project's toolchain and lockfile.
-        Pass environment only to run a project that matches none.
-        Optionally cap total workspace spending in microdollars ($1 = 1000000).
+        The project's toolchain, lakefile, lockfile and path dependencies define its
+        environment; LeanWarp builds it once and this waits up to 40 seconds. Pass
+        retry after fixing what made a build fail.
+        Optionally cap workspace spending in microdollars ($1 = 1000000), excluding the build.
         Omit the cap to keep an existing connection's cap. A different supplied
         cap is rejected; change an existing cap in the account dashboard.
         Pass workspace_id only when the user chose an existing workspace from
         workspaces; the result lists the files the next sync uploads over it.
+        While the environment builds this returns state building; call connect again
+        to keep waiting. The build goes on, answered by this server, between calls.
         """
-        return session().connect(
-            environment=environment,
-            max_spend_microusd=max_spend_microusd,
-            workspace_id=workspace_id,
+        import anyio
+
+        # The limit runs from this call's start, whatever starting the job takes.
+        deadline = anyio.current_time() + CONNECT_WAIT_SECONDS
+        job = joined(
+            {"max_spend_microusd": max_spend_microusd, "workspace_id": workspace_id, "retry": retry}
         )
+        # On the event loop, timed from this call's start and holding no worker
+        # thread; a caller that stops waiting claims nothing, only one that resumes
+        # here may.
+        with anyio.CancelScope(deadline=deadline):
+            # The job's own thread outlives its callers and sets no loop's event.
+            while job["thread"].is_alive():  # noqa: ASYNC110
+                await anyio.sleep(0.05)
+        with connection:
+            if job["thread"].is_alive():
+                return building(job)
+            # Claimed once; the next call connects afresh.
+            if job.get("claimed"):
+                return {
+                    "state": "reported",
+                    "message": "another call reported this connect's outcome; call connect "
+                    "again to see this project's connection",
+                }
+            job["claimed"] = True
+            if jobs and jobs[0] is job:
+                jobs.clear()
+        if "error" in job:
+            raise job["error"]
+        return cast(dict[str, Any], job["result"])
 
     @server.tool(annotations=read)
     @_safe_tool
@@ -431,6 +529,34 @@ def create_server(cloud: LeanWarpCloud | Callable[[], LeanWarpCloud], root: str)
 
     @server.tool(annotations=write)
     @_safe_tool
+    def proof_states(
+        file: str,
+        cursor: int = 0,
+        max_bytes: int = 12_288,
+        wait_seconds: float = DEFAULT_WAIT_SECONDS,
+        detail: Detail = "full",
+    ) -> dict[str, Any]:
+        """Every tactic Lean ran in the file, with its goals before and after, one page at a time.
+
+        One call replaces an inspect per tactic. Rows are in command order, a tactic
+        before those nested in it; each has source_range (1-based lines and columns),
+        occurrence (a tactic run once per goal repeats its range) and before/after
+        with status available (state: an id in the page's states), no_goals,
+        omitted (too large) or unavailable. Call again with next_cursor as cursor
+        until it is null. max_bytes bounds the page (4096 to 524288). status
+        unsupported means the environment cannot list tactic states yet; use
+        inspect. A file with errors is listed as far as Lean elaborated it.
+        May use credit.
+        """
+        return operate(
+            "proof_states",
+            {"file": file, "cursor": cursor, "max_bytes": max_bytes},
+            wait_seconds=wait_seconds,
+            detail=detail,
+        )
+
+    @server.tool(annotations=write)
+    @_safe_tool
     def extract_decls(
         file: str, wait_seconds: float = DEFAULT_WAIT_SECONDS, detail: Detail = "compact"
     ) -> dict[str, Any]:
@@ -490,7 +616,7 @@ def create_server(cloud: LeanWarpCloud | Callable[[], LeanWarpCloud], root: str)
     def simplify_proofs(
         file: str,
         tactics: list[str] | None = None,
-        timeout_ms: int = 10_000,
+        timeout_ms: int | None = None,
         max_simplifications: int = 16,
         min_reduction_bytes: int = 1,
         wait_seconds: float = DEFAULT_WAIT_SECONDS,
@@ -499,7 +625,8 @@ def create_server(cloud: LeanWarpCloud | Callable[[], LeanWarpCloud], root: str)
         """Replace theorem proofs with shorter tactic proofs; call apply to write the file.
 
         Each candidate is kept only if the whole file still checks with it and it is
-        at least min_reduction_bytes shorter; timeout_ms bounds each attempt. Each
+        at least min_reduction_bytes shorter; timeout_ms bounds each attempt (each
+        tactic's own budget without it). Each
         theorem it edits must end complete with Lean's standard axioms only, and no
         statement may change; status rejected, with reason, means LeanWarp's audit
         refused the rewritten file. Tactics may not use sorry or admit. The file is
@@ -507,10 +634,11 @@ def create_server(cloud: LeanWarpCloud | Callable[[], LeanWarpCloud], root: str)
         """
         payload: dict[str, Any] = {
             "file": file,
-            "timeout_ms": timeout_ms,
             "max_simplifications": max_simplifications,
             "min_reduction_bytes": min_reduction_bytes,
         }
+        if timeout_ms is not None:
+            payload["timeout_ms"] = timeout_ms
         if tactics is not None:
             payload["tactics"] = tactics
         return operate("simplify_proofs", payload, wait_seconds=wait_seconds, detail=detail)
@@ -520,14 +648,15 @@ def create_server(cloud: LeanWarpCloud | Callable[[], LeanWarpCloud], root: str)
     def repair_proofs(
         file: str,
         tactics: list[str] | None = None,
-        timeout_ms: int = 10_000,
+        timeout_ms: int | None = None,
         max_repairs: int = 16,
         wait_seconds: float = DEFAULT_WAIT_SECONDS,
         detail: Detail = "compact",
     ) -> dict[str, Any]:
         """Try to repair sorry holes. Call apply only when source_changed is true.
 
-        Every attempt checks the whole patched file; timeout_ms bounds each one, and
+        Every attempt checks the whole patched file; timeout_ms bounds each one (each
+        tactic's own budget without it), and
         sorrys that do not fit the operation's time come back skipped. Each theorem
         it edits must end complete with Lean's standard axioms only: a theorem that
         keeps another sorry is refused (declaration_has_other_holes). Solve its
@@ -535,11 +664,9 @@ def create_server(cloud: LeanWarpCloud | Callable[[], LeanWarpCloud], root: str)
         may not use sorry or admit. A rejected response gives the audit's reason.
         The file is not changed until apply. May use credit.
         """
-        payload: dict[str, Any] = {
-            "file": file,
-            "timeout_ms": timeout_ms,
-            "max_repairs": max_repairs,
-        }
+        payload: dict[str, Any] = {"file": file, "max_repairs": max_repairs}
+        if timeout_ms is not None:
+            payload["timeout_ms"] = timeout_ms
         if tactics is not None:
             payload["tactics"] = tactics
         return operate("repair_proofs", payload, wait_seconds=wait_seconds, detail=detail)
@@ -557,7 +684,7 @@ def create_server(cloud: LeanWarpCloud | Callable[[], LeanWarpCloud], root: str)
 
         Strict by default: sorry, errors and non-standard axioms fail a file. draft
         accepts files that compile; timeout bounds each file in seconds (default 60, at
-        most 210, which needs the default operation deadline). Each file's
+        most 300, which needs the default operation deadline). Each file's
         status is ok, error or rejected (a verdict), or timeout,
         infrastructure_failure or not_checked (no verdict: retry those, do not change
         the proof). The batch is ok, failed (a file was refused) or incomplete.
@@ -587,7 +714,7 @@ def create_server(cloud: LeanWarpCloud | Callable[[], LeanWarpCloud], root: str)
         "target": {"context": imports, "statement": the Prop, "declaration": the
         theorem's name} to bind it, and an accepted entry carries a receipt.
         Strict by default; draft accepts proofs that compile and takes no target.
-        timeout bounds each proof in seconds (default 60, at most 210). Each entry's
+        timeout bounds each proof in seconds (default 60, at most 300). Each entry's
         status is ok, error or rejected (a verdict), or timeout,
         infrastructure_failure or not_checked (no verdict: retry those, do not
         change the proof). May use credit.

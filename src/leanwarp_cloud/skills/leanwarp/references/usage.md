@@ -15,16 +15,17 @@ A **workspace** holds the project's uploaded files and results on LeanWarp. A
 | `setup [--agent NAME] [--no-mcp]` | Install the skill and MCP server for the agents installed here: Claude Code, Codex, Cursor and `~/.agents`. No key needed. |
 | `setup --remove [--agent NAME]` | Remove what `setup` recorded installing in `~/.config/leanwarp/setup.json`, and only what is still as it wrote it: a changed file or entry stays and is reported `modified`. Without a record, nothing is removed. |
 | `update` | Upgrade `leanwarp` to the latest release and refresh the skills `setup` installed. |
-| `doctor [--environment NAME]` | Show which environment the project runs on, and summarise the upload. Starts no worker. Before you sign in, it checks against the public catalog. |
-| `files` | List the Lean files that would upload, their sizes and any problems. No key needed. |
-| `connect [--environment NAME] [--max-spend USD] [--ephemeral]` | Create the project's workspace. `--max-spend` sets a spending cap. `--ephemeral` makes it this run's alone, for `stop --delete` to delete. Starts no worker. |
-| `connect --workspace ID` | Connect the project to an existing workspace instead, such as one from another machine. Reports what the next sync uploads or deletes, and the files only the workspace has (`remote_only`), which stay. Starts no worker. |
+| `doctor` | Show the project's toolchain, its environment and whether it runs, and summarise the upload. Starts no worker. Before you sign in, it checks the toolchain against the supported ones. |
+| `files [--dependencies]` | List the workspace Lean files that would upload, their sizes and any problems. `--dependencies` adds the path-dependency files `connect` sends, with their sizes. No key needed. |
+| `connect [--timeout SECONDS] [--retry] [--max-spend USD] [--ephemeral]` | Build the project's environment once, wait until it is ready, and create the project's workspace. `--retry` builds again after a failure you fixed. The default wait is four hours. If it expires, run `connect` again to rejoin the build. `--max-spend` caps workspace use; a new environment build uses account credit separately. `--ephemeral` makes it this run's alone, for `stop --delete` to delete. |
+| `connect --workspace ID` | Connect the project to an existing workspace instead, such as one from another machine. Reports what the next sync uploads or deletes, and the files only the workspace has (`remote_only`), which stay. |
 | `check FILE [--draft] [--retention short]` | Compile a file and report Lean's errors and warnings. |
 | `check --all [--draft]` | Check every file that uploads, in batches of up to 64, as one result. Waits until the last batch finishes. |
 | `inspect FILE --line N --column N [--retention short]` | Show the goals and hypotheses at a tactic or proof hole. An outside or ambiguous position returns `cursor_outside_proof` or `ambiguous_cursor_capture`. |
 | `try-tactics FILE --line N --column N --tactic T [--tactic T …] [--retention short]` | Try tactics without editing the file. |
 | `verify FILE --declaration NAME --target STATEMENT [--context-file PATH]` | Check that a declaration proves exactly the given statement. |
 | `holes FILE [--no-goals]` | List every `sorry` and `?_` with its position, and the goals of the first 16. |
+| `proof-states FILE [--cursor N] [--max-bytes N]` | List every tactic in the file with its goals before and after, one page at a time. Pass a page's `next_cursor` as `--cursor` for the next. |
 | `suggest FILE --line N --column N [--tactic T …] [--tactic-timeout MS]` | Find a tactic that closes the hole at a position. Never edits the file. |
 | `apply` | Write the latest `suggest`, `sorry2lemma`, `have2lemma`, `simplify-proofs` or `repair-proofs` result into its file and upload it. |
 | `sorry2lemma FILE [--max N] [--prefix NAME] [--strict-final-check]` | For each theorem that still has a `sorry`, move its proof into a named lemma, and make the theorem use that lemma. Never edits the file. |
@@ -46,7 +47,7 @@ A **workspace** holds the project's uploaded files and results on LeanWarp. A
 | `prune [--confirm TOKEN]` | List the files only the workspace has. With the token from that list, delete them. This cannot be undone: ask the user first. |
 | `disconnect` | Forget a stopped workspace, so the project can connect to another environment. |
 | `delete --confirm ID` | Delete the named workspace with its files and results. Your credit is kept. This cannot be undone. |
-| `environments`, `resources`, `account` | List environments, show the published worker's resources and pricing, or show your credit. |
+| `environments`, `versions`, `resources`, `account` | List your account's environments, the supported Lean toolchains, the published worker's resources and pricing, or your credit. |
 | `skill [--reference]` | Print the agent instructions or this reference. No key needed. |
 | `mcp` | Run the MCP server for this project over stdio. |
 
@@ -59,7 +60,8 @@ accept:
 - `--block`: wait until the operation finishes instead, for CI. The wait ends at
   the execution timeout (600 seconds unless set) plus five minutes to start a
   worker. `wait --block` does the same for the latest operation.
-- `--execution-timeout SECONDS`: the operation's time limit on the server, 1 to 600.
+- `--execution-timeout SECONDS`: the operation's time limit on the server, 1 to 600
+  (or up to the account's own limit, at most 1,800).
 
 `verify --fresh` runs on a temporary worker. Otherwise, operations share the
 workspace's worker, which keeps imports loaded between calls.
@@ -113,7 +115,7 @@ it found (`exact Nat.add_comm a b`), and `found_by` names the search. This way,
 compiling the file doesn't repeat the search. If the found term does not pass,
 LeanWarp checks the search tactic itself instead.
 
-Preparing imports, the portfolio and its rechecks share one four-minute budget.
+Preparing imports, the portfolio and its rechecks share the operation's time limit.
 
 `apply` writes a result only onto the exact bytes it was computed from. Run it
 straight after `suggest` or a file rewrite (`sorry2lemma`, `have2lemma`,
@@ -181,15 +183,18 @@ that uses an earlier local, or is unnamed, may be skipped or fail.
 `simplify-proofs` keeps a shorter proof only if it saves at least
 `--min-saving` bytes. `repair-proofs` keeps the first tactic the whole file accepts for
 each eligible `sorry`. It leaves `?_` placeholders alone. Each attempt is bounded
-by `--tactic-timeout`. Holes outside the repair limit or time budget can be skipped. Tactics may not use `sorry` or
-`admit`. Without `--tactic`, both try `rfl`, `trivial`, `simp`, `simpa`,
-`omega`, `constructor`, `assumption` and `exact True.intro`.
+by `--tactic-timeout`, or without it by its tactic's own budget (from 50 ms for
+`rfl` to 2 seconds for `aesop`, `grind` and `nlinarith`). Holes outside the repair limit or time budget can be skipped. Tactics may not use `sorry` or
+`admit`. Without `--tactic`, both try, cheapest first, those of `rfl`,
+`norm_num`, `simp`, `omega`, `linarith`, `positivity`, `ring`, `simpa`,
+`decide`, `trivial`, `constructor`, `assumption`, `exact True.intro`,
+`nlinarith`, `aesop` and `grind` that the file's imports provide.
 
 `check-files` runs each file as `check` would, on the workspace's warm (already
-running) workers, within a four-minute budget. A file the budget does not reach
+running) workers, within the operation's time limit. A file the limit does not reach
 is `not_checked`, and the batch does not pass. Each file is promised its
 `--file-timeout`, or 60 seconds without one, from when its imports have loaded;
-a timeout over 210 seconds, or over `--execution-timeout` less 40 seconds, is
+a timeout over 300 seconds, or over `--execution-timeout` less 31 seconds, is
 refused. A file that had its whole time and did not finish is `timeout`; one
 that started with less and did not finish is `not_checked`, which a file on the
 default 60 seconds can be under a shorter `--execution-timeout`.
@@ -215,31 +220,63 @@ only the environment's packages.
 
 ## Environments
 
-An environment is a Lean release with pinned (fixed) library versions, already
-built on LeanWarp's workers, such as `lean-4.35-mathlib`.
-`leanwarp environments` lists them with their toolchain and Mathlib commit.
-LeanWarp updates an environment's build, for example with engine fixes, without
-changing its Lean or Mathlib. A workspace picks up the new build when its next
-worker starts.
+Your project defines its environment: its `lean-toolchain`, its lakefile, its
+`lake-manifest.json` (with `.lake/package-overrides.json` if present) and the
+source trees of its path dependencies. `connect` sends those, never your
+build outputs. A path dependency sends its files except what its own top-level
+`.gitignore` and `.leanwarpignore` leave out, build outputs, version control
+and credential files (`files --dependencies` lists them). A package URL or
+lakefile URL with a credential in it is refused before anything is sent.
+LeanWarp builds the dependency closure once for your
+account: it fetches pinned public Git dependencies itself, uses the public
+Mathlib cache when the closure is standard Mathlib, and waits until the
+environment is ready. The same inputs reuse the same environment, so a second
+`connect` builds nothing. LeanWarp never runs Lake on your machine.
 
-`connect` chooses an environment from the project's `lean-toolchain` and its
-lockfile, `lake-manifest.json`:
+A private dependency on GitHub is built like any other once LeanWarp has access.
+Connect it in the dashboard, under Private repositories, with a GitHub account
+that administers the repository; until then `connect` stops with
+`grant_required`, and once access is connected `connect --retry` builds again.
+If access is paused later, your workspaces, files and results are kept. A
+private dependency hosted anywhere other than GitHub returns
+`private_host_unsupported`.
 
-| The project has | LeanWarp uses | `match` |
-| --- | --- | --- |
-| A toolchain and lockfile that match an environment | That environment | `exact` |
-| Only a toolchain that matches | That environment | `exact` |
-| Neither file | The only served environment, or the newest served stable Lean release | `unpinned` |
-| Files that match no environment | Nothing; `connect` lists the options | |
-| Any of these, plus `--environment NAME` | That environment | `requested` |
+A Git dependency on a repository on this machine is sent as Lake's checkout of it
+in `.lake/packages`, which must be at the commit `lake-manifest.json` pins; run
+`lake build` (or `lake update`) once if `connect` says otherwise. Path
+dependencies Lake copies (`copy = true`) work as they do locally. A lakefile that
+reads files outside the project gets what this machine holds there: `connect`
+answers each read the build asks for, so let it run until it returns. A file
+committed in its git repository is answered as that commit holds it; any other is
+read from disk, and if it changes after the build read it, `connect` stops and
+asks you to run it again or commit the file. Each dependency's default libraries
+(what `lake build` of it builds) are in the environment; a check that imports a
+module from one of its other libraries (tests, examples, documentation) is refused
+with an error naming the module and its package. Outside the project it
+answers only inside path dependencies (never what their ignore files leave out)
+and the directories `.leanwarpread` lists
+(one per line, relative to the project, such as `../shared`); it refuses any other
+read with an error naming the file. Add a directory there only if the project's
+build really needs it. Workers load the project from `lean-toolchain`, the
+lakefile and `lake-manifest.json` alone, so a lakefile that reads any other file
+when Lake loads it is refused before the environment is ready, with
+`configuration_not_reproducible` naming the file; make the configuration depend
+on those three files only.
 
-With `--environment`, `matches_project` says whether the project's own files
-match. If they don't, your files compile against the environment's Lean and
-Mathlib, which can differ from a local build. An import of a package the
-environment doesn't contain fails like any missing import.
+| The project has | LeanWarp uses |
+| --- | --- |
+| A Lake project (lakefile, lockfile and toolchain) | That project's own environment |
+| Plain `.lean` files and no lakefile | The newest supported Lean with Mathlib, or the `lean-toolchain` beside them |
+| A toolchain LeanWarp does not support | Nothing; `leanwarp versions` lists the supported ones |
 
-A workspace stays on its environment. If the project's toolchain or lockfile
-changes, run `stop`, `disconnect` and `connect` again.
+A lakefile without `lake-manifest.json` asks you to run `lake update` first.
+If a build fails, the error names the package or file; fix it locally, then run
+`leanwarp connect --retry`. `leanwarp environments` lists your environments and
+their build status.
+
+A workspace stays on its environment. If the project's toolchain, lakefile,
+lockfile or path dependencies change, run `stop`, `disconnect` and `connect`
+again. Engine updates never rebuild your environment.
 
 ## Results
 
@@ -299,6 +336,7 @@ What to read in `result.result`:
 | `try_tactics` | `results`: one entry per tactic, in the order given, each with `tactic`, `outcome`, `status`, `diagnostics`, `elapsed_ms` and `execution`. Tactics that differ only in surrounding whitespace share one trial. Later positions report `execution: repeated` and zero additional `elapsed_ms`. `skipped` lists tactics that did not run, with a reason. |
 | `verify_target` | `status` `ok` and `receipt.policy` `fixed_target_kernel_check_v2`. A rejection, a timeout or an infrastructure failure has `failure`. |
 | `holes` | `holes`: each with `kind`, `token`, its exact semantic `state` (`resolved`, `sorry`, `unresolved` or `unknown`), `unfinished` and source positions. A filled `?_` is resolved independently of other holes in its declaration. `unfinished_count` counts confirmed `sorry` and `unresolved` placeholders. `unknown_count` is separate. The legacy `unfinished` boolean stays true for unknowns. False means positively resolved. `hole_count` counts all syntax placeholders, not remaining goals. `resolved_count`, `holes_omitted` and `goals_omitted` account for resolved entries and output limits. Goals (`target`, `hypotheses`) are returned only for the first 16 unfinished or unknown entries. `goal_status: omitted` means the context was not returned. `status: error` and `diagnostics` keep compilation errors. `diagnostics_complete` says whether elaboration finished. |
+| `proof_states` | `rows` in command order, a tactic before those nested in it. Each has `index`, `kind` (the syntax kind; null with `kind_omitted` when too long), `source_range` (UTF-8 byte offsets, 1-based lines and columns; null when the tactic does not map back to the file), `occurrence` (how many earlier rows share the range: `t <;> s` runs `s` once per goal), and `before` and `after`, each with `status` `available` (with `goal_count` and `state`, an `id` in `states`), `no_goals`, `omitted` (a goal too large, with `goal_count`) or `unavailable`. `states` holds each distinct goal list once per page. `cursor`, `next_cursor` (null after the last page), `tactic_count` (every row), `commands_unavailable`, and `diagnostics`. A file with errors is listed as far as Lean elaborated it, with `status` `error`. `status` `unsupported`: the environment cannot list tactic states yet; use `inspect`. |
 | `suggest` | Either `status` `closed`, with `tactic`, `found_by` (when `tactic` is what a search such as `exact?` found), `verification` (`strict` or `declaration`), `patch` (`start_utf8_offset`, `end_utf8_offset`, `replacement`), `source_sha256` and `patched_source_sha256`. Or `not_closed`, with `tried`, `candidates`, `rejected_by_recheck`, `rejections` (each closing `tactic` the recheck refused, with its `reason`, listed below) and `exhausted` (`portfolio` or `budget`). `portfolio` is `leanwarp` or `caller`. |
 | `extract_decls` | `declarations` written in the file, not those Lean generates, such as recursors. Each has `name`, `kind`, `type`, `local_dependencies`, `dependencies` (up to 128, then `dependencies_omitted`), `level_params`, `is_unsafe`, `is_partial` and the source range. `declarations_omitted` counts any beyond 512 or beyond the result's size. |
 | `sorry2lemma` | `status` (`extracted`, `partial`, `unchanged`, `no_targets` or `failed`), and `targets`, each with `declaration_name`, `generated_lemma_name` and `status`. When `source_changed`, also `transformed_source` with its `transformed_source_sha256`. Then `final_check` and, if requested, `strict_final_check`. A transformed file too large to return gives `status` `error` with `error.code` `result_too_large`. |
@@ -425,7 +463,8 @@ Tools: `doctor`, `files`, `environments`, `connect`, `check` (`draft`),
 `inspect`, `try_tactics` (these three take `retention`), `verify_target`
 (`file`, `candidate_declaration`, `target_statement`, `target_context`),
 `holes`, `suggest` (`tactics` optional), `apply`, `sorry2lemma`, `have2lemma`,
-`simplify_proofs`, `repair_proofs`, `extract_decls`, `check_files` (`files`, `draft`),
+`simplify_proofs`, `repair_proofs`, `extract_decls`, `proof_states` (`cursor`; full
+detail by default), `check_files` (`files`, `draft`),
 `verify_batch` (`codes`, `draft`), `wait`, `status`, `cancel`, `stop`,
 `recover`, `reconcile`, `disconnect`, `workspaces`, `history` (one page; pass
 `next_cursor` for older ones), `delete` (`workspace_id`), `account`, `resources`
@@ -481,8 +520,10 @@ with load_client() as cloud:
 
 `load_client()` reads the same key as the CLI. Like the CLI, `ProjectSession`
 keeps the workspace, revisions and any unfinished request in
-`.leanwarp/session.json`. `connect(environment=NAME)` chooses an environment
-explicitly. Closing the client doesn't stop the worker, so call `stop()`.
+`.leanwarp/session.json`. `connect(timeout=..., retry=True)` takes the CLI's
+`--timeout` and `--retry`; when its wait ends first it raises `ConnectTimeout`,
+and calling `connect()` again rejoins the build. Closing the client doesn't
+stop the worker, so call `stop()`.
 
 `project.apply()` writes the latest `suggest` or file-rewrite result, as the
 CLI does. With the lower-level client, `leanwarp_cloud.edits.edited_source(kind,
@@ -493,6 +534,30 @@ source and the result's checksums match.
 checks up to 64 inline proofs, each `{"custom_id": ..., "proof": ...}`, in one
 operation. The lower-level `LeanWarpCloud.verify_batch(workspace_id, codes,
 expected_revision=...)` does the same. Results keep each `custom_id`, in order.
+
+For a whole dataset, `LeanWarpCloud.verify_many(items, output="verdicts.jsonl",
+environment_id=...)` verifies every item, `{"id", "proof", "target":
+{"context", "statement", "declaration"}}`, against its own statement. It sends
+chunks of up to 64 over `workspaces` new workspaces (4 by default) and writes one
+JSON line per verdict as it arrives. `client.toolchain_environment()` returns
+the ready Mathlib environment; a project's own is listed by `leanwarp
+environments`. As with `verify_batch`, proofs and targets may import the
+environment's packages, such as Mathlib, but not a workspace's own modules.
+Items need a `target` unless `require_target=False`.
+
+Run it again with the same `output` and `environment_id` to resume. Items
+already written are skipped. A chunk that was running is recovered from the
+`.journal` file beside the output: if the journal names its operation, the
+result is read back while LeanWarp still holds it; if the request's answer
+never arrived, the exact request is sent again to the same workspace, within 6
+days of its journal entry. A chunk that can be recovered neither way (its
+result was removed, its workspace is gone, its items changed, or the 6 days
+have passed) runs again only with `rerun_lost=True`. A resumed run must
+give each written item the same proof, target and settings.
+
+`AsyncLeanWarpCloud` offers every `LeanWarpCloud` method as a coroutine, with
+the same arguments, retries and deadlines; calls made together run together, up
+to `concurrency` (16 by default) at a time.
 
 `project.feedback(kind, summary, details=..., severity=...)` reports a problem
 with LeanWarp itself, naming the project's workspace and latest operation.
@@ -622,8 +687,8 @@ $1,000,000.
 
 If you omit the cap, a first connection creates an uncapped workspace, and a
 reconnect keeps the existing cap. A reconnect with a different cap is rejected.
-Change an existing cap in the dashboard. A cap of zero stops any worker from
-starting.
+Change an existing cap in the dashboard. A cap of zero blocks workspace compute.
+Building a new environment is billed separately from the workspace.
 
 When `usage_based` is true, CPU and RAM charges rise independently above their
 reserved baselines. The starting rate remains a paid minimum while the worker
@@ -650,13 +715,13 @@ reports `leanwarp_budget_exceeded`.
 | Module paths | ASCII letters, digits and `_`; not under `Init`, `Lean`, `Lake`, `Std` or `Mathlib` |
 | Statement context | 128 KiB |
 | Inline wait | 0 to 40 seconds (`wait` and `--block` can wait longer) |
-| Operation time limit | 1 to 600 seconds |
+| Operation time limit | 1 to 600 seconds\* |
 | Operations per workspace | One at a time |
-| Operation history | The newest 1,000 operations per workspace\* |
-| File sync history | The newest 1,000 syncs per workspace\* |
+| Operation history | The newest 10,000 operations per workspace\* |
+| File sync history | The newest 10,000 syncs per workspace\* |
 | Stored results | 512 MiB per account, across workspaces\*. Each queued or running operation reserves its request and 1 MiB |
 | Stored source | 64 MiB per account, across workspaces\* |
-| Workspaces | 100 per account\*, and 300 created an hour\* |
+| Workspaces | 100 per account\*, and 500 created an hour\* |
 | Feedback | 60 requests an hour and 300 a day per account, repeats included. Of these, 20 an hour and 100 a day may be new reports. A summary of 8 to 200 characters, and up to 4,000 characters of details. Reports expire 180 days after their last repeat. At most 500 are kept per account, and they are deleted with their workspace |
 | Active API keys | 100 per account\* |
 
@@ -673,8 +738,8 @@ Otherwise nothing is removed, and the request reports the limit with HTTP
 it, within the call's deadline. LeanWarp never removes queued or running work, each workspace's newest
 operation and sync, or your uploaded files.
 
-Until history removes an operation, at least an hour after it finished (a minute
-for short retention), retrying its request with the same idempotency key returns
+Until history removes an operation, at least an hour after it finished (a day
+for `check-files` and `verify-batch`, a minute for short retention), retrying its request with the same idempotency key returns
 the original result. Later, a removed operation reads as `not_found`. For at
 least 7 days, resubmitting it returns `operation_expired` without running it
 again.

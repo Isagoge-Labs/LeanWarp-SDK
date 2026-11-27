@@ -2,6 +2,68 @@
 
 Update an installed SDK with `leanwarp update`.
 
+## 0.2.10
+
+- Connect plain Lean files to a ready environment, or connect a Lake project to
+  its pinned dependencies. Preparing a new project environment uses prepaid
+  credit when builds are available. Reusing a ready environment is free.
+- Run `leanwarp update` to upgrade from 0.2.9 or earlier. For a previously
+  connected project, run `leanwarp stop`, `leanwarp disconnect`, then
+  `leanwarp connect` to create a workspace in its new environment. The new service lists toolchains at `/versions` and creates
+  workspaces using an account-owned `environment_id`.
+- `connect` waits up to four hours for a build by default; `--timeout SECONDS`
+  (`timeout=` in Python) changes it. When the wait ends first, `ConnectTimeout`
+  is raised and the CLI exits with code 3. Run `connect` again in the same project
+  to start the build or rejoin one already in progress. Exit code 3 still also means an
+  operation is running: run `leanwarp wait`, never submit it again.
+- MCP `connect` returns `state: building` after about 40 seconds while a build
+  goes on; call it again to keep waiting.
+- `connect --retry` builds a failed environment again once its cause is fixed.
+  After `stored_file_missing` it also uploads the missing file again.
+- A lakefile that reads files outside the project gets them from `connect`,
+  which must keep running while the build asks: only inside path dependencies
+  and the directories listed in `.leanwarpread`. A project that a worker cannot
+  load the same way from `lean-toolchain`, the lakefile and `lake-manifest.json`
+  alone, such as one whose lakefile reads other files when Lake loads it, is
+  refused with `configuration_not_reproducible`.
+- Each dependency's default libraries are built; importing a module from its
+  other libraries is refused with an error naming it.
+- Private GitHub dependencies are connected in the dashboard with a GitHub
+  account that administers them; until then, connecting returns
+  `grant_required`. Paused access keeps your workspaces, files and results.
+- A path dependency sends its files except what its own top-level `.gitignore`
+  and `.leanwarpignore` leave out, build outputs, version control and
+  credential files (`.env*`, `.npmrc`, SSH private keys, `*.pem`, `*.key` and
+  similar), which are never uploaded or sent; a build that reads a file its
+  ignore files leave out is refused. `leanwarp files --dependencies` (MCP
+  `files` with `dependencies`) lists the files `connect` sends.
+- A package URL in `lake-manifest.json`, `.lake/package-overrides.json` or a
+  path dependency's own manifest, or a lakefile URL, with a credential in it is
+  refused before anything is sent;
+  connect private GitHub repositories in the dashboard instead.
+
+- `verify_many` checks a dataset of proofs, each against its own statement,
+  in chunks of up to 64 spread over several workspaces. Verdicts stream to a
+  JSONL file as they arrive, each with the item's stable `id` and the
+  `target_sha256` of the statement it was checked against. Run it again with
+  the same output to resume: written items are skipped and an interrupted
+  chunk is read back or, within 6 days, replayed, never charged twice; an
+  older one runs again only with `rerun_lost=True`. A written verdict is kept
+  only for the same proof, target and settings (its `input_sha256`); a resumed
+  run that changes any of them is refused. An output is verified in one
+  environment, named by `environment_id` on each line: once its first proof
+  chunk is journaled or a verdict written, a resumed run in another is refused.
+  Each line's `decided` is false for `timeout`,
+  `infrastructure_failure` and `not_checked`, which the summary counts as
+  `undecided`, not `failed`; resuming skips them, so retry them in a new
+  output. One run at a time uses an output. Items need a `target` unless
+  `require_target=False`.
+- `AsyncLeanWarpCloud`: every client method as a coroutine, with the same
+  retries and deadlines.
+- `proof_states` (`leanwarp proof-states`, MCP `proof_states`) lists every
+  tactic in a file with its goals before and after, a page per call, instead of
+  an `inspect` per tactic.
+
 ## 0.2.9
 
 - Three proof rewrites, each written into the file by `apply`:

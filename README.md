@@ -1,9 +1,10 @@
 <h1><img src="https://raw.githubusercontent.com/Isagoge-Labs/LeanWarp-SDK/main/docs/assets/leanwarp-banner.svg" alt="LeanWarp by Isagoge Labs" width="960"></h1>
 
 LeanWarp is hosted Lean 4 for formal verification. It checks and verifies proofs
-on workers that stay warm between edits, against a Lean release and the libraries
-your project pins. This SDK is how you and your agents use it: the `leanwarp`
-command, an MCP server and a Python library.
+on workers that stay warm between edits, against Mathlib or the exact libraries
+your Lake project pins, private GitHub repositories included. This SDK is how you
+and your agents use it: the `leanwarp` command, an MCP server and a Python
+library.
 
 **[Get started](https://isagoge.in/leanwarp/docs/getting-started)** · [Agent setup](https://isagoge.in/leanwarp/docs/agents) ·
 [Reference](https://isagoge.in/leanwarp/docs/reference) · [HTTP API](https://isagoge.in/leanwarp/docs/http-api) ·
@@ -20,6 +21,7 @@ command, an MCP server and a Python library.
 | Try tactics | Several tactics from the same captured goal: which close it, which leave goals, which fail. The file is not edited. | `leanwarp try-tactics` |
 | Verify | Whether a declaration proves exactly the statement you give, checked by Lean's kernel. | `leanwarp verify` |
 | Holes | Every `sorry` and `?_` in a file, with its position, and the goals of the first 16. | `leanwarp holes` |
+| Proof states | Every tactic in a file with its goals before and after, a page at a time, in one call instead of one `inspect` per tactic. | `leanwarp proof-states` |
 | Suggest | A tactic that closes a hole, accepted only if nothing else changes and the proof gains no unproved lemma or extra axiom. `apply` writes it into the file. | `leanwarp suggest`, `leanwarp apply` |
 | Sorry to lemma | The proof of each theorem that still has a `sorry` moved into a new named lemma the theorem then uses; the lemma keeps its `sorry`. `apply` writes it. | `leanwarp sorry2lemma` |
 | Have to lemma | Each named `have` in a theorem's proof moved into its own lemma, which the `have` then uses. `apply` writes it. | `leanwarp have2lemma` |
@@ -28,6 +30,7 @@ command, an MCP server and a Python library.
 | Declarations | The declarations a file adds, with their types and dependencies. | `leanwarp declarations` |
 | Check files | Up to 64 files checked in one operation. | `leanwarp check-files` |
 | Verify batch | Up to 64 inline proofs checked in one operation, without uploading them as files; each result keeps its `custom_id`. | `leanwarp verify-batch` |
+| Verify a dataset | Every proof in a dataset verified against its own statement, over several workspaces, with verdicts streamed to a file and a rerun resuming where it stopped. | Python `verify_many` |
 
 For a hole-free proof in `Main.lean`, inspect the start of `exact` on line 2.
 
@@ -54,6 +57,8 @@ statement unchanged, nothing added but the reported lemmas, and every theorem a
 repair or simplification edits complete, with no axiom beyond Lean's own.
 
 ## Install in two steps
+
+New connections and the examples below require `leanwarp` 0.2.10 or later.
 
 **1. Install.** In a terminal, with [uv](https://docs.astral.sh/uv/getting-started/installation/):
 
@@ -95,7 +100,9 @@ When a new release is out, results include `update_available`; run
 
 ## Quick start
 
-From your Lean project or one of the [examples](https://github.com/Isagoge-Labs/LeanWarp-SDK/tree/main/examples):
+Save [LeanWarpExample.lean](https://github.com/Isagoge-Labs/LeanWarp-SDK/blob/main/examples/lean-4.35/LeanWarpExample.lean) by itself in a
+folder outside any Lake project and run these commands there. Plain files connect
+for free. Checking them uses prepaid credit.
 
 ```sh
 leanwarp doctor              # which environment this project runs on
@@ -119,7 +126,8 @@ while the work is still running, in which case run `leanwarp wait`. `decided` is
 `false` when there was no verdict (a timeout, or a check LeanWarp could not
 complete): retry it rather than changing the proof. The exit code says the same
 thing: `0` passed, `1` did not pass, `2` the command failed, `3` still running,
-`4` no verdict.
+`4` no verdict. For `connect`, exit `3` means only its wait ended: run `connect`
+again, not `wait`.
 
 In CI, `leanwarp connect --ephemeral`, `leanwarp check --all` and, always last,
 `leanwarp stop --delete` check every file and leave nothing behind; see the
@@ -140,34 +148,109 @@ Keep API keys out of prompts, source files and tool arguments.
 
 ## Your project and its environment
 
-LeanWarp uploads only your `.lean` files. Lean, Mathlib and every other
-dependency come from an **environment**: a Lean release with pinned libraries,
-already built on LeanWarp's workers. Run `leanwarp environments` to list them.
-`leanwarp files` lists what would upload; patterns in `.gitignore` and
-`.leanwarpignore` leave files out.
+An **environment** is the Lean toolchain and built libraries your proofs compile
+against. You don't pick one from a list: your project defines it.
 
-`leanwarp connect` picks the environment for you:
+- **Plain `.lean` files** outside any Lake project run on a ready-built Mathlib
+  on the newest supported Lean, or the supported toolchain a `lean-toolchain`
+  beside them names. Nothing to build.
+- **A Lake project** runs against the Lean toolchain and libraries it pins:
+  `leanwarp connect` sends its `lean-toolchain`, lakefile, `lake-manifest.json`
+  and any path dependencies, LeanWarp builds the pinned libraries once, and
+  every later `connect` with the same inputs reuses them.
+  Lake never runs on your machine. A path dependency sends its files except
+  what its own `.gitignore` and `.leanwarpignore` leave out, build outputs,
+  version control and credential files; `leanwarp files --dependencies` lists
+  them.
+- **Private GitHub dependencies** are built like the rest once you connect them
+  in the [dashboard](https://isagoge.in/dashboard), under Private repositories,
+  with a GitHub account that administers them. Until then `connect` stops with
+  `grant_required`; once access is connected, run `leanwarp connect --retry`.
 
-- If your project's `lean-toolchain` and `lake-manifest.json` match an
-  environment, it uses that one, so results agree with your local build.
-- If your project has neither file, as with a folder of `.lean` files, it uses
-  the only served environment, or the newest served stable Lean release when there are several.
-- If they match no environment, it stops and lists the ones available. Run
-  `leanwarp connect --environment NAME` to check your files there anyway; they
-  then compile against that environment's Lean and Mathlib.
+`connect` waits up to four hours for a build; `--timeout SECONDS` changes that.
+If the wait ends first (exit `3`, `connect_timeout`), run `connect` again with
+the same inputs: if a build is under way, it rejoins it and answers any files
+it asks for.
+If a build fails, the error names the package or file; fix it locally and run
+`leanwarp connect --retry`. `leanwarp environments` lists your environments.
 
-To start a new project, copy one of the [examples](https://github.com/Isagoge-Labs/LeanWarp-SDK/tree/main/examples), which match the
-environments LeanWarp serves.
+Only your `.lean` files are uploaded to the workspace. `leanwarp files` lists
+them; patterns in `.gitignore` and `.leanwarpignore` leave files out.
 
-### Lean versions and libraries
+### What a build reads
 
-The LeanWarp engine supports every stable Lean 4 release from 4.26.0, with the
-Lake libraries a project locks. The hosted service runs it in the environments
-[listed on the website](https://isagoge.in/leanwarp/docs/environments), which today pair
-Lean with Mathlib. Each one is built and tested before it is served, so your first
-check starts from compiled libraries. If your project needs another Lean release
-or library, [open an issue](https://github.com/Isagoge-Labs/LeanWarp-SDK/issues) with its `lean-toolchain` and
-`lake-manifest.json`.
+A Git dependency on a repository on your own machine is sent as Lake's checkout
+of it, which must be at the commit the lockfile pins (run `lake build` once).
+Path dependencies Lake copies (`copy = true`) work as they do locally.
+
+If your lakefile reads files outside the project, `connect` answers those reads
+while the build runs, so keep it running until it finishes. It answers only
+inside your path dependencies, except what their ignore files leave out, and the
+directories listed in `.leanwarpread` at the project's top level, one per line
+relative to it (such as `../shared`); any other read stops the connect and names
+the file. Files committed in their git
+repository are read as the commit holds them. Edit any other file the build read
+while `connect` runs and it stops, so you can run it again or commit.
+
+Workers load the project from `lean-toolchain`, the lakefile and
+`lake-manifest.json` alone. A lakefile that reads other files when Lake loads it
+(outside the project, or files of the project itself) is refused with
+`configuration_not_reproducible`, naming the file.
+
+Each dependency is built as `lake build` of it would build it: its default
+libraries. Modules only in its other libraries (tests, examples, documentation)
+are not in the environment, and a check that imports one is refused with an
+error naming the module and its package.
+
+### Lean versions
+
+The LeanWarp engine supports every stable Lean 4 release from 4.26.0.
+`leanwarp doctor` shows whether your project's toolchain is supported, and
+`leanwarp versions` lists the toolchains the service offers now. The ready-built Mathlib environments are
+[listed on the website](https://isagoge.in/leanwarp/docs/environments). To start
+a new Mathlib project, copy one of the
+[examples](https://github.com/Isagoge-Labs/LeanWarp-SDK/tree/main/examples). If
+you need a Lean release that isn't supported,
+[open an issue](https://github.com/Isagoge-Labs/LeanWarp-SDK/issues) with your
+project's `lean-toolchain`.
+
+## Python
+
+Install the library in your application's environment with `uv add leanwarp`
+(or `pip install leanwarp`). To verify a dataset, give each proof its own
+statement:
+
+```python
+from leanwarp_cloud import load_client
+
+items = [
+    {
+        "id": "sq-1",
+        "proof": "import Mathlib\ntheorem t (x : ℝ) : 0 ≤ x ^ 2 := by positivity",
+        "target": {
+            "context": "import Mathlib",
+            "statement": "∀ x : ℝ, 0 ≤ x ^ 2",
+            "declaration": "t",
+        },
+    },
+]
+with load_client() as client:
+    # The ready Mathlib environment. Save its ID and pass the same one to resume.
+    environment_id = client.toolchain_environment()["environment_id"]
+    summary = client.verify_many(
+        items, output="verdicts.jsonl", environment_id=environment_id
+    )
+```
+
+Each verdict is written to `verdicts.jsonl` as it arrives. If the run stops,
+run it again with the same `output` and `environment_id`: finished items are
+skipped, and a chunk that was running is recovered from the `.journal` file
+beside it where it can be (the reference says when). Proofs may
+import the environment's packages but not a project's own modules; for a Lake
+project's libraries, use its `environment_id` from `leanwarp environments`.
+`ProjectSession` drives a project the way the CLI does,
+and `AsyncLeanWarpCloud` offers every client method as a coroutine; see the
+[Python reference](https://isagoge.in/leanwarp/docs/reference#python).
 
 ## Billing
 
@@ -175,7 +258,8 @@ You pay from prepaid credit, billed by the second while a worker runs. Run
 `leanwarp resources` to see the published worker's starting minute price, whether
 charges depend on usage, startup credit hold and idle timeout. LeanWarp selects
 the worker. Use `leanwarp connect --max-spend 2` to create a workspace with a $2
-cap, or edit an existing cap in the dashboard. Reconnecting without a cap keeps
+cap, or edit an existing cap in the dashboard. When available, a first-time Lake
+project build uses prepaid credit separately from this cap. Reusing a ready environment is free. Reconnecting without a cap keeps
 the saved cap.
 
 When the worker uses usage billing, CPU and RAM charges increase independently
@@ -198,7 +282,7 @@ setup for your team, email contact@isagoge.in or tell us with `leanwarp feedback
 
 | Term | Meaning |
 | --- | --- |
-| Environment | A Lean release with pinned libraries, prebuilt on LeanWarp, such as `lean-4.35-mathlib`. |
+| Environment | The Lean toolchain and libraries a workspace uses. Plain Lean files use a ready environment with Mathlib. |
 | Workspace | Your project's files on LeanWarp. One per project; creating it starts no compute. |
 | Worker | The machine that runs Lean for a workspace. It starts on demand and stays warm. |
 | Operation | One request, such as a check or a verification, and its result. |

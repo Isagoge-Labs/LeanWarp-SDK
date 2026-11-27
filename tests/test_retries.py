@@ -320,7 +320,7 @@ def test_every_exported_exception_derives_from_the_one_root():
         for name in leanwarp_cloud.__all__
         if isinstance(value := getattr(leanwarp_cloud, name), type) and issubclass(value, Exception)
     ]
-    assert len(exported) == 10 and all(issubclass(kind, LeanWarpError) for kind in exported)
+    assert len(exported) == 11 and all(issubclass(kind, LeanWarpError) for kind in exported)
 
 
 def test_a_refused_write_carries_what_the_caller_needs(monkeypatch):
@@ -355,6 +355,41 @@ def test_a_rejected_write_says_it_is_not_retryable_and_keeps_its_key(monkeypatch
         cloud.sync_files("w", expected_revision=1, files={"A.lean": ""})
     assert raised.value.retryable is False
     assert raised.value.idempotency_key == requests[0].headers["Idempotency-Key"]
+
+
+@pytest.mark.parametrize(
+    ("steps", "resent"),
+    [
+        ([refused(422, code="unsupported_bundle")], False),
+        ([httpx.ConnectError("refused"), refused(422, code="unsupported_bundle")], False),
+        ([httpx.ConnectTimeout("slow"), refused(422, code="unsupported_bundle")], False),
+        ([httpx.ReadTimeout("lost"), refused(422, code="unsupported_bundle")], True),
+        ([httpx.PoolTimeout("busy"), refused(422, code="unsupported_bundle")], False),
+        (
+            [
+                httpx.ConnectError("refused"),
+                httpx.Response(201, headers={"Content-Encoding": "gzip"}, content=b"x"),
+            ],
+            False,
+        ),
+        ([httpx.ReadTimeout("lost"), httpx.Response(201, content=b"{")], True),
+    ],
+    ids=[
+        "first",
+        "never-connected",
+        "connect-timeout",
+        "lost-reply",
+        "no-pooled-connection",
+        "never-connected-then-compressed",
+        "lost-then-garbled",
+    ],
+)
+def test_an_error_says_whether_an_earlier_attempt_may_have_taken_effect(monkeypatch, steps, resent):
+    Clock(monkeypatch)
+    cloud, _ = scripted(steps)
+    with cloud, pytest.raises(LeanWarpCloudError) as raised:
+        cloud.create_workspace("b", idempotency_key="slot-0")
+    assert raised.value.resent is resent
 
 
 def test_reads_have_no_idempotency_key_on_their_errors(monkeypatch):

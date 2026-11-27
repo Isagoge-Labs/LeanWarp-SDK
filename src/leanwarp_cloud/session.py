@@ -18,6 +18,7 @@ from uuid import UUID, uuid4
 
 from .amounts import validate_spending_cap
 from .client import (
+    DEFAULT_CONNECT_TIMEOUT_SECONDS,
     MAX_BATCH_FILES,
     MAX_FEEDBACK_DETAILS,
     MAX_FEEDBACK_SUMMARY,
@@ -31,6 +32,7 @@ from .client import (
 )
 from .compact import summary
 from .edits import EDITING_KINDS, edited_sha256, edited_source
+from .environment import ProjectInputs, observations_match, project_inputs
 from .errors import (
     EditError,
     LeanWarpCloudError,
@@ -44,15 +46,10 @@ from .errors import (
 )
 from .outcome import BATCH_COUNTERS, OperationOutcome, judge_batch, reported
 from .project import (
-    ProjectIdentity,
-    choose_environment,
     collect_lean_sources,
-    environment_name,
+    newest_toolchain,
     plan_upload,
-    project_identity,
     project_lean_options,
-    selects,
-    validate_selection,
 )
 from .resources import published_worker_resources
 
@@ -69,8 +66,10 @@ MAX_INLINE_WAIT_SECONDS = 40
 # Longer than a healthy request, and short enough to report a stuck one.
 _LOCK_WAIT_SECONDS = 10.0
 _LOCK_POLL_SECONDS = 0.05
-#: The longest an operation runs on the service, and so the default execution timeout.
+#: Every account's operation time limit, and so the default execution timeout.
 MAX_EXECUTION_SECONDS = 600
+#: The longest limit an account may be given; the service holds each to its own.
+MAX_OPERATION_LIMIT_SECONDS = 1800
 # Starting a worker and queueing come before the execution timeout starts.
 _BLOCK_GRACE_SECONDS = 300
 # How long tearing down waits for a cancelled operation to end.
@@ -192,6 +191,7 @@ class ProjectSession:
                     "workspace_id",
                     "revision",
                     "environment",
+                    "input_observations",
                     "operation_id",
                     "operation_revision",
                 }
@@ -267,21 +267,51 @@ class ProjectSession:
         for the next command unless the service definitely refused it.
         """
         pending = state.get("pending")
-        return None if pending is None else (pending, self._replay(state))
+        if pending is None:
+            return None
+        if pending.get("method") in {"submit", "run"} and state.get("workspace_id"):
+            # Work never starts on inputs that changed since connecting; `recover`
+            # resends it deliberately.
+            self._environment(state)
+        return pending, self._replay(state)
+
+    def _inputs(self, state: Mapping[str, Any] | None = None) -> ProjectInputs:
+        """The project's environment inputs; plain files keep the toolchain chosen
+        when they connected."""
+        journal = (state or {}).get("environment")
+        if isinstance(journal, list) and len(journal) == 3:
+            connected = str(journal[2])
+            # A connected project may have deleted its last file and still sync that.
+            return project_inputs(self.root, default_toolchain=lambda: connected, allow_empty=True)
+        return project_inputs(
+            self.root,
+            default_toolchain=lambda: newest_toolchain(_toolchains(self.cloud.versions())),
+        )
 
     def _environment(self, state: dict[str, Any]) -> None:
-        identity = project_identity(self.root, allow_empty=True)
-        environment = list(identity.journal())
-        if environment == state.get("environment"):
-            return
-        if list(identity.journal(legacy=True)) != state.get("environment"):
+        """Refuse to run a project whose toolchain, lakefile, lockfile or path
+        dependencies changed since it connected: they define its environment."""
+        journal = state.get("environment")
+        if (
+            not isinstance(journal, list)
+            or len(journal) != 3
+            or not self._matches_environment(state, self._inputs(state))
+        ):
             raise SessionError(
-                "the project's toolchain or lockfile changed since it was connected; run "
-                "`leanwarp stop`, `leanwarp disconnect` and `leanwarp connect`"
+                "the project's toolchain, lakefile, lockfile or path dependencies changed "
+                "since it was connected; run `leanwarp stop`, `leanwarp disconnect` and "
+                "`leanwarp connect`"
             )
-        # Upgrade a byte-bound journal only while the original bytes still match.
-        state["environment"] = environment
-        self._save(state)
+
+    def _matches_environment(self, state: Mapping[str, Any], inputs: ProjectInputs) -> bool:
+        journal = state.get("environment")
+        if not isinstance(journal, list) or len(journal) != 3 or inputs.digest != journal[1]:
+            return False
+        observed = state.get("input_observations")
+        if observed is None:
+            # Older Lake journals did not record which helper files selected their libraries.
+            return inputs.plain
+        return observations_match(self.root, observed)
 
     def _previous_operation(self, state: Mapping[str, Any]) -> dict[str, Any] | None:
         """This project's last operation, or None once LeanWarp no longer stores it.
@@ -329,23 +359,27 @@ class ProjectSession:
         resource_profile: str | None = None,
         max_resource_profile: str | None = None,
         max_spend_microusd: int | None = None,
-        environment: str | None = None,
-        bundle_id: str | None = None,
         workspace_id: str | None = None,
         ephemeral: bool = False,
+        retry: bool = False,
+        timeout: float = DEFAULT_CONNECT_TIMEOUT_SECONDS,
+        progress: Callable[[Mapping[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
-        """Create this project's workspace once, without starting compute.
+        """Connect the project to a workspace. A new environment build uses prepaid
+        credit separately from the workspace cap. ``progress`` reports build changes.
 
-        With ``workspace_id``, connect to an existing workspace instead, such as
-        one from another machine. Its current files become this project's
-        baseline, so the next sync uploads only the files that differ; the
-        result lists them. A file only the workspace has stays there and is listed
-        under ``remote_only``. Its environment must match the project, unless
-        ``environment`` names it explicitly.
+        The project's `lean-toolchain`, lakefile, `lake-manifest.json` and path
+        dependencies define its environment: LeanWarp builds it once from them,
+        fetching pinned Git dependencies itself, and this waits until it is ready.
+        Plain Lean files outside a Lake project run on the newest supported Lean with
+        Mathlib. LeanWarp never runs Lake on this machine. ``retry`` retries a build
+        that failed once its cause is fixed.
 
-        LeanWarp picks the environment that matches the project's toolchain and
-        lockfile, or the newest one for a project that pins neither. Name an
-        environment to run a project that matches none of them.
+        With ``workspace_id``, connect to an existing workspace in the same
+        environment instead, such as one from another machine. Its current files
+        become this project's baseline, so the next sync uploads only the files that
+        differ; the result lists them. A file only the workspace has stays there and
+        is listed under ``remote_only``.
 
         A cap limits total workspace spending, including reserved credit. On an
         existing connection, an omitted cap keeps its current limit; a supplied
@@ -354,15 +388,14 @@ class ProjectSession:
         With ``ephemeral``, the new workspace is this project's alone to delete:
         ``stop(delete=True)`` then deletes it, as a CI job's last step should.
         """
-        validate_selection(environment, bundle_id)
         try:
             validate_spending_cap(max_spend_microusd)
         except ValueError as error:
             raise UsageError(str(error)) from error
         if workspace_id is not None and (
-            resource_profile is not None or max_resource_profile is not None or bundle_id
+            resource_profile is not None or max_resource_profile is not None
         ):
-            raise UsageError("an existing workspace keeps its own environment and worker size")
+            raise UsageError("an existing workspace keeps its own worker size")
         if workspace_id is not None and ephemeral:
             raise UsageError("only a workspace this project creates can be ephemeral")
         with self._locked() as state:
@@ -380,31 +413,22 @@ class ProjectSession:
             if state.get("workspace_id"):
                 self._environment(state)
                 workspace = self.cloud.workspace(self._workspace(state))
-                if bundle_id is not None:
-                    choose_environment(
-                        project_identity(self.root, allow_empty=True),
-                        self.cloud.versions()["versions"],
-                        bundle_id=bundle_id,
-                    )
-                if not selects(workspace, environment or bundle_id):
-                    raise SessionError(
-                        f"this project is connected to {environment_name(workspace)}; run "
-                        "`leanwarp stop` and `leanwarp disconnect` before choosing another "
-                        "environment"
-                    )
                 _check_cap(workspace, max_spend_microusd)
                 return workspace
-            identity = project_identity(self.root)
+            environment = self._ready_environment(retry=retry, timeout=timeout, progress=progress)
             # Nothing is connected or being created, so any earlier mark is stale.
             self.ephemeral.unlink(missing_ok=True)
+            journal = [
+                environment["environment_id"],
+                environment["inputs_sha256"],
+                environment["lean_toolchain"],
+            ]
+            state["input_observations"] = environment["input_observations"]
             if workspace_id is not None:
-                return self._attach(state, identity, workspace_id, environment, max_spend_microusd)
-            choice = choose_environment(
-                identity, self.cloud.versions()["versions"], environment, bundle_id=bundle_id
-            )
-            state["environment"] = list(identity.journal())
+                return self._attach(state, journal, workspace_id, max_spend_microusd)
+            state["environment"] = journal
             arguments: dict[str, Any] = {
-                "bundle_id": choice.build["bundle_id"],
+                "environment_id": environment["environment_id"],
                 "max_spend_microusd": max_spend_microusd,
             }
             if resource_profile is not None:
@@ -416,51 +440,38 @@ class ProjectSession:
                 # Before the request, so that a lost response still leaves it deletable.
                 self._mark_ephemeral({"create": key})
             workspace = self._request(state, "create_workspace", arguments, idempotency_key=key)
-            return {**workspace, "environment_choice": choice.public()}
+            return {**workspace, "environment": _environment_report(environment)}
+
+    def _ready_environment(
+        self,
+        *,
+        retry: bool,
+        timeout: float,
+        progress: Callable[[Mapping[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        return self.cloud.connect_environment(
+            self.root, timeout=timeout, progress=progress, retry=retry
+        )
 
     def _attach(
         self,
         state: dict[str, Any],
-        identity: ProjectIdentity,
+        journal: list[Any],
         workspace_id: str,
-        environment: str | None,
         max_spend_microusd: int | None,
     ) -> dict[str, Any]:
         workspace = self.cloud.workspace(workspace_id)
         if workspace.get("workspace_id") != workspace_id:
             raise SessionError("LeanWarp returned a different workspace; try again")
         _check_cap(workspace, max_spend_microusd)
-        build = next(
-            (
-                build
-                for build in self.cloud.versions()["versions"]
-                if selects(build, str(workspace.get("bundle_id", "")))
-            ),
-            None,
-        )
-        if build is None:
+        if workspace.get("environment_id") != journal[0]:
             raise SessionError(
-                f"workspace {workspace_id} runs {environment_name(workspace)}, which LeanWarp "
-                "no longer serves; run `leanwarp connect` without a workspace to create one"
-            )
-        if environment is not None and not selects(workspace, environment):
-            raise SessionError(
-                f"workspace {workspace_id} runs {environment_name(workspace)}, not {environment}"
-            )
-        if environment is None and not identity.matches(build):
-            raise SessionError(
-                f"workspace {workspace_id} runs {environment_name(build)}, which does not match "
-                "this project's toolchain or lockfile; to use it anyway, pass "
-                f"`--environment {environment_name(build)}`"
+                f"workspace {workspace_id} runs another environment than this project's; "
+                "run `leanwarp connect` without a workspace to create one"
             )
         revision, remote = self._manifest(workspace_id)
         files, changes = self._baseline(remote, tracked=())
-        state.update(
-            workspace_id=workspace_id,
-            revision=revision,
-            files=files,
-            environment=list(identity.journal()),
-        )
+        state.update(workspace_id=workspace_id, revision=revision, files=files, environment=journal)
         self._save(state)
         return {**workspace, "connected_existing": True, **changes}
 
@@ -597,16 +608,15 @@ class ProjectSession:
                 "disconnected": workspace_id == connected,
             }
 
-    def doctor(self, *, environment: str | None = None) -> dict[str, Any]:
-        """Report the saved connection or a proposed choice without writes or compute."""
+    def doctor(self) -> dict[str, Any]:
+        """Report the saved connection and the project's inputs without writes or compute."""
         if self.directory.is_symlink():
             raise SessionError(".leanwarp must be a directory, not a symlink")
         state = self._read()
-        catalog = self.cloud.versions()["versions"]
+        versions = self.cloud.versions()
         resources = self.cloud.resources()
         report: dict[str, Any] = {
-            "environments": _environment_names(catalog),
-            "matching_bundles": [],
+            "toolchains": _toolchains(versions),
             **published_worker_resources(resources),
             "base_url": self.cloud.base_url,
             "connected": bool(state.get("workspace_id")),
@@ -616,58 +626,37 @@ class ProjectSession:
             return {
                 **report,
                 "compatible": False,
-                "message": "run `leanwarp recover` before choosing an environment",
+                "message": "run `leanwarp recover` before connecting",
             }
-        identity = project_identity(self.root, allow_empty=bool(state.get("workspace_id")))
-        report.update(_project_report(self.root, identity, catalog))
-        if state.get("workspace_id"):
-            owner = self.cloud.owner_id()
-            if not isinstance(owner, str) or not owner or owner != state.get("owner_id", owner):
-                raise SessionError(
-                    "this project belongs to another account; restore its credentials"
-                )
-            workspace = self.cloud.workspace(self._workspace(state))
-            build = next(
-                (build for build in catalog if selects(build, str(workspace.get("bundle_id", "")))),
-                None,
-            )
-            if build is None:
-                return {
-                    **report,
-                    "compatible": False,
-                    "environment": environment_name(workspace),
-                    "message": (
-                        "the connected environment is no longer served; "
-                        "stop and disconnect before reconnecting"
-                    ),
-                }
-            choice = {
-                "environment": environment_name(build),
-                "lean_toolchain": build["lean_toolchain"],
-                "match": "connected",
-                "matches_project": identity.matches(build),
+        try:
+            inputs = self._inputs(state if state.get("workspace_id") else None)
+        except ProjectError as error:
+            return {**report, "compatible": False, "message": str(error)}
+        report.update(_project_report(self.root, inputs, versions))
+        if not state.get("workspace_id"):
+            return report
+        owner = self.cloud.owner_id()
+        if not isinstance(owner, str) or not owner or owner != state.get("owner_id", owner):
+            raise SessionError("this project belongs to another account; restore its credentials")
+        try:
+            matches = self._matches_environment(state, inputs)
+        except ProjectError as error:
+            return {**report, "compatible": False, "message": str(error)}
+        if not matches:
+            return {
+                **report,
+                "compatible": False,
+                "message": (
+                    "the project's toolchain, lakefile, lockfile or path dependencies "
+                    "changed; stop, disconnect and reconnect"
+                ),
             }
-            if list(identity.journal()) != state.get("environment") and list(
-                identity.journal(legacy=True)
-            ) != state.get("environment"):
-                return {
-                    **report,
-                    "compatible": False,
-                    "environment": choice,
-                    "message": (
-                        "the project's toolchain or lockfile changed; "
-                        "stop, disconnect and reconnect"
-                    ),
-                }
-            if not selects(workspace, environment):
-                return {
-                    **report,
-                    "compatible": False,
-                    "environment": choice,
-                    "message": "stop and disconnect before choosing another environment",
-                }
-            return {**report, "compatible": True, "environment": choice}
-        return {**report, **_choice_report(identity, catalog, environment)}
+        environment = self.cloud.environment(str(state["environment"][0]))
+        return {
+            **report,
+            "compatible": environment.get("state") == "ready",
+            "environment": _environment_report(environment),
+        }
 
     def sync(self) -> dict[str, Any]:
         with self._locked() as state:
@@ -715,10 +704,12 @@ class ProjectSession:
         if retention is not None and retention not in RETENTIONS:
             raise UsageError('retention must be "standard" or "short"')
         if timeout_seconds is not None and (
-            type(timeout_seconds) is not int or not 1 <= timeout_seconds <= 600
+            type(timeout_seconds) is not int
+            or not 1 <= timeout_seconds <= MAX_OPERATION_LIMIT_SECONDS
         ):
             raise UsageError(
-                "the execution timeout must be a whole number of seconds from 1 to 600"
+                "the execution timeout must be a whole number of seconds from 1 to "
+                f"{MAX_OPERATION_LIMIT_SECONDS}"
             )
         try:
             json.dumps(dict(payload), allow_nan=False)
@@ -846,7 +837,7 @@ class ProjectSession:
         self._save(state)
         return self._replay(state)
 
-    def _replay(self, state: dict[str, Any]) -> dict[str, Any]:
+    def _replay(self, state: dict[str, Any], *, deliberate: bool = False) -> dict[str, Any]:
         pending = state["pending"]
         if (
             not isinstance(pending, dict)
@@ -870,9 +861,17 @@ class ProjectSession:
                     idempotency_key=pending["idempotency_key"],
                 )
             else:
-                result = getattr(self.cloud, method)(
-                    **pending["arguments"], idempotency_key=pending["idempotency_key"]
+                # Work never starts on inputs that changed since connecting, not even
+                # through a resend within this command; `recover` resends deliberately.
+                check = (
+                    (lambda: self._environment(state))
+                    if method in {"submit", "run"} and not deliberate
+                    else (lambda: None)
                 )
+                with self.cloud.resends_checked(check):
+                    result = getattr(self.cloud, method)(
+                        **pending["arguments"], idempotency_key=pending["idempotency_key"]
+                    )
         except LeanWarpCloudError as error:
             # Definite rejection has no accepted effect. Auth/transient/ambiguous
             # errors keep the intent recoverable, including a rotated key later.
@@ -1016,7 +1015,7 @@ class ProjectSession:
         with self._locked() as state:
             if state.get("pending") is None:
                 return self._status(state)
-            return self._replay(state)
+            return self._replay(state, deliberate=True)
 
     def _status(self, state: dict[str, Any], operation_id: str | None = None) -> dict[str, Any]:
         workspace = self._workspace(state)
@@ -1593,51 +1592,60 @@ class ProjectSession:
             }
 
 
-def check_project(
-    root: str | Path, catalog: list[dict[str, Any]], environment: str | None = None
-) -> dict[str, Any]:
+def check_project(root: str | Path, versions: Mapping[str, Any]) -> dict[str, Any]:
     """Whether a project runs on LeanWarp, before signing up: no key, writes or compute.
 
-    ``catalog`` is the public environment list, from ``LeanWarpCloud(None).versions()``.
+    ``versions`` is the public toolchain list, from ``LeanWarpCloud(None).versions()``.
     """
-    identity = project_identity(root)
-    return {
-        "environments": _environment_names(catalog),
-        **_project_report(Path(root), identity, catalog),
-        **_choice_report(identity, catalog, environment),
-    }
+    try:
+        inputs = project_inputs(
+            root, default_toolchain=lambda: newest_toolchain(_toolchains(versions))
+        )
+    except ProjectError as error:
+        return {"toolchains": _toolchains(versions), "compatible": False, "message": str(error)}
+    return {"toolchains": _toolchains(versions), **_project_report(Path(root), inputs, versions)}
 
 
-def _environment_names(catalog: list[dict[str, Any]]) -> list[str]:
-    return sorted({environment_name(build) for build in catalog})
+def _toolchains(versions: Mapping[str, Any]) -> list[str]:
+    return sorted(
+        str(item["lean_toolchain"])
+        for item in versions.get("toolchains", [])
+        if isinstance(item, Mapping) and isinstance(item.get("lean_toolchain"), str)
+    )
 
 
 def _project_report(
-    root: Path, identity: ProjectIdentity, catalog: list[dict[str, Any]]
+    root: Path, inputs: ProjectInputs, versions: Mapping[str, Any]
 ) -> dict[str, Any]:
     upload = plan_upload(root)
-    return {
-        "matching_bundles": [build for build in catalog if identity.matches(build)],
+    toolchain = str(inputs.request["lean_toolchain"])
+    supported = toolchain in _toolchains(versions)
+    report: dict[str, Any] = {
         "project": {
-            "lean_toolchain": identity.toolchain,
-            "lockfile": identity.manifest_sha256 is not None,
+            "lean_toolchain": toolchain,
+            "lake_project": not inputs.plain,
+            "path_dependencies": len(inputs.request.get("path_trees", [])),
         },
         "upload": {
             "file_count": len(upload.sizes),
             "total_bytes": upload.total_bytes,
             "problems": list(upload.problems),
         },
+        "compatible": supported,
     }
+    if not supported:
+        report["message"] = (
+            f"LeanWarp does not support {toolchain} yet; `leanwarp versions` lists the "
+            "supported toolchains"
+        )
+    return report
 
 
-def _choice_report(
-    identity: ProjectIdentity, catalog: list[dict[str, Any]], environment: str | None
-) -> dict[str, Any]:
-    try:
-        selected = choose_environment(identity, catalog, environment)
-    except ProjectError as error:
-        return {"compatible": False, "message": str(error)}
-    return {"compatible": True, "environment": selected.public()}
+def _environment_report(environment: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        key: environment.get(key)
+        for key in ("environment_id", "state", "lean_toolchain", "dependencies", "error")
+    }
 
 
 # A batch's counts, which partition its files.
@@ -1710,11 +1718,25 @@ def _validate_journal(state: dict[str, Any]) -> None:
         )
 
     valid = text(state.get("owner_id")) and hashes(state.get("files"))
+    if "input_observations" in state:
+        observed = state["input_observations"]
+        valid = (
+            valid
+            and isinstance(observed, dict)
+            and all(
+                isinstance(path, str)
+                and isinstance(digest, str)
+                and re.fullmatch(r"(?:git:)?[0-9a-f]{64}", digest)
+                for path, digest in observed.items()
+            )
+        )
     environment = state.get("environment")
     valid = (
         valid
         and isinstance(environment, list)
-        and len(environment) == 2
+        # [environment, inputs digest, toolchain]; a journal from before project
+        # environments has two entries and must reconnect.
+        and len(environment) in (2, 3)
         and all(map(text, environment))
     )
     if "workspace_id" in state:
@@ -1740,14 +1762,20 @@ def _validate_journal(state: dict[str, Any]) -> None:
                 and all(c in "0123456789abcdef" for c in key)
             )
         if valid and method == "create_workspace":
+            selection = "bundle_id" if len(state["environment"]) == 2 else "environment_id"
             valid = (
-                "bundle_id" in args
+                selection in args
                 and set(args).issubset(
-                    {"bundle_id", "resource_profile", "max_resource_profile", "max_spend_microusd"}
+                    {
+                        selection,
+                        "resource_profile",
+                        "max_resource_profile",
+                        "max_spend_microusd",
+                    }
                 )
                 and all(
                     text(args[k])
-                    for k in ("bundle_id", "resource_profile", "max_resource_profile")
+                    for k in (selection, "resource_profile", "max_resource_profile")
                     if k in args
                 )
                 and (
@@ -1760,6 +1788,12 @@ def _validate_journal(state: dict[str, Any]) -> None:
                 and "workspace_id" not in state
                 and pending["hashes"] is None
             )
+            if valid and selection == "bundle_id":
+                raise SessionError(
+                    "this project has an unfinished workspace creation from an older SDK. "
+                    "Keep .leanwarp/session.json and check your workspaces in the dashboard "
+                    "before reconnecting. Contact support if its outcome is unclear."
+                )
         elif valid:
             valid = (
                 args.get("workspace_id") == state.get("workspace_id")
@@ -1803,7 +1837,7 @@ def _validate_journal(state: dict[str, Any]) -> None:
                         "timeout_seconds" not in args
                         or (
                             type(args["timeout_seconds"]) is int
-                            and 1 <= args["timeout_seconds"] <= 600
+                            and 1 <= args["timeout_seconds"] <= MAX_OPERATION_LIMIT_SECONDS
                         )
                     )
                     and (

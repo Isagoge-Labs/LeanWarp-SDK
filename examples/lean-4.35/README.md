@@ -1,8 +1,10 @@
 # Lean 4.35 example
 
-A small Lean project whose toolchain and lockfile match LeanWarp's
-`lean-4.35-mathlib` environment. Run `leanwarp environments` to check that
-LeanWarp serves it. From this directory, after `leanwarp auth login`:
+This Lake project pins Lean 4.35 and Mathlib. Run `leanwarp versions` to see
+the hosted toolchains. A first-time environment build uses prepaid credit when
+project builds are available. To try the example without a build, copy only
+`LeanWarpExample.lean` into a new folder outside any Lake project. From your
+chosen folder, after `leanwarp auth login`:
 
 ```sh
 leanwarp doctor

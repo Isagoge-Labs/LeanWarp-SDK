@@ -49,7 +49,7 @@ def test_parallel_tool_calls_take_turns_instead_of_failing(served):
         calls = [
             server.call_tool("check", {"file": "Main.lean"}),
             server.call_tool("status", {}),
-            server.call_tool("files", {}),
+            server.call_tool("files", {"dependencies": True}),
             server.call_tool("status", {}),
         ]
         results = await asyncio.gather(*calls, return_exceptions=True)
@@ -61,6 +61,8 @@ def test_parallel_tool_calls_take_turns_instead_of_failing(served):
     results = asyncio.run(together())
     failures = [result for result in results if isinstance(result, BaseException)]
     assert failures == []
+    # A project without path dependencies sends none of their files.
+    assert json.loads(results[2][0][0].text)["dependencies"] == []
 
 
 OPERATION_TOOLS = {
@@ -74,6 +76,7 @@ OPERATION_TOOLS = {
     },
     "suggest": {"file": "Main.lean", "line": 1, "column": 30},
     "holes": {"file": "Main.lean"},
+    "proof_states": {"file": "Main.lean"},
     "extract_decls": {"file": "Main.lean"},
     "sorry2lemma": {"file": "Main.lean"},
     "have2lemma": {"file": "Main.lean"},

@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -130,7 +131,7 @@ def test_cli_installed_project_workflow_and_skill(tmp_path):
         assert "name: leanwarp" in command("skill")
         diagnosis = json.loads(command("doctor"))
         assert diagnosis["compatible"] is True
-        assert diagnosis["matching_bundles"]
+        assert diagnosis["project"]["lean_toolchain"] in diagnosis["toolchains"]
         assert diagnosis["worker"] == {"usage_based": False}
         assert "resources" not in diagnosis and "default_resource_profile" not in diagnosis
         assert diagnosis["base_url"] == origin
@@ -142,18 +143,15 @@ def test_cli_installed_project_workflow_and_skill(tmp_path):
         }
         upload = json.loads(command("files"))
         assert [file["path"] for file in upload["files"]] == ["Main.lean"]
-        assert (
-            json.loads(command("connect", "--bundle", "b", "--max-spend", "2.000001"))[
-                "workspace_id"
-            ]
-            == "w"
+        assert json.loads(command("connect", "--max-spend", "2.000001"))["workspace_id"] == "w"
+        creation = next(
+            r for r in service.requests if r.method == "POST" and r.url.path.endswith("/workspaces")
         )
-        creation = next(r for r in service.requests if r.method == "POST")
         assert json.loads(creation.content)["max_spend_microusd"] == 2_000_001
         assert json.loads(command("connect"))["max_spend_microusd"] == 2_000_001
         mismatch = json.loads(command("connect", "--max-spend", "3", expected=2))
         assert "different spending cap" in mismatch["message"]
-        assert json.loads(command("versions"))["versions"]
+        assert json.loads(command("versions"))["toolchains"]
         assert json.loads(command("resources")) == {"worker": {"usage_based": False}}
         assert json.loads(command("sync"))["revision"] == 1
         first = json.loads(command("check", "Main.lean", expected=1))
@@ -241,7 +239,13 @@ def test_mcp_stdio_uses_same_project_session_without_key_arguments(tmp_path):
                 assert json.loads(resources.content[0].text) == {"worker": {"usage_based": False}}
                 connected = await client.call_tool("connect", {"max_spend_microusd": 2_000_001})
                 assert not connected.isError, connected
-                body = json.loads(next(r.content for r in service.requests if r.method == "POST"))
+                body = json.loads(
+                    next(
+                        r.content
+                        for r in service.requests
+                        if r.method == "POST" and r.url.path.endswith("/workspaces")
+                    )
+                )
                 assert body["max_spend_microusd"] == 2_000_001
                 conflict = await client.call_tool("connect", {"max_spend_microusd": 3_000_000})
                 assert conflict.isError
@@ -543,7 +547,7 @@ def test_doctor_checks_a_project_against_the_public_catalog_before_sign_in(
     assert cli.main(["--project", str(tmp_path), "doctor"]) == 0
     report = json.loads(capsys.readouterr().out)
     assert report["compatible"] is True and report["signed_in"] is False
-    assert report["environment"]["match"] == "exact"
+    assert report["project"]["lean_toolchain"] in report["toolchains"]
     assert "auth login" in report["next"]
     (request,) = service.requests
     assert request.url == "https://public.example/v1/leanwarp/versions"
@@ -551,7 +555,7 @@ def test_doctor_checks_a_project_against_the_public_catalog_before_sign_in(
     assert not (tmp_path / ".leanwarp").exists()
     (tmp_path / "lean-toolchain").write_text("leanprover/lean4:v4.99.0\n")
     assert cli.main(["--project", str(tmp_path), "doctor"]) == 1
-    assert "No LeanWarp environment matches" in json.loads(capsys.readouterr().out)["message"]
+    assert "does not support" in json.loads(capsys.readouterr().out)["message"]
 
 
 def _batch(status: str, entries: list[str]) -> dict[str, Any]:
@@ -596,6 +600,9 @@ def _completed(kind: str, result: dict[str, Any]) -> OperationOutcome:
         # Listing a file that does not compile yet still lists it.
         ("holes", {"status": "error", "holes": []}, True),
         ("holes", {"status": "error"}, False),
+        ("proof_states", {"status": "error", "rows": []}, True),
+        # An environment that cannot list them gave no answer.
+        ("proof_states", {"status": "unsupported", "file": "Main.lean"}, False),
         ("extract_decls", {"status": "ok", "declarations": []}, True),
         ("extract_decls", {"status": "error", "declarations": []}, True),
         ("extract_decls", {"status": "timeout", "declarations": []}, False),
@@ -676,9 +683,9 @@ PROOFS = [
         (
             ["simplify-proofs", "Main.lean", "--tactic", "simp", "--min-saving", "4"],
             "simplify_proofs",
+            # Without --tactic-timeout, each tactic keeps its own budget.
             {
                 "file": "Main.lean",
-                "timeout_ms": 10_000,
                 "max_simplifications": 16,
                 "min_reduction_bytes": 4,
                 "tactics": ["simp"],
@@ -1098,3 +1105,88 @@ def test_a_result_without_its_kinds_fields_is_undecided(kind: str, result: dict[
 
     judgement = judge_result(kind, result)
     assert (judgement.success, judgement.decided, judgement.exit_code) == (False, False, 4)
+
+
+def test_mcp_connect_returns_while_the_build_goes_on_answering(tmp_path, monkeypatch):
+    from leanwarp_cloud import client as client_module
+    from leanwarp_cloud import mcp_server
+    from leanwarp_cloud.mcp_server import create_server
+
+    from .test_environment_compatibility import api, lake_project
+
+    project = lake_project(tmp_path)
+    (project / ".leanwarpread").write_text("..\n")
+    (tmp_path / "config.json").write_text("{}")
+    # A host that stops waiting long before the build ends; polls come quickly.
+    monkeypatch.setattr(mcp_server, "CONNECT_WAIT_SECONDS", 0.5)
+    sleep = client_module.time.sleep
+    monkeypatch.setattr(client_module.time, "sleep", lambda seconds: sleep(min(seconds, 0.02)))
+    with api() as (service, cloud):
+        ready = service.environment
+        asking = {**ready, "state": "building", "phase": "compiling",
+                  "input_requests": ["../config.json"], "input_token": "c" * 64}  # fmt: skip
+        answered: list[dict] = []
+
+        def handle(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/inputs"):
+                answered.append(json.loads(request.content))
+                service.environment = {**asking, "input_requests": []}
+                return httpx.Response(202, json=service.environment)
+            return service.handle(request)
+
+        service.environment = asking
+        cloud._client._transport = httpx.MockTransport(handle)
+        server = create_server(cloud, str(project))
+
+        async def call(tool: str, arguments: dict | None = None) -> dict:
+            result = await asyncio.wait_for(server.call_tool(tool, arguments or {}), timeout=10)
+            return json.loads(result[0][0].text) if isinstance(result, tuple) else result
+
+        async def exercise() -> None:
+            # The limit runs from the call's start, a slow thread start included.
+            start = mcp_server.threading.Thread.start
+
+            def slow(thread: Any) -> None:
+                sleep(0.5)
+                start(thread)
+
+            monkeypatch.setattr(mcp_server.threading.Thread, "start", slow)
+            begun = time.monotonic()
+            first = await call("connect")
+            assert time.monotonic() - begun < 0.85
+            monkeypatch.setattr(mcp_server.threading.Thread, "start", start)
+            assert first["state"] == "building"
+            # The build's read is still answered after the call returned.
+            for _ in range(200):
+                if answered:
+                    break
+                await asyncio.sleep(0.02)
+            assert answered and answered[0]["answers"]["../config.json"]["kind"] == "file"
+            assert (await call("doctor"))["connect"]["phase"] == "compiling"
+            # A call asking for something else is refused while one connect runs, a
+            # zero cap included.
+            for other in ({"workspace_id": "other"}, {"max_spend_microusd": 0}):
+                with pytest.raises(Exception, match="in progress"):
+                    await call("connect", other)
+            # Waiting holds no worker thread: many callers each return within the limit.
+            begun = time.monotonic()
+            waited = await asyncio.gather(*(call("connect") for _ in range(45)))
+            assert all(item["state"] == "building" for item in waited)
+            assert time.monotonic() - begun < 0.9
+            # A caller cancelled while it waits claims nothing.
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(server.call_tool("connect", {}), timeout=0.1)
+            # Two calls join the same exchange while it runs; when it finishes, its
+            # outcome is reported to exactly one of them.
+
+            async def ready_soon() -> None:
+                await asyncio.sleep(0.1)
+                service.environment = ready
+
+            first, second, _ = await asyncio.gather(call("connect"), call("connect"), ready_soon())
+            outcomes = sorted([first, second], key=lambda item: "workspace_id" not in item)
+            assert outcomes[0]["workspace_id"] == "w"
+            assert outcomes[1]["state"] == "reported"
+
+        asyncio.run(exercise())
+    assert service.workspace_count == 1

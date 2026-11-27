@@ -54,7 +54,13 @@ class LeanWarpError(Exception):
 
 
 class LeanWarpCloudError(LeanWarpError):
-    """The service refused the request, or sent a response the SDK could not trust."""
+    """The service refused the request, or sent a response the SDK could not trust.
+
+    ``resent`` says an earlier attempt of the same request was sent, so that
+    attempt may have taken effect even though this answer refuses it.
+    """
+
+    resent = False
 
     def __init__(
         self,
@@ -64,6 +70,7 @@ class LeanWarpCloudError(LeanWarpError):
         *,
         retry_after: float | None = None,
         idempotency_key: str | None = None,
+        paths: tuple[str, ...] = (),
     ) -> None:
         super().__init__(
             message,
@@ -73,6 +80,8 @@ class LeanWarpCloudError(LeanWarpError):
             retry_after=retry_after,
             idempotency_key=idempotency_key,
         )
+        # The paths an `inputs_required` refusal asks the project's files about.
+        self.paths = paths
 
     @property
     def status_code(self) -> int:
@@ -92,6 +101,18 @@ class LeanWarpTransportError(LeanWarpError):
         self.timed_out = timed_out
 
 
+class ConnectTimeout(LeanWarpError, TimeoutError):
+    """The local connect deadline expired. An accepted environment build continues."""
+
+    default_code = "connect_timeout"
+
+    def __init__(self) -> None:
+        super().__init__(
+            "connect timed out; run connect again in the same project to rejoin any ongoing build",
+            retryable=True,
+        )
+
+
 class OperationTimeout(LeanWarpError, TimeoutError):
     """Waiting expired; the operation remains addressable and may still be running."""
 
@@ -108,6 +129,30 @@ class OperationTimeout(LeanWarpError, TimeoutError):
 
 class SessionError(LeanWarpError):
     """Local recovery or project reconciliation is required before another write."""
+
+
+class EnvironmentBuildError(LeanWarpError):
+    """The project's environment failed or was cancelled; ``environment`` says why,
+    with the logical file or package and the action to take."""
+
+    def __init__(self, environment: dict[str, Any]) -> None:
+        error = environment.get("error")
+        error = error if isinstance(error, dict) else {}
+        detail = ", ".join(f"{key} {error[key]}" for key in ("package", "file") if error.get(key))
+        # The service explains each failure and what to do about it, as the dashboard shows.
+        message = error.get("message")
+        explanation = f". {message}" if isinstance(message, str) and message else ""
+        if environment.get("phase") == "retiring":
+            explanation += " Cleanup is in progress; retry after it finishes."
+        elif not explanation:
+            explanation = "; fix the cause, then run `leanwarp connect --retry`"
+        super().__init__(
+            f"the environment is {environment.get('state')}"
+            + (f": {error['code']}" if error.get("code") else "")
+            + (f" ({detail})" if detail else "")
+            + explanation
+        )
+        self.environment = environment
 
 
 class UsageError(LeanWarpError, ValueError):

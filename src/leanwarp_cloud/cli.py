@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import getpass
 import json
 import sys
+from collections.abc import Mapping
 from importlib.resources import files
 from pathlib import Path
 from typing import Any, NoReturn, get_args
@@ -13,7 +15,13 @@ from typing import Any, NoReturn, get_args
 from . import __version__
 from .agents import AGENTS, setup
 from .amounts import usd_spending_cap
-from .client import MAX_BATCH_PROOFS, FeedbackKind, FeedbackSeverity, LeanWarpCloud
+from .client import (
+    DEFAULT_CONNECT_TIMEOUT_SECONDS,
+    MAX_BATCH_PROOFS,
+    FeedbackKind,
+    FeedbackSeverity,
+    LeanWarpCloud,
+)
 from .config import (
     credentials_path,
     feedback_enabled,
@@ -21,7 +29,9 @@ from .config import (
     save_credentials,
     signed_in,
 )
+from .environment import dependency_files
 from .errors import (
+    ConnectTimeout,
     LeanWarpCloudError,
     LeanWarpError,
     LeanWarpTransportError,
@@ -57,7 +67,7 @@ _EPILOG = f"""\
 a typical session:
   leanwarp doctor            show which environment this project runs on
   leanwarp files             list the Lean files that would upload
-  leanwarp connect           create the project's workspace (no compute yet)
+  leanwarp connect           connect the project (a new environment build uses credit)
   leanwarp check Main.lean   compile a file and report Lean errors
   leanwarp verify Main.lean --declaration NAME --target 'STATEMENT'
   leanwarp stop              stop the worker when you are done
@@ -77,7 +87,8 @@ exit codes:
   1  the check or proof did not pass (Lean's errors or a rejection), the project
      has no environment, or `files` found a file that cannot upload
   2  the command could not run (see "message")
-  3  still running: run `leanwarp wait`, never submit it again
+  3  wait expired: rerun connect to start or rejoin a build; for an operation run
+     `leanwarp wait`, never submit it again
   4  no verdict: the work timed out or could not be completed; retry it
 
 in CI:
@@ -86,6 +97,17 @@ in CI:
   leanwarp stop --delete           always, last: leaves nothing behind
 
 AI agents: run `leanwarp skill` for the full workflow."""
+
+
+def _build_progress(environment: Mapping[str, Any]) -> None:
+    """One line on stderr per change in the build connect waits on; stdout keeps
+    the one JSON result."""
+    phase = environment.get("phase") or "queued"
+    asked = len(environment.get("input_requests") or ())
+    reads = f"; reading {asked} file(s) outside the project from this machine" if asked else ""
+    # A note for the person watching: a terminal that cannot take it changes nothing.
+    with contextlib.suppress(OSError, ValueError):
+        sys.stderr.write(f"leanwarp: building this project's environment ({phase}){reads}\n")
 
 
 _BLOCK_HELP = (
@@ -145,28 +167,38 @@ def parser() -> argparse.ArgumentParser:
         "logout", help="forget the saved key on this machine (revoke it in the dashboard)"
     )
 
-    environment_help = (
-        "an environment from `leanwarp environments`; use it even if the project pins "
-        "another toolchain or lockfile"
-    )
-    doctor = commands.add_parser(
-        "doctor", help="show which environment this project runs on (no compute)"
-    )
-    doctor.add_argument("--environment", metavar="NAME", help=environment_help)
     commands.add_parser(
+        "doctor",
+        help="show the project's toolchain, environment and whether it runs (no compute)",
+    )
+    files_command = commands.add_parser(
         "files",
         help=(
             "list the Lean files that would upload, with sizes and problems; .gitignore and "
             ".leanwarpignore exclude files (no key needed)"
         ),
     )
+    files_command.add_argument(
+        "--dependencies",
+        action="store_true",
+        help="also list the path-dependency files connect sends, with sizes",
+    )
 
     connect = commands.add_parser(
-        "connect", help="create this project's workspace (no compute until the first operation)"
+        "connect", help="connect this project; building a new environment uses credit"
     )
-    selection = connect.add_mutually_exclusive_group()
-    selection.add_argument("--environment", metavar="NAME", help=environment_help)
-    selection.add_argument("--bundle", help=argparse.SUPPRESS)
+    connect.add_argument(
+        "--retry",
+        action="store_true",
+        help="build the project's environment again after a failure you have fixed",
+    )
+    connect.add_argument(
+        "--timeout",
+        metavar="SECONDS",
+        type=int,
+        default=DEFAULT_CONNECT_TIMEOUT_SECONDS,
+        help="local wait in seconds (default: %(default)s); expiry leaves a build running",
+    )
     connect.add_argument(
         "--workspace",
         metavar="ID",
@@ -278,6 +310,18 @@ def parser() -> argparse.ArgumentParser:
     holes.add_argument("file", metavar="FILE", help="a .lean file in the project")
     holes.add_argument("--no-goals", action="store_true", help="list positions only (faster)")
 
+    states = commands.add_parser(
+        "proof-states",
+        help="list every tactic in a file with its goals before and after, one page at a time",
+    )
+    states.add_argument("file", metavar="FILE", help="a .lean file in the project")
+    states.add_argument(
+        "--cursor", type=int, default=0, help="the page's first tactic: a page's next_cursor"
+    )
+    states.add_argument(
+        "--max-bytes", type=int, help="bound the page (4096 to 524288; default 262144)"
+    )
+
     declarations = commands.add_parser(
         "declarations", help="list the declarations a file adds, with types and dependencies"
     )
@@ -335,9 +379,8 @@ def parser() -> argparse.ArgumentParser:
         rewrite.add_argument(
             "--tactic-timeout",
             type=int,
-            default=10_000,
             metavar="MS",
-            help="milliseconds per attempt, 1 to 60000 (default 10000)",
+            help="milliseconds per attempt, 1 to 60000; each tactic's own budget by default",
         )
         rewrite.add_argument(
             "--max", type=int, default=16, metavar="N", help=f"at most this many {noun}, 1 to 256"
@@ -365,7 +408,7 @@ def parser() -> argparse.ArgumentParser:
         "--file-timeout",
         type=int,
         metavar="SECONDS",
-        help="Lean time per file, 1 to 210 (default 60)",
+        help="Lean time per file, 1 to 300 (default 60)",
     )
 
     proofs = commands.add_parser(
@@ -386,7 +429,7 @@ def parser() -> argparse.ArgumentParser:
         "--proof-timeout",
         type=int,
         metavar="SECONDS",
-        help="Lean time per proof, 1 to 210 (default 60)",
+        help="Lean time per proof, 1 to 300 (default 60)",
     )
 
     commands.add_parser(
@@ -402,6 +445,7 @@ def parser() -> argparse.ArgumentParser:
         verify,
         suggest,
         holes,
+        states,
         declarations,
         obligations,
         lifts,
@@ -425,7 +469,10 @@ def parser() -> argparse.ArgumentParser:
             "--execution-timeout",
             type=int,
             metavar="SECONDS",
-            help="stop the operation on the server after this long, 1 to 600",
+            help=(
+                "stop the operation on the server after this long, 1 to 600 "
+                "(or up to your account's own limit)"
+            ),
         )
 
     for operation in (check, inspect, tactics):
@@ -507,8 +554,9 @@ def parser() -> argparse.ArgumentParser:
     )
     commands.add_parser("account", help="show your credit balance")
     commands.add_parser(
-        "environments", aliases=["versions"], help="list the Lean environments LeanWarp serves"
+        "environments", help="list this account's environments and their build status"
     )
+    commands.add_parser("versions", help="list the Lean toolchains LeanWarp supports")
     commands.add_parser("resources", help="show worker resources and pricing")
     report = commands.add_parser(
         "feedback",
@@ -594,17 +642,17 @@ def _exit_code(operation: dict[str, Any]) -> int:
     return OperationOutcome(operation).judgement.exit_code
 
 
-def _doctor(cloud: LeanWarpCloud, root: str, environment: str | None) -> int:
-    report = ProjectSession(cloud, root).doctor(environment=environment)
+def _doctor(cloud: LeanWarpCloud, root: str) -> int:
+    report = ProjectSession(cloud, root).doctor()
     _emit(report)
     return 0 if report["compatible"] else 1
 
 
-def _check_before_sign_in(root: str, environment: str | None) -> int:
-    """Check a project against the public catalog, so it is known to run before signing up."""
+def _check_before_sign_in(root: str) -> int:
+    """Check a project against the public toolchains, so it is known to run before signing up."""
     with LeanWarpCloud(None, interface="cli") as cloud:
-        catalog = cloud.versions()["versions"]
-    report = check_project(root, catalog, environment)
+        versions = cloud.versions()
+    report = check_project(root, versions)
     _emit(
         {
             **report,
@@ -681,6 +729,10 @@ def _request(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
             payload["timeout_ms"] = args.tactic_timeout
     elif kind == "holes":
         payload["goals"] = not args.no_goals
+    elif kind == "proof_states":
+        payload["cursor"] = args.cursor
+        if args.max_bytes is not None:
+            payload["max_bytes"] = args.max_bytes
     elif kind == "extract_decls":
         pass
     elif kind == "sorry2lemma":
@@ -692,7 +744,8 @@ def _request(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
         if args.prefix is not None:
             payload["name_prefix"] = args.prefix
     elif kind in {"simplify_proofs", "repair_proofs"}:
-        payload["timeout_ms"] = args.tactic_timeout
+        if args.tactic_timeout is not None:
+            payload["timeout_ms"] = args.tactic_timeout
         if kind == "simplify_proofs":
             payload.update(max_simplifications=args.max, min_reduction_bytes=args.min_saving)
         else:
@@ -750,6 +803,8 @@ def _export(project: ProjectSession, output: Path, workspace_id: str | None) -> 
 def main(argv: list[str] | None = None) -> int:
     root = parser()
     args = root.parse_args(argv)
+    if args.command == "connect" and args.timeout < 0:
+        root.error("connect --timeout must be zero or more seconds")
     if args.command == "check" and args.all == bool(args.file):
         root.error("check takes a FILE or --all")
     if args.command == "check" and args.all and args.wait is not None:
@@ -771,7 +826,10 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "files":
             plan = plan_upload(args.project)
-            _emit(plan.public())
+            report = plan.public()
+            if args.dependencies:
+                report["dependencies"] = dependency_files(args.project)
+            _emit(report)
             return 1 if plan.problems else 0
         if args.command == "setup":
             report = setup(
@@ -813,15 +871,15 @@ def main(argv: list[str] | None = None) -> int:
             _emit({"recorded": False, "reason": "feedback_disabled"})
             return 0
         if args.command == "doctor" and not signed_in():
-            return _check_before_sign_in(args.project, args.environment)
+            return _check_before_sign_in(args.project)
         with load_client(interface="cli") as cloud:
             if args.command == "doctor":
-                return _doctor(cloud, args.project, args.environment)
-            if args.command in {"environments", "versions"}:
-                catalog = cloud.versions()
-                _emit(
-                    catalog if args.command == "versions" else {"environments": catalog["versions"]}
-                )
+                return _doctor(cloud, args.project)
+            if args.command == "versions":
+                _emit(cloud.versions())
+                return 0
+            if args.command == "environments":
+                _emit(cloud.environments())
                 return 0
             if args.command in {"account", "resources"}:
                 _emit(
@@ -835,10 +893,12 @@ def main(argv: list[str] | None = None) -> int:
                 _emit(
                     project.connect(
                         max_spend_microusd=args.max_spend,
-                        environment=args.environment,
-                        bundle_id=args.bundle,
                         workspace_id=args.workspace,
                         ephemeral=args.ephemeral,
+                        timeout=args.timeout,
+                        retry=args.retry,
+                        # A build can take a while: say where it is, on a terminal only.
+                        progress=_build_progress if sys.stderr.isatty() else None,
                     )
                 )
                 return 0
@@ -900,6 +960,9 @@ def main(argv: list[str] | None = None) -> int:
             )
             _emit(reported(result))
             return _exit_code(result)
+    except ConnectTimeout as error:
+        _emit({"error": error.code, "message": str(error), "retryable": error.retryable})
+        return 3
     except OperationTimeout as error:
         _emit(
             {

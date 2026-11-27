@@ -53,6 +53,12 @@ nothing and the MCP server offers no `feedback` tool.
 Sign in yourself with `leanwarp auth login`, or give the agent's environment a
 `LEANWARP_API_KEY`. Never put the key in the instruction.
 
+If the project depends on a private GitHub repository, connect it yourself in
+the [dashboard](https://isagoge.in/dashboard), under Private repositories, with
+a GitHub account that administers it. The agent can't do that step; without it,
+its `connect` stops with `grant_required` and asks you to, then builds again
+with `connect --retry`.
+
 ## Agents with shell access
 
 The command line is built for agents:
@@ -62,7 +68,9 @@ The command line is built for agents:
   same operation; don't submit it again.
 - Exit codes tell apart "did not pass" (`1`), "could not run" (`2`), "still
   running" (`3`) and "no verdict" (`4`: the check timed out or could not be
-  completed; retry it instead of changing the proof).
+  completed; retry it instead of changing the proof). For `connect`, `3` means
+  only its wait ended: run `connect` again with the same inputs, which rejoins
+  any build under way.
 
 For an agent that `leanwarp setup` doesn't know, point its skill installer at
 the [skill folder](../src/leanwarp_cloud/skills/leanwarp), including
@@ -106,7 +114,7 @@ The agent should first read the resources `leanwarp://guide` and
 
 - **Setup:** `doctor`, `files`, `environments`, `connect`.
 - **Proofs:** `check`, `inspect`, `try_tactics`, `verify_target`, `holes`,
-  `suggest`, `sorry2lemma`, `have2lemma`, `simplify_proofs`, `repair_proofs`,
+  `proof_states`, `suggest`, `sorry2lemma`, `have2lemma`, `simplify_proofs`, `repair_proofs`,
   `extract_decls`, `check_files`, `verify_batch`, and `apply` to write a result
   into its file.
 - **Control:** `wait`, `status`, `cancel`, `stop`, `recover`.

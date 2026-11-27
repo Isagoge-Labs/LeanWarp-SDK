@@ -389,7 +389,7 @@ def serving_shared(service: CIService, monkeypatch) -> None:
                     "workspace_id": "shared",
                     "state": "stopped",
                     "generation": 1,
-                    "bundle_id": "b",
+                    "environment_id": "e",
                 },
             )
         if request.method == "GET" and request.url.path.endswith("/workspaces/shared/files"):

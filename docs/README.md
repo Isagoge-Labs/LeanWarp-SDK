@@ -9,7 +9,7 @@
 ### Reference
 
 - [Commands](../src/leanwarp_cloud/skills/leanwarp/references/usage.md#commands): what each command does.
-- [Environments](https://isagoge.in/leanwarp/docs/environments): the Lean versions and libraries you can use.
+- [Environments](https://isagoge.in/leanwarp/docs/environments): your Lake project, private repositories, ready-built Mathlib and the supported Lean versions.
 - [Results](../src/leanwarp_cloud/skills/leanwarp/references/usage.md#results): what `success` means and where Lean's messages are.
 - [Python](../src/leanwarp_cloud/skills/leanwarp/references/usage.md#python): use LeanWarp from Python.
 - [Recovery](../src/leanwarp_cloud/skills/leanwarp/references/usage.md#recovery): lost responses, timeouts and conflicting edits.

@@ -16,6 +16,8 @@ You can check whether a project will run on LeanWarp before you sign up: run
 `leanwarp doctor` in the project's folder. Without a key, it compares your
 project with the environments LeanWarp offers. It uploads nothing.
 
+New connections require LeanWarp SDK 0.2.10 or later. Check your installed version with `leanwarp --version`.
+
 ## 1. Sign in
 
 Run this in your own terminal:
@@ -35,76 +37,71 @@ Commands that run Lean use prepaid credit, which you add in the dashboard.
 
 ## 2. Choose a project
 
-LeanWarp uploads only your `.lean` files. It runs them in an **environment**: a
-Lean release with fixed versions of libraries such as Mathlib, already built on
-LeanWarp's servers. To see the environments:
+LeanWarp uploads only your `.lean` files to a workspace. It runs them in your
+project's own **environment**, built once from what a local `lake build` reads:
+`lean-toolchain`, the lakefile, `lake-manifest.json` and any path dependencies.
+A path dependency sends its files except what its own `.gitignore` and
+`.leanwarpignore` leave out, build outputs, version control and credential
+files; `leanwarp files --dependencies` lists them. LeanWarp fetches pinned Git
+dependencies itself and never runs Lake on your machine. To see the supported
+Lean toolchains:
 
 ```sh
-leanwarp environments
+leanwarp versions
 ```
 
-The quickest way to start is an example project. Copy one of the
-[examples](../examples) and work inside it:
-
-```sh
-git clone https://github.com/Isagoge-Labs/LeanWarp-SDK.git
-cd LeanWarp-SDK/examples/lean-4.35
-```
-
-For your own project, run `leanwarp doctor` in its folder. It tells you which
-environment the project will use, without starting a server:
-
-- If the project's `lean-toolchain` and `lake-manifest.json` match an
-  environment, LeanWarp uses that one, so your results match your local build.
-- If the folder has neither file, LeanWarp uses the newest stable Lean it offers.
-- If nothing matches, `doctor` lists the environments that exist and reports
-  `compatible: false`. To use one anyway, pass `--environment NAME` to
-  `doctor` and `connect`. Your files then compile against that environment's
-  Lean and Mathlib.
-
-When several environments offer the newest Lean, choose one with
-`--environment`. Once a project is connected, it keeps its environment, even if
-the default changes later.
-
-LeanWarp reads both Git and local path dependencies in `lake-manifest.json`, in
-newer manifest formats too. Git dependencies must be pinned to full commit
-hashes. LeanWarp does not upload or build dependency folders: the environment
-must already provide every library your files import.
-
-Then create the project's workspace. This doesn't start a server or cost anything:
-
-```sh
-leanwarp connect
-```
-
-Add `.leanwarp/` to `.gitignore`. It holds this project's connection.
-
-A project can upload at most 256 `.lean` files and 1 MiB in total.
-The Lean options your `lakefile` sets, such as `maxSynthPendingDepth`, apply to
-every check and verification, as Lake would apply them. Options that could weaken
-checking, such as `debug.*` and `warn.sorry`, are not applied: `leanwarp status`
-lists them under `lean_options_ignored`. LeanWarp checks every file with one set
-of options, so an option that only some of your libraries or executables set, or
-that they set differently, is listed there too instead of reaching the others. A `lakefile.lean`
-must write its options as literal lists, or definitions of them, because LeanWarp
-never runs it. If LeanWarp cannot read every option the lakefile sets, including a
-`-D` argument in `moreLeanArgs`, it applies none and lists `leanOptions` there.
-
-`leanwarp files` lists what will upload. Files listed in `.gitignore` are left
-out. To leave out more, such as an archive folder, list it in
-`.leanwarpignore` in the project's root, using the same syntax as `.gitignore`
-(`archive/`).
-
-## 3. Check and verify
-
-The example's `LeanWarpExample.lean` contains:
+For a first proof, create an empty folder outside any Lake project. Save this as
+`LeanWarpExample.lean` in that folder:
 
 ```lean
 theorem add_zero_example (n : Nat) : n + 0 = n := by
   rfl
 ```
 
-First check the file:
+From that folder run:
+
+```sh
+leanwarp connect
+```
+
+Plain Lean files use a ready environment with Mathlib. Connecting them is free;
+the first proof operation starts a worker and uses prepaid credit.
+
+**Using your own Lake project?** Run `leanwarp doctor` in its folder to check
+the toolchain. Where project builds are available, `leanwarp connect` uses
+prepaid credit to build a new environment and reuses a matching ready one for
+free. A workspace spending cap applies to workspace operations; the environment
+build is billed separately. If the service returns `project_builds_unavailable`,
+you can still try the plain-file example above.
+
+A Lake project needs a `lake-manifest.json`; run `lake update` locally if it is
+missing. Git dependencies use pinned commits. To use a private GitHub repository,
+connect it in the dashboard with a GitHub account that administers it. If access
+is paused, reconnect it there to use your existing workspaces again. Path dependencies are sent
+by content. If a build fails, fix the reported problem and run
+`leanwarp connect --retry`.
+
+Add `.leanwarp/` to `.gitignore`. It holds this project's connection.
+
+A workspace source sync accepts at most 256 `.lean` files and 1 MiB in total.
+The Lean options your `lakefile` sets, such as `maxSynthPendingDepth`, apply to
+every check and verification, as Lake would apply them. Options that could weaken
+checking, such as `debug.*` and `warn.sorry`, are not applied: `leanwarp status`
+lists them under `lean_options_ignored`. LeanWarp checks every file with one set
+of options, so an option that only some of your libraries or executables set, or
+that they set differently, is listed there too instead of reaching the others. A `lakefile.lean`
+must write its options as literal lists, or definitions of them, for the SDK to read them
+from your local file. If LeanWarp cannot read every option the lakefile sets, including a
+`-D` argument in `moreLeanArgs`, it applies none and lists `leanOptions` there.
+
+`leanwarp files` lists workspace source files for sync. Environment inputs are sent separately. Files listed in `.gitignore` are left
+out. To leave out more, such as an archive folder, list it in
+`.leanwarpignore` in the project's root, using the same syntax as `.gitignore`
+(`archive/`).
+
+## 3. Check and verify
+
+Check the file from step 2:
 
 ```sh
 leanwarp check LeanWarpExample.lean
@@ -197,6 +194,47 @@ proof against it with Lean's kernel, in a separate checker that never runs your
 source. So the proof can't change what the statement means. The context may
 import only the environment's packages, such as Mathlib. Proofs that use
 `sorry`, `admit`, `native_decide` or new axioms are rejected.
+
+### Verify a dataset of proofs
+
+From Python, `verify_many` checks each proof against its own statement and
+writes one JSON line per verdict as it arrives:
+
+```python
+from leanwarp_cloud import LeanWarpCloud
+
+items = [
+    {
+        "id": "sq-1",
+        "proof": "import Mathlib\ntheorem t (x : ℝ) : 0 ≤ x ^ 2 := by positivity",
+        "target": {
+            "context": "import Mathlib",
+            "statement": "∀ x : ℝ, 0 ≤ x ^ 2",
+            "declaration": "t",
+        },
+    },
+]
+with LeanWarpCloud(api_key) as client:
+    summary = client.verify_many(
+        items, output="verdicts.jsonl", environment_id=environment_id, workspaces=4
+    )
+```
+
+If the run stops, run it again with the same `output`: written items are
+skipped, and a chunk that was running is read back rather than run and charged
+again. A resumed run must give each item the same proof and target, and the same
+`strict`, `timeout` and `timeout_seconds`; if any differ, it stops before sending
+anything, so write changed items to a new `output`. An output is verified in one
+environment: once its first proof chunk is journaled or a verdict written, a
+resumed run with another `environment_id`, or with workspaces in another, is
+refused. One run at a time uses an output; a second one started
+meanwhile is refused at once. Each line keeps the item's `id`, `passed`,
+`decided`, `environment_id`, the `target_sha256` of the statement it was checked
+against and the `input_sha256` of its proof, target and settings. `decided` is
+false for `timeout`, `infrastructure_failure` and `not_checked`: no verdict was
+reached, and the summary counts these as `undecided`, not `failed`. A resumed run
+skips them too, so write those items to a new `output` to try them again.
+`AsyncLeanWarpCloud` offers every client method as a coroutine.
 
 ## 5. Stop the worker
 

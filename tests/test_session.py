@@ -19,10 +19,12 @@ from leanwarp_cloud import (
     SessionError,
 )
 from leanwarp_cloud import session as session_module
+from leanwarp_cloud.environment import project_inputs
 from leanwarp_cloud.project import MAX_UPLOAD_BYTES, ProjectError
 from leanwarp_cloud.session import UsageError
 
 REJECTED = {"status": "rejected", "failure": {"kind": "axioms"}, "diagnostics": []}
+TOOLCHAIN = "leanprover/lean4:v4.26.0"
 
 
 class Service:
@@ -44,6 +46,16 @@ class Service:
         self._completion: dict[str, Any] = {}
         # The result a submitted operation completes with, built from its request.
         self.result_for: Any = lambda body: dict(REJECTED)
+        # The project's environment, as the service reports it, and what built it.
+        self.environment: dict[str, Any] = {
+            "environment_id": "e",
+            "attempt_id": "a",
+            "state": "ready",
+            "lean_toolchain": TOOLCHAIN,
+            "dependencies": [],
+        }
+        self.environment_requests: list[dict[str, Any]] = []
+        self.blobs: dict[str, bytes] = {}
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
@@ -53,20 +65,32 @@ class Service:
         if path.endswith("/resources"):
             return httpx.Response(200, json={"resources": [{"name": "standard"}]})
         if path.endswith("/versions"):
+            return httpx.Response(200, json={"toolchains": [{"lean_toolchain": TOOLCHAIN}]})
+        if path.endswith("/environment-uploads"):
+            blobs = json.loads(request.content)["blobs"]
             return httpx.Response(
-                200,
+                201,
                 json={
-                    "versions": [
-                        {
-                            "bundle_id": "b",
-                            "lean_toolchain": "leanprover/lean4:v4.26.0",
-                            "lake_manifest_sha256": hashlib.sha256(
-                                b'{"version":"1.1.0","packages":[]}'
-                            ).hexdigest(),
-                        }
-                    ]
+                    "upload_id": "u",
+                    "expires_at": "2026-09-16T01:00:00Z",
+                    "missing": sorted(blobs),
                 },
             )
+        if "/environment-uploads/" in path:
+            self.blobs[path.rsplit("/", 1)[-1]] = request.content
+            return httpx.Response(204)
+        if path.endswith("/environments") and request.method == "POST":
+            body = json.loads(request.content)
+            needed = {
+                *([body["lakefile"]["sha256"]] if "lakefile" in body else []),
+                *(tree["sha256"] for tree in body.get("path_trees", [])),
+            }
+            if needed - set(self.blobs):
+                return httpx.Response(409, json={"error": {"code": "upload_required"}})
+            self.environment_requests.append(body)
+            return httpx.Response(200, json=self.environment)
+        if "/environments/" in path and request.method == "GET":
+            return httpx.Response(200, json=self.environment)
         if request.method == "GET" and path.endswith("/files"):
             digests = {
                 name: hashlib.sha256(text.encode()).hexdigest()
@@ -161,6 +185,11 @@ class Service:
             self._completion = self.operation
             self.operation = {**self.operation, "state": "queued", "result": None}
         return self.operation
+
+
+def journal(root: Path) -> list[str]:
+    """A connection's environment record for the project at ``root``."""
+    return ["e", project_inputs(root).digest, TOOLCHAIN]
 
 
 @pytest.fixture
@@ -282,19 +311,90 @@ def test_lock_prevents_two_local_clients_from_mutating(project):
 
 
 def test_changed_environment_never_silently_upgrades(project):
-    root, _, _, session = project
+    root, service, _, session = project
     session.connect()
     (root / "lean-toolchain").write_text("leanprover/lean4:v4.27.0")
-    with pytest.raises(SessionError, match="toolchain or lockfile changed"):
-        session.sync()
-
-
-def test_connected_project_refuses_a_silent_environment_switch(project):
-    _, service, _, session = project
-    session.connect()
-    with pytest.raises(SessionError, match="disconnect"):
-        session.connect(environment="lean-4.34-mathlib")
+    for command in (session.sync, session.connect):
+        with pytest.raises(SessionError, match="changed since it was connected"):
+            command()
     assert service.workspace_count == 1
+
+
+def test_work_is_never_resent_once_the_project_changed(project):
+    root, service, _, _ = project
+    sent = []
+
+    def flaky(request):
+        # The first submission never reaches the service; the project changes during
+        # the backoff before the automatic resend.
+        if request.url.path.endswith("/run") and not sent:
+            sent.append(request)
+            (root / "lean-toolchain").write_text("leanprover/lean4:v4.27.0")
+            raise httpx.ConnectError("unreachable", request=request)
+        return service.handle(request)
+
+    with LeanWarpCloud(
+        "secret", base_url="https://api.example", retries=2, transport=httpx.MockTransport(flaky)
+    ) as cloud:
+        session = ProjectSession(cloud, root)
+        session.connect()
+        with pytest.raises(SessionError, match="changed since it was connected"):
+            session.submit("check", {"file": "Main.lean"})
+    assert len(sent) == 1 and service.operation == {}
+    # A deliberate recovery still resends exactly what was saved.
+    with LeanWarpCloud(
+        "secret", base_url="https://api.example", retries=0, transport=httpx.MockTransport(flaky)
+    ) as cloud:
+        assert ProjectSession(cloud, root).recover()["kind"] == "check"
+    # A resend runs the innermost check its own client installed, never another's.
+    calls = []
+    failed = set()
+
+    def once(request):
+        if request.url.host not in failed:
+            failed.add(request.url.host)
+            raise httpx.ConnectError("unreachable", request=request)
+        return httpx.Response(200, json={})
+
+    with (
+        LeanWarpCloud(
+            "secret", base_url="https://a.example", retries=1, transport=httpx.MockTransport(once)
+        ) as first,
+        LeanWarpCloud(
+            "secret", base_url="https://b.example", retries=1, transport=httpx.MockTransport(once)
+        ) as second,
+        first.resends_checked(lambda: calls.append("first")),
+        second.resends_checked(lambda: calls.append("second")),
+    ):
+        first._request("POST", "/v1/leanwarp/x", retry=True)
+        second._request("POST", "/v1/leanwarp/x", retry=True)
+    assert calls == ["first", "second"]
+
+
+def test_unresolved_pre_environment_create_is_preserved_and_never_replayed(project):
+    root, service, cloud, session = project
+    path = root / ".leanwarp/session.json"
+    path.parent.mkdir()
+    state = {
+        "schema": 1,
+        "base_url": cloud.base_url,
+        "owner_id": "owner",
+        "environment": [TOOLCHAIN, "0" * 64],
+        "files": {},
+        "pending": {
+            "method": "create_workspace",
+            "arguments": {"bundle_id": "lean426", "max_spend_microusd": None},
+            "idempotency_key": "a" * 32,
+            "hashes": None,
+        },
+    }
+    path.write_text(json.dumps(state))
+    before = path.read_bytes()
+    count = len(service.requests)
+    with pytest.raises(SessionError, match="unfinished workspace creation from an older SDK"):
+        session.recover()
+    assert path.read_bytes() == before
+    assert len(service.requests) == count
 
 
 def test_malformed_journal_is_not_overwritten(project):
@@ -764,7 +864,7 @@ def test_invalid_connect_profile_does_not_poison_first_connection(project, field
 def test_recovery_preserves_nullable_and_legacy_creation_payloads(project, cap):
     root, service, cloud, session = project
     arguments = {
-        "bundle_id": "b",
+        "environment_id": "e",
         "resource_profile": "standard",
         "max_resource_profile": "standard",
         "max_spend_microusd": cap,
@@ -781,10 +881,7 @@ def test_recovery_preserves_nullable_and_legacy_creation_payloads(project, cap):
                 "base_url": cloud.base_url,
                 "owner_id": "owner-a",
                 "files": {},
-                "environment": [
-                    "leanprover/lean4:v4.26.0",
-                    hashlib.sha256(b'{"version":"1.1.0","packages":[]}').hexdigest(),
-                ],
+                "environment": journal(root),
                 "pending": {
                     "method": "create_workspace",
                     "arguments": arguments,
@@ -796,7 +893,9 @@ def test_recovery_preserves_nullable_and_legacy_creation_payloads(project, cap):
     )
     assert ProjectSession(cloud, root).recover()["workspace_id"] == "w"
     assert service.workspace_count == 1
-    posts = [r for r in service.requests if r.method == "POST"]
+    posts = [
+        r for r in service.requests if r.method == "POST" and r.url.path.endswith("/workspaces")
+    ]
     assert len(posts) == 2 and posts[0].content == posts[1].content
     assert posts[0].headers["Idempotency-Key"] == posts[1].headers["Idempotency-Key"]
 
@@ -804,7 +903,13 @@ def test_recovery_preserves_nullable_and_legacy_creation_payloads(project, cap):
 def test_new_connection_explicitly_selects_prepaid_policy(project):
     _, service, _, session = project
     session.connect()
-    body = json.loads(next(r.content for r in service.requests if r.method == "POST"))
+    body = json.loads(
+        next(
+            r.content
+            for r in service.requests
+            if r.method == "POST" and r.url.path.endswith("/workspaces")
+        )
+    )
     assert body["max_spend_microusd"] is None
     assert "resource_profile" not in body
     assert "max_resource_profile" not in body
@@ -823,7 +928,9 @@ def test_capped_connection_recovers_exact_creation_intent(project, cap):
     assert resumed.connect(max_spend_microusd=cap)["max_spend_microusd"] == cap
     assert resumed.connect()["max_spend_microusd"] == cap
     assert service.workspace_count == 1
-    posts = [r for r in service.requests if r.method == "POST"]
+    posts = [
+        r for r in service.requests if r.method == "POST" and r.url.path.endswith("/workspaces")
+    ]
     assert len(posts) == 2
     assert posts[0].content == posts[1].content
     assert posts[0].headers["Idempotency-Key"] == posts[1].headers["Idempotency-Key"]
@@ -856,7 +963,9 @@ def test_recovery_keeps_server_default_selection_omitted(project):
     with pytest.raises(LeanWarpTransportError):
         session.connect()
     assert ProjectSession(session.cloud, root).recover()["workspace_id"] == "w"
-    posts = [r for r in service.requests if r.method == "POST"]
+    posts = [
+        r for r in service.requests if r.method == "POST" and r.url.path.endswith("/workspaces")
+    ]
     assert len(posts) == 2
     assert posts[0].content == posts[1].content
     assert posts[0].headers["Idempotency-Key"] == posts[1].headers["Idempotency-Key"]
@@ -866,7 +975,13 @@ def test_recovery_keeps_server_default_selection_omitted(project):
 def test_connection_keeps_explicit_profile_selection(project):
     _, service, _, session = project
     session.connect(resource_profile="standard", max_resource_profile="large")
-    body = json.loads(next(r.content for r in service.requests if r.method == "POST"))
+    body = json.loads(
+        next(
+            r.content
+            for r in service.requests
+            if r.method == "POST" and r.url.path.endswith("/workspaces")
+        )
+    )
     assert body["resource_profile"] == "standard"
     assert body["max_resource_profile"] == "large"
 
@@ -1170,7 +1285,7 @@ class AccountWorkspaces(SharedWorkspace):
             return httpx.Response(204)
         if request.method == "GET" and path.endswith("/v1/leanwarp/workspaces"):
             self.requests.append(request)
-            listed = [{"workspace_id": "w", "bundle_id": "b"}, {"workspace_id": "x"}]
+            listed = [{"workspace_id": "w", "environment_id": "e"}, {"workspace_id": "x"}]
             return httpx.Response(200, json={"workspaces": listed})
         if request.method == "GET" and path.endswith("/operations"):
             self.requests.append(request)
@@ -1191,7 +1306,7 @@ class AccountWorkspaces(SharedWorkspace):
                 200,
                 json={
                     "workspace_id": "w",
-                    "bundle_id": "b",
+                    "environment_id": "e",
                     "revision": self.revision,
                     "max_spend_microusd": self.max_spend_microusd,
                 },
@@ -1284,17 +1399,16 @@ def test_prune_never_lists_a_tracked_file_removed_locally(project):
     assert session.prune()["status"] == "nothing_to_prune"
 
 
-def test_an_existing_workspace_must_match_the_project_or_be_named(account):
-    root, _, session = account
-    with pytest.raises(UsageError, match="keeps its own environment"):
+def test_an_existing_workspace_must_be_in_the_projects_environment(account):
+    root, service, session = account
+    with pytest.raises(UsageError, match="keeps its own worker size"):
         session.connect(workspace_id="w", resource_profile="large")
-    (root / "lean-toolchain").write_text("leanprover/lean4:v4.27.0\n")
-    with pytest.raises(SessionError, match="--environment b"):
+    service.environment = {**service.environment, "environment_id": "other"}
+    with pytest.raises(SessionError, match="another environment"):
         session.connect(workspace_id="w")
     assert not (root / ".leanwarp/session.json").exists()
-    with pytest.raises(SessionError, match="not other"):
-        session.connect(workspace_id="w", environment="other")
-    assert session.connect(workspace_id="w", environment="b")["connected_existing"] is True
+    service.environment = {**service.environment, "environment_id": "e"}
+    assert session.connect(workspace_id="w")["connected_existing"] is True
 
 
 @pytest.mark.parametrize(

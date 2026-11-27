@@ -31,7 +31,7 @@ BATCH_COUNTERS: Mapping[str, frozenset[str]] = {
     "not_checked": frozenset({"not_checked"}),
 }
 #: The list a listing tool returns, even for a file that does not compile.
-_LISTINGS = {"holes": "holes", "extract_decls": "declarations"}
+_LISTINGS = {"holes": "holes", "extract_decls": "declarations", "proof_states": "rows"}
 #: The `inspect` statuses that promise goals.
 _INSPECTED = frozenset({"available", "proof_state", "metadata_only"})
 # The statuses each source tool documents as its answer. Anything else, a
@@ -43,6 +43,8 @@ _ANSWERS: dict[str, frozenset[str]] = {
     "suggest": frozenset({"closed", "not_closed", "error"}),
     "holes": frozenset({"ok", "error"}),
     "extract_decls": frozenset({"ok", "error"}),
+    # `unsupported`: the environment's build cannot list them; no answer.
+    "proof_states": frozenset({"ok", "error"}),
     "sorry2lemma": frozenset(
         {"extracted", "partial", "unchanged", "no_targets", "failed", "error"}
     ),

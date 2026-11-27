@@ -1,24 +1,29 @@
 ---
 name: leanwarp
-description: Check and formally verify Lean 4 proofs on hosted Lean workers with Mathlib already loaded. Use it for any Lean 4 or Mathlib work - compiling files, reading goals, trying tactics, closing sorrys and verifying that a proof proves an exact statement. Warm workers reuse loaded imports and prior work, without requiring a local Lean installation. Check many proofs in one operation for proof search, evaluation and RL rollouts. Includes setup - install, sign in and connect.
+description: Check and formally verify Lean 4 proofs on hosted Lean workers, with Mathlib ready or a Lake project's own pinned libraries, private GitHub dependencies included. Use it for any Lean 4 work, with or without Mathlib - compiling files, reading goals, trying tactics, closing sorrys and verifying that a proof proves an exact statement. Warm workers reuse loaded imports and prior work, without requiring a local Lean installation. Check many proofs in one operation, or a whole dataset from Python, for proof search, evaluation and RL rollouts. Includes setup - install, sign in and connect.
 ---
 
 # LeanWarp
 
-LeanWarp runs Lean 4 and Mathlib on hosted workers, so you can check and verify
-proofs without installing Lean. Use it whenever you work on Lean 4 proofs:
+LeanWarp runs Lean 4 on hosted workers, so you can check and verify proofs
+without installing Lean. Use it whenever you work on Lean 4 proofs:
 
 - Formal verification: confirm that a proof proves exactly the statement the
   user asked for, checked by Lean's kernel.
 - Faster proving: Mathlib stays loaded on a warm worker, and a draft check
   redoes only the part of the file you changed.
+- The user's own project: a Lake project runs against the exact libraries it
+  pins (Mathlib, other packages, private GitHub repositories), built once on
+  LeanWarp. Plain `.lean` files run on a ready-built Mathlib.
 - Many attempts at once: check up to 64 files, or verify up to 64 proofs, in
   one operation, for proof search, evaluation or RL rollouts.
 
-Every command prints one JSON object. Only the project's `.lean` files are
-uploaded; the environment supplies Lean, Mathlib and every other dependency.
+Every command prints one JSON object. The project's `.lean` files are uploaded
+as workspace sources; the environment supplies Lean and every dependency.
 
 ## Set up
+
+New connections require SDK 0.2.10 or later. Check `leanwarp --version` before connecting. If the package index only offers an older version, wait for 0.2.10.
 
 Skip any step that is already done.
 
@@ -52,17 +57,36 @@ Skip any step that is already done.
    leanwarp connect
    ```
 
-   `doctor` names the environment the project will use, without starting
-   compute. If it reports `"compatible": false`, tell the user which
-   environments exist and let them choose; then pass `--environment NAME` to
-   `connect`. Never edit the project's `lean-toolchain` or `lake-manifest.json`
-   to make it match. With no Lean project yet, copy the example project for an
-   environment, linked from the environments page below.
+   `doctor` shows the project's toolchain and whether LeanWarp supports it,
+   without starting compute. `connect` builds the project's own environment from
+   its `lean-toolchain`, lakefile, `lake-manifest.json` and path dependencies,
+   once, and waits until it is ready; LeanWarp never runs Lake on this machine.
+   The MCP `connect` tool returns `state: building` while it builds: call it
+   again (or `doctor`) to follow it; the build goes on between calls.
+   If a build fails, the error names the package or file: fix it locally (often
+   `lake update`), then run `leanwarp connect --retry`. Never edit the project's
+   `lean-toolchain` or `lake-manifest.json` to make it match anything.
+
+   The CLI `connect` waits up to four hours for a build. If your shell stops
+   long commands, pass `--timeout SECONDS` below that limit. Exit code `3` with
+   `connect_timeout` means only the wait ended: run `leanwarp connect` again,
+   with the project unchanged: it starts the build or rejoins one under way,
+   and answers any files it asked for. Never run `leanwarp wait` for it. If the build then fails with
+   `input_unanswered`, run `leanwarp connect --retry`.
+
+   `grant_required` (an error code, or a failed build whose message names it)
+   means a private GitHub dependency needs access. Ask the user to connect it
+   in the LeanWarp dashboard, under Private repositories, with a GitHub account
+   that administers the repository. Then run `leanwarp connect --retry` (MCP
+   `connect(retry=True)`).
+   `private_host_unsupported` means a private dependency is hosted somewhere
+   other than GitHub; tell the user, since LeanWarp reaches only GitHub.
 
 If the user gives a budget, set it when first connecting: `leanwarp connect
 --max-spend 2` caps that workspace at $2, including reserved credit. MCP takes
 millionths of a dollar: `connect(max_spend_microusd=2000000)` is $2. Reconnecting
-without a cap keeps the existing one. Change an existing cap in the dashboard;
+without a cap keeps the existing one. A new environment build uses prepaid credit
+separately from the workspace cap; plain files and ready environments need no build. Change an existing cap in the dashboard;
 don't create another workspace to get around it.
 
 When a result includes `update_available`, tell the user once that a new
@@ -115,6 +139,10 @@ For `inspect`, read `goal_status`: `available` includes the goals in
 `goal_contexts`, `no_goals` means Lean observed zero goals at that position,
 and `omitted` means goals were hidden (`context_omitted.goal_contexts` counts
 them). With `unavailable`, LeanWarp could not capture the goals.
+
+To see the goals at every tactic of a file, run `leanwarp proof-states FILE`
+once instead of an `inspect` per tactic. Each row has the tactic's range and its
+goals before and after; pass `next_cursor` as `--cursor` until it is null.
 
 ## Close holes one at a time
 
@@ -206,6 +234,11 @@ proves what was meant. Add `"target": {"context": "import Mathlib",
 `verify` does. A batch is `ok`, `failed` (an entry was refused) or `incomplete`
 (some entries got no verdict: retry those).
 
+For a dataset larger than one batch, use Python's `verify_many`: it verifies
+every proof against its own statement in chunks of 64 over several workspaces,
+streams each verdict to a JSONL file, and resumes from that file when run again.
+See the Python section of the reference.
+
 ## Verify against the user's statement
 
 ```sh
@@ -288,11 +321,14 @@ is `blocking`, `worked_around` or `minor` (the default).
   loads the project again, which can take tens of seconds on a Mathlib project.
 
 With MCP the tools have the same names, with `try_tactics`, `verify_target`,
-`extract_decls`, `check_files` and `verify_batch` for `try-tactics`, `verify`,
-`declarations`, `check-files` and `verify-batch`. Every operation tool returns
+`extract_decls`, `proof_states`, `check_files` and `verify_batch` for
+`try-tactics`, `verify`, `declarations`, `proof-states`, `check-files` and
+`verify-batch`. Every operation tool returns
 `operation_id`; pass it to `wait`, `status` or `cancel`. Results are compact,
 errors first, with `omitted` counting what was left out; pass `detail: "full"`
-only when you need the rest. For every option, limit and recovery case, run
+only when you need the rest. `proof_states` answers in full, a page at a time;
+if it is still running, use `wait(operation_id=..., detail="full")` before
+asking for the next `cursor`. For every option, limit and recovery case, run
 `leanwarp skill --reference` or read `leanwarp://reference`.
 
 ## Learn more
@@ -301,7 +337,7 @@ only when you need the rest. For every option, limit and recovery case, run
   https://isagoge.in/leanwarp/docs/getting-started.md
 - Every command, option, limit and recovery case:
   https://isagoge.in/leanwarp/docs/reference.md (or `leanwarp skill --reference`)
-- The Lean versions and libraries you can use:
+- Lake projects, private repositories, ready-built Mathlib and Lean versions:
   https://isagoge.in/leanwarp/docs/environments.md
 - MCP clients and agent setup: https://isagoge.in/leanwarp/docs/agents.md
 - The HTTP API, for your own client: https://isagoge.in/leanwarp/docs/http-api.md

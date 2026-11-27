@@ -14,10 +14,27 @@ Authorization: Bearer lw_live_…
 
 ## Workflow
 
-1. `GET /versions` lists the environments LeanWarp serves. Pick one whose
-   `lean_toolchain` and dependencies suit your files.
-2. `POST /workspaces` with `{"bundle_id": …}` creates a workspace at revision
-   `0`. No worker (the server that runs Lean) starts.
+1. `POST /environments` with your project's inputs finds or builds its
+   environment: `lean_toolchain` (the text of `lean-toolchain`), `lakefile`
+   (`name` and the SHA-256 of its bytes), `manifest` (the text of
+   `lake-manifest.json`), optional `package_overrides` and, per path dependency,
+   `path_trees` (its `dir` and the SHA-256 of its canonical file listing). Plain
+   Lean files send only `lean_toolchain`. A `409 upload_required` asks for the
+   named files first: `POST /environment-uploads` with `{"blobs": {sha256:
+   size}}` lists the ones missing, and `PUT
+   /environment-uploads/{upload_id}/blobs/{sha256}` sends each. The reply is `200`
+   when the environment is ready and `202` while it builds; poll its
+   `poll_url`. `GET /versions` lists the supported Lean toolchains.
+   Git dependencies are fetched at their pinned commit. A private one must be on
+   GitHub and connected by a repository administrator in the dashboard. Missing
+   or paused access can return `grant_required`. If the dashboard shows **Access
+   paused**, the workspaces and their data are kept. Reconnect the repository
+   through GitHub as an administrator to restore access. A confirmed removal or
+   explicit disconnect deletes the environments that used the repository and
+   their workspaces. Other private hosts return `private_host_unsupported`.
+2. `POST /workspaces` with `{"environment_id": …}` creates a workspace at
+   revision `0` in a ready environment. No worker (the server that runs Lean)
+   starts.
 3. `PUT /workspaces/{workspace_id}/files` uploads `.lean` files and returns the
    new `revision`.
 4. `POST /workspaces/{workspace_id}/operations` submits an operation against
@@ -57,7 +74,14 @@ axioms. Send `"strict": false` for a faster draft check while editing.
 
 | Method | Path | Permission | Purpose |
 | --- | --- | --- | --- |
-| `GET` | `/versions` | none | Served environments, one current build each. A key is optional, but one you send must be valid. |
+| `GET` | `/versions` | none | Supported Lean toolchains. A key is optional, but one you send must be valid. |
+| `POST` | `/environment-uploads` | write | Name a project's input files by SHA-256 and size; the reply lists those the account does not hold. |
+| `PUT` | `/environment-uploads/{upload_id}/blobs/{sha256}` | write | Send one named file; it is kept only if its bytes have that digest. |
+| `POST` | `/environments` | write and execute | Find or build the environment for a project's inputs: `200` ready, `202` building. Equivalent submissions share one build. |
+| `GET` | `/environments`, `/environments/{environment_id}` | read | Your environments: state, build phase, dependencies and any error with its file or package. |
+| `POST` | `/environments/{environment_id}/retry`, `/cancel` | write and execute; write or execute | Retry a failed or cancelled build, or cancel one, naming its current `attempt_id`. |
+| `DELETE` | `/environments/{environment_id}?expected_workspaces=N` | write | Delete an environment and every workspace that uses it. Name the `affected_workspaces` it showed; a different count answers `409 preview_changed` with the current one. `202` with the deletion. |
+| `GET` | `/deletions/{deletion_id}` | read | A deletion's state, until `completed`: every workspace, stored file and unreferenced upload it covers is gone. |
 | `GET` | `/resources` | read | Published worker resources and billing metadata. |
 | `GET` | `/account` | read | Balance, reserved and available credit, and credit returned after LeanWarp's own failures, in microdollars. |
 | `POST` | `/workspaces` | write | Create a workspace. |
@@ -108,12 +132,13 @@ start at 1, and columns count characters (Unicode code points).
 | `try_tactics` | `file`, `line`, `column`, `tactics` (1 to 32), `timeout_ms` per tactic (default 30000). Near the operation's limit, tactics tried together share the time left, and those with no time left are listed in `skipped`. |
 | `verify_target` | `file`, `candidate_declaration`, `target_statement`, `target_context` (it may import only the environment's packages, never the workspace's modules), `execution_mode` (`reusable` or `fresh`), `timeout` seconds. |
 | `holes` | `file`, `goals` (default `true`: bounded goals for the first 16 unfinished or unknown placeholders). |
+| `proof_states` | `file`, `cursor` (default 0: the page's first tactic), `max_bytes` (4096 to 524288, default 262144). One page of every tactic Lean ran in the file, from the revision's checked elaboration. |
 | `suggest` | `file`, `line`, `column`. Optional `tactics` (1 to 32) to use instead of LeanWarp's portfolio, and `timeout_ms` per tactic (learned budgets by default). Near the operation's limit, tactics tried together share the time left. |
 | `extract_decls` | `file`. |
 | `sorry2lemma` | `file`, `max_extractions` (1 to 256, default 64), optional `name_prefix`, `strict_final_check` (default `false`). |
 | `have2lemma` | `file`, `max_extractions` (1 to 256, default 64), optional `name_prefix`. |
-| `simplify_proofs` | `file`. Optional `tactics` (1 to 32, without `sorry` or `admit`) instead of LeanWarp's default list, `timeout_ms` per attempt (1 to 60000, default 10000), `max_simplifications` (1 to 256, default 16), `min_reduction_bytes` (default 1). |
-| `repair_proofs` | `file`. Optional `tactics` (1 to 32, without `sorry` or `admit`) instead of LeanWarp's default list, `timeout_ms` per attempt (1 to 60000, default 10000), `max_repairs` (1 to 256, default 16). The operation attempts repairs within its time budget and repair limit; remaining holes can be `skipped`. Each theorem it edits must end complete. |
+| `simplify_proofs` | `file`. Optional `tactics` (1 to 32, without `sorry` or `admit`) instead of LeanWarp's default list, `timeout_ms` per attempt (1 to 60000; without it each tactic has its own budget, from 50 ms for `rfl` to 2 seconds for `aesop`, `grind` and `nlinarith`), `max_simplifications` (1 to 256, default 16), `min_reduction_bytes` (default 1). |
+| `repair_proofs` | `file`. Optional `tactics` (1 to 32, without `sorry` or `admit`) instead of LeanWarp's default list, `timeout_ms` per attempt (1 to 60000; without it each tactic has its own budget, as for `simplify_proofs`), `max_repairs` (1 to 256, default 16). The operation attempts repairs within its time budget and repair limit; remaining holes can be `skipped`. Each theorem it edits must end complete. |
 | `check_files` | `files` (1 to 64 distinct paths), `strict` (default `true`), optional `timeout` seconds per file (default 60), which starts once the file's imports have loaded, except in a file using `native_decide`. It must fit the operation's budget for its entries (see below). |
 | `verify_batch` | `codes`: 1 to 64 objects `{"custom_id", "proof"}`. Each `custom_id` is unique and 1 to 128 characters, without control characters. Proofs must not be blank. The payload is at most 256 KiB of UTF-8. Also `strict` (default `true`) and optional `timeout` seconds per proof (default 60), which starts once the proof's imports have loaded, except in a proof using `native_decide`. It must fit the operation's budget for its entries (see below). The proofs run in the workspace's environment. They may import its packages, such as Mathlib, but not the workspace's own modules. Such a proof is refused without running: `status` `rejected`, `failure.kind` `policy`, `error.code` `unsupported_import`. A code may add `target`: `{"context", "statement", "declaration"}` (see below). |
 
@@ -121,7 +146,14 @@ Any `payload` may also carry `lean_options`, an object of Lean options applied a
 a lakefile's `leanOptions` would be, such as `{"maxSynthPendingDepth": 3}`. Options
 that could weaken checking are refused.
 
-An operation's `timeout_seconds` limits execution to 1–600 seconds. The default
+An operation's `timeout_seconds` limits execution to 1–600 seconds, or up to the
+account's own operation time limit when that is raised (at most 1,800; email
+contact@isagoge.in). A longer limit is refused with `operation_time_limit_exceeded`.
+Lean works for all of it but the last second (a tenth of a limit under ten
+seconds). Settling the result is allowed 4 seconds beyond the limit. When a
+`check_files` or `verify_batch` reply has not arrived by then, one more read of
+up to 5 seconds recovers the entries it finished: together these bound how long
+an operation can run and recover past its limit. The default
 depends on the operation. For example, `check` and `inspect` default to 120 seconds,
 and `suggest`, `simplify_proofs`, `repair_proofs`, `check_files` and
 `verify_batch` to 600.
@@ -158,26 +190,27 @@ It then has up to 15 minutes to create the worker and 5 more for it to become
 ready (`worker_start_timeout`). Both failures are retryable, and nothing ran.
 Uploading files counts against neither limit.
 
-`suggest`, `check_files` and `verify_batch` stop starting new work after four
-minutes. Their default `timeout_seconds` is 600, enough for the work still in
-flight to finish. A lower `timeout_seconds` stops starting new work ten seconds
-before it expires, or halfway through a limit under 20 seconds, so finished
-results still return. With a limit of one or two seconds, `check_files` and
-`verify_batch` run at most one source. Any they do not reach are `not_checked`.
+`suggest`, `check_files` and `verify_batch` start new work until the operation's
+limit; their default `timeout_seconds` is 600. Any sources they do not reach are
+`not_checked`.
 
 Sources that share the same imports run together on one worker, so results keep
 your order but the order they ran in may differ. Cancelling either operation keeps
 the entries that finished: `state` is `cancelled`, `result` holds them, and the
 rest are `not_checked`. A batch still running when its `timeout_seconds` expires
-keeps them the same way, with `state` `completed`.
+keeps them the same way, with `state` `completed`. When its reply is missing, the
+finished entries are read once more (up to 5 seconds, after the 4-second
+settlement): recovered entries are published as above and the worker is
+retired (the next operation starts a new one); if that read fails too, the
+operation fails with `operation_timeout`.
 
 `native_decide` runs in its own fresh Lean process, so a source that uses it
 loads its imports again within its `timeout`. Allow for that when setting one.
 
 Each entry is promised its `timeout`, or 60 seconds without one. A `timeout`
-larger than the operation's budget for its entries (`timeout_seconds` less 40
-seconds, and at most 210) is refused at submission, so with the default
-`timeout_seconds` of 600 an entry can have up to 210 seconds. An entry that had
+larger than the operation's budget for its entries (`timeout_seconds` less 31
+seconds, and at most 300) is refused at submission, so with the default
+`timeout_seconds` of 600 an entry can have up to 300 seconds. An entry that had
 its whole budget and did not finish is `timeout`. One that started with less, because the
 batch's time ran short, and did not finish is `not_checked`, not `timeout`:
 retry it on its own. An entry on the default 60 seconds under a shorter
@@ -206,7 +239,8 @@ and statement count toward the 256 KiB payload.
 ### Releasing results
 
 Stored results count against the account's storage limit until history makes
-room for them, an hour after they finish. A client that keeps its own copy can
+room for them, an hour after they finish (a day for `check_files` and
+`verify_batch`). A client that keeps its own copy can
 release them sooner: read the result, then `DELETE /operations/{operation_id}`.
 That deletes the finished operation's request and result at once and answers
 `204`; repeating it also answers `204`. A queued or running operation is refused
@@ -268,7 +302,7 @@ LeanWarp selects the published worker when you create a workspace. Set
 dashboard. Existing workspaces, and identical retries of a creation request,
 keep their saved billing terms.
 
-For example, `{"bundle_id": "…", "max_spend_microusd": 2000000}` creates a
+For example, `{"environment_id": "…", "max_spend_microusd": 2000000}` creates a
 workspace capped at $2, including reserved credit. The cap is an integer from
 zero to 1,000,000,000,000 microdollars, or `null` for no workspace cap.
 
@@ -337,8 +371,9 @@ twice. Use a new key for each new request.
 LeanWarp keeps a window of finished history, not all of it (see
 [limits](../src/leanwarp_cloud/skills/leanwarp/references/usage.md#credentials-credit-and-limits)).
 A replay returns the original result while it is stored. Unless you explicitly
-delete it, history keeps a finished result for at least an hour, or a minute
-with [short retention](#releasing-results). After deletion or removal by history,
+delete it, history keeps a finished result for at least an hour (a day for
+`check_files` and `verify_batch`), or a minute with
+[short retention](#releasing-results). After deletion or removal by history,
 replaying the submission returns `operation_expired` for at least 7 days.
 Reading the removed operation returns `not_found`. `retention` is part of the
 request: leaving it out is the same as `"standard"`, and resending a key with a
@@ -375,25 +410,44 @@ do next. It may change. Common codes:
 | `leanwarp_key_scope_denied` | 403 | The key lacks the permission, or is limited to another workspace. |
 | `invalid_request` | 422 | The body doesn't match the API. The message names the field. |
 | `invalid_cursor` | 422 | The page cursor was altered. Pass `next_cursor` unchanged. |
-| `unsupported_bundle` | 422 | The environment isn't served. The wire code keeps its original name for compatibility. |
+| `unsupported_toolchain` | 422 | LeanWarp does not support the project's Lean toolchain yet; `GET /versions` lists the supported ones. |
+| `invalid_project_input` | 422 | A project file LeanWarp reads is not valid; `file` and `package` name it. |
+| `environment_not_ready` | 409 | The environment is still building, failed or was cancelled. |
+| `environment_reconnect_required` | 409 | The workspace predates project environments; connect the project again. |
+| `project_builds_unavailable` | 503 | The project needs a build, and builds are not available yet. Plain Lean files still run. |
+| `upload_required` | 409 | Send project input hashes and sizes to `POST /environment-uploads`, then upload the missing blobs it lists using `PUT`. |
+| `inputs_required` | 409 | Submit again with `inputs` for the listed paths outside the project. |
+| `private_host_unsupported` | 422 | A Git dependency is pinned by SSH on a host other than GitHub; private repositories are reached only on GitHub. Use a public HTTPS URL, or move it to GitHub. |
+| `grant_required` | 409 | A private GitHub dependency needs access, connected or reconnected in the dashboard. |
+| `preview_changed` | 409 | The deletion would now affect a different number of workspaces; `affected_workspaces` is the current one. |
+| `project_data_erasing` | 409 | Your project data is being erased; nothing new can be added until that completes. |
 | `revision_conflict` | 409 | `expected_revision` is out of date. |
 | `workspace_busy` | 409 | Another operation is running in the workspace. |
 | `idempotency_conflict` | 409 | The `Idempotency-Key` was used for a different request. |
 | `operation_expired` | 409 | The request already ran and its result is no longer stored. It was not run again. |
 | `operation_active` | 409 | The operation has not finished, so its result cannot be deleted yet. |
-| `operation_limit_exceeded` | 429 | The workspace stores the account's limit of operations (1,000 by default). |
+| `operation_limit_exceeded` | 429 | The workspace stores the account's limit of operations (10,000 by default). |
 | `operation_storage_limit_exceeded` | 429 | Stored results, and the space held for queued and running operations, reached the account's limit (512 MiB by default). |
-| `source_history_limit_exceeded` | 429 | The workspace reached the account's sync limit (1,000 by default) within the last hour, or stored source reached the account's limit (64 MiB by default). |
-| `workspace_creation_limit_exceeded` | 429 | The account created its limit of workspaces within the last hour (300 by default). |
+| `source_history_limit_exceeded` | 429 | The workspace reached the account's sync limit (10,000 by default) within the last hour, or stored source reached the account's limit (64 MiB by default). |
+| `workspace_creation_limit_exceeded` | 429 | The account created its limit of workspaces within the last hour (500 by default). |
 
 The four limits above free with time, so they answer `429` with `Retry-After`:
 the seconds until enough records that count can be removed, an hour after each
-finished or a minute for short retention (or the whole hour-long window when
+finished (a day for a batch) or a minute for short retention, at most an hour (or the whole hour-long window when
 nothing is waiting to leave it; for storage held only by running operations, 30
 seconds). Deleting results you have read frees operation history and storage at
 once. Stored source frees only when you delete files or workspaces, so waiting
 does not help that case. An account's limits can be
 raised; email contact@isagoge.in.
+
+A failed build's `error` is shown with its environment (`GET /environments/{id}`
+answers `200`). It can carry `grant_required` or `private_host_unsupported` when
+a dependency turns out to be private only while the build fetches it.
+`stored_file_missing` means LeanWarp lost a file it held: retry with the files
+uploaded again (`leanwarp connect --retry` does both). `configuration_not_reproducible`
+means a worker cannot load the project the same way from `lean-toolchain`, the
+lakefile and `lake-manifest.json` alone, for example because the lakefile reads
+other files when Lake loads it.
 
 ## Results and failed operations
 
@@ -455,8 +509,9 @@ is `fixed_target_kernel_check_v2`.
 `build`: the `bundle_id`, `engine_commit` and `environment_id` of the build that
 produced it. The operation's `build` field names the same build as soon as the
 operation is dispatched to a worker, while it runs, and is `null` until then. An
-operation that was interrupted and rerun names the worker that reran it. A workspace's `bundle_id`
-names its current build. After a build update, the next operation starts a new worker. The operation's own fields are under `result.result`, and the
+operation that was interrupted and rerun names the worker that reran it. A workspace's
+`environment_id` names its environment. After a build update, the next operation starts a
+new worker; the environment's libraries are never rebuilt for it. The operation's own fields are under `result.result`, and the
 [reference](../src/leanwarp_cloud/skills/leanwarp/references/usage.md#results)
 lists them. Completed operations also have `execution`, which says which worker
 ran them and what was reused, and `timing`, with `queued_ms`, `worker_ms`,
